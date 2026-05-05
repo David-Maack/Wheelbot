@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/wheelbot.db
+logs/
+backups/
+
+# Secrets and local config (per spec)
+config/secrets.env
+config/config.local.yaml
+.env
+.env.local
+
+# Manual stop file (runtime artifact)
+STOP
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type checkers
+.mypy_cache/
+.ruff_cache/

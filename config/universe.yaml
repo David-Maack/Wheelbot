@@ -1,0 +1,60 @@
+# WheelBot trading universe. Curated. Never auto-add tickers without human review.
+# See spec §6.
+#
+# Tier enforcement:
+#   tier 1 — auto-traded if all risk gates pass
+#   tier 2 — requires LLM screener + risk gates
+#   tier 3 — requires manual human approval per cycle
+
+tickers:
+  # Tier 1 — Safe core for small accounts (under $30/share, large-cap, dividend-paying)
+  - symbol: F
+    name: "Ford Motor Company"
+    tier: 1
+    notes: "Liquid, dividend, low IV but reliable. Good for first live trades."
+    overrides:
+      csp_delta_max: 0.25         # tighter delta given low premium
+
+  - symbol: SOFI
+    name: "SoFi Technologies"
+    tier: 1
+    notes: "Higher IV fintech. Good monthly premium."
+
+  - symbol: BAC
+    name: "Bank of America"
+    tier: 1
+    notes: "Low IV but tight spreads, very liquid."
+
+  - symbol: NOK
+    name: "Nokia"
+    tier: 1
+
+  # Tier 2 — Higher beta, higher premium, requires bigger BP cushion
+  - symbol: RIVN
+    name: "Rivian"
+    tier: 2
+    overrides:
+      max_position_pct_of_account: 20
+
+  - symbol: PLTR
+    name: "Palantir"
+    tier: 2
+
+  - symbol: PLUG
+    name: "Plug Power"
+    tier: 2
+
+  # Tier 3 — Trade only when LLM screener AND human approve
+  - symbol: HOOD
+    name: "Robinhood Markets"
+    tier: 3
+    notes: "Wheel the broker. Approved one cycle at a time."
+
+# Banned list — explicitly never trade these even if screener suggests
+banned:
+  - GME
+  - AMC
+
+# Banned categories enforced in code
+banned_rules:
+  - "biotech under $20"           # binary FDA risk

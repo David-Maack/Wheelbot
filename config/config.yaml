@@ -1,0 +1,88 @@
+# WheelBot defaults. Committed to repo. Override in config.local.yaml.
+# See spec §5.
+
+account:
+  id: "primary"
+  broker: "alpaca_paper"        # alpaca_paper | tastytrade_sandbox | tastytrade
+
+database:
+  path: "/mnt/wheelbot-storage/wheelbot.db"
+
+logging:
+  level: "INFO"
+  json: true
+  path: "/mnt/wheelbot-storage/logs/wheelbot.log"
+
+dashboard:
+  host: "127.0.0.1"
+  port: 8889
+  basic_auth_user: "wheelbot"   # password lives in secrets.env
+
+reconciler:
+  market_hours_interval_seconds: 300
+  off_hours_interval_seconds: 1800
+  max_failures_before_pause: 5
+
+wheel:
+  # Strike selection
+  csp_delta_min: 0.20
+  csp_delta_max: 0.30
+  cc_delta_min: 0.20
+  cc_delta_max: 0.30
+  cc_strike_floor: cost_basis    # never sell CC below cost basis
+
+  # Time
+  dte_min: 30
+  dte_max: 45
+  weekly_only: false             # if true, only trade contracts with weekly expiries
+
+  # Entry gates
+  ivr_min: 30                    # don't sell premium when premium is cheap
+  bid_ask_spread_max_pct: 5      # skip illiquid contracts (spread > 5% of mid)
+  open_interest_min: 500
+  volume_min: 100                # contract daily volume
+
+  # Earnings handling
+  earnings_blackout_days_before: 5
+  earnings_blackout_days_after: 2
+  earnings_low_delta_override: 0.10
+
+  # Exit / management
+  profit_close_pct: 50           # close at 50% max profit
+  time_close_dte: 7              # close any position with <= 7 DTE remaining
+  roll_trigger_delta: 0.50       # consider roll when short option's delta hits this
+  roll_only_for_credit: true     # never debit-roll
+
+  # Position sizing
+  max_position_pct_of_account: 30
+  max_concurrent_positions: 4
+  buying_power_floor_pct: 20
+
+risk:
+  daily_loss_kill_switch_pct: 5  # if account drops 5% in a day, halt new trades
+  consecutive_losses_pause: 3    # 3 losses in a row → pause for human review
+  stop_file_path: "/opt/wheelbot/STOP"
+
+regime:
+  enabled: true
+  spy_above_sma_days: 200
+  vix_max: 35
+  pause_on_vix_spike_pct: 30
+
+intelligence:
+  llm_screener_enabled: true
+  llm_news_check_enabled: true
+  llm_roll_advisor_enabled: false
+  llm_provider: anthropic
+  screener_model: claude-opus-4-7
+  news_check_model: claude-haiku-4-5
+  roll_advisor_models:
+    - claude-opus-4-7
+    - claude-haiku-4-5
+  ensemble_quorum: 2
+
+execution:
+  dry_run: false
+  retry_max_attempts: 5
+  retry_initial_backoff_seconds: 1
+  retry_max_backoff_seconds: 60
