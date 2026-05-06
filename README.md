@@ -7,9 +7,12 @@ See `wheelbot_spec.md.pdf` for the full technical specification.
 
 ## Status
 
-Sprint 2 — Broker Abstraction. Async `Broker` ABC, in-memory `PaperBroker` for unit
-tests, and an `AlpacaBroker` adapter against Alpaca paper. Strategy code (Sprint 3+)
-goes through `core.broker_factory.make_broker`. No live orders.
+Sprint 3 — Strategy Core. Black-Scholes Greeks fallback, chain fetch + filter
+(`data/chain.py`), IVR/IVP from rolling history (`data/ivr.py`), CSP and CC
+selectors (`strategies/csp_selector.py`, `cc_selector.py`), and the wheel
+orchestrator (`strategies/wheel.py`) that produces `Proposal`s per state.
+Daily IV ingest in `scripts/ingest_history.py`. No order placement, no risk
+gates yet — both land in Sprint 4.
 
 ## Quick start
 
