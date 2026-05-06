@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Orders{% endblock %}
+{% block content %}
+<h1>Recent orders</h1>
+{% if orders %}
+<table class="grid">
+  <thead>
+    <tr><th>Placed</th><th>Symbol</th><th>Type</th><th>Contract</th><th>Qty</th><th>Limit</th><th>Fill</th><th>Status</th><th>Inspect</th></tr>
+  </thead>
+  <tbody>
+    {% for o in orders %}
+    <tr>
+      <td>{{ o.placed_at }}</td>
+      <td>{{ o.symbol }}</td>
+      <td><code>{{ o.order_type }}</code></td>
+      <td>{{ o.contract_symbol or "—" }}</td>
+      <td>{{ o.quantity }}</td>
+      <td>{% if o.limit_price is not none %}{{ "%.2f"|format(o.limit_price) }}{% else %}—{% endif %}</td>
+      <td>{% if o.fill_price is not none %}{{ "%.2f"|format(o.fill_price) }}{% else %}—{% endif %}</td>
+      <td><code>{{ o.status }}</code></td>
+      <td>
+        <details>
+          <summary>raw</summary>
+          <pre><strong>request</strong>
+{{ o.raw_request }}
+
+<strong>response</strong>
+{{ o.raw_response }}</pre>
+        </details>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No orders yet.</p>
+{% endif %}
+{% endblock %}

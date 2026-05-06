@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Candidates{% endblock %}
+{% block content %}
+<h1>Screener candidates</h1>
+{% if candidates %}
+<table class="grid">
+  <thead>
+    <tr><th>Run date</th><th>Rank</th><th>Symbol</th><th>Score</th><th>IVR</th><th>IV %ile</th><th>Acted on</th><th>Rationale</th></tr>
+  </thead>
+  <tbody>
+    {% for c in candidates %}
+    <tr>
+      <td>{{ c.run_date }}</td>
+      <td>{{ c.rank }}</td>
+      <td>{{ c.symbol }}</td>
+      <td>{% if c.score is not none %}{{ "%.2f"|format(c.score) }}{% else %}—{% endif %}</td>
+      <td>{% if c.ivr is not none %}{{ "%.0f"|format(c.ivr) }}{% else %}—{% endif %}</td>
+      <td>{% if c.iv_pct is not none %}{{ "%.0f"|format(c.iv_pct) }}{% else %}—{% endif %}</td>
+      <td>{{ "yes" if c.acted_on else "no" }}</td>
+      <td class="rationale">{{ c.rationale or "" }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No screener output yet — LLM screener arrives in Sprint 7.</p>
+{% endif %}
+{% endblock %}

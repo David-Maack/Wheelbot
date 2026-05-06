@@ -7,15 +7,14 @@ See `wheelbot_spec.md.pdf` for the full technical specification.
 
 ## Status
 
-Sprint 4 — Execution & Reconciliation. The seven §8 pre-trade gates run inside
-`risk/limits.py`; an idempotent `OrderRouter` places orders with retry/backoff
-and a no-broker-no-DB dry-run mode; `Reconciler` is the single source of truth
-for state-after-fill (transitions for fill / assignment / expiration / called-
-away, MANUAL_INTERVENTION on broker-vs-local mismatches). `KillSwitch` halts
-new orders on stop-file, daily-P&L drawdown, or N consecutive losing cycles
-(durable via the new `daily_state` table). `ReconcilerLoop` ticks 5 min in
-market hours / 30 min off, and flips positions to `BROKER_DOWN` after N
-consecutive failures.
+Sprint 5 — Operations. FastAPI + HTMX dashboard on :8889 with five views
+(positions, cycles, candidates, orders, risk) plus `/healthz` and a manual-stop
+toggle. CLI tools: `scripts/manual_close.py` (per-symbol or `--all`, optional
+`--dry-run` / `--force`), `scripts/replay_cycle.py` (narrative replay of a
+closed cycle with P&L decomposition), `scripts/backup_db.py` (online SQLite
+backup → gzipped daily file with 30-day retention). Structured JSON logging
+via `core/logs.py` with daily rotation; `ops/logrotate.conf` for OS-level
+rotation if you prefer that.
 
 ## Quick start
 
@@ -65,5 +64,7 @@ Three layers, each overlays the previous:
 ## Operations
 
 - Manual stop file: `touch /opt/wheelbot/STOP` halts all new orders. Reconciler keeps running.
-- Dashboard: <http://127.0.0.1:8889> (after Sprint 5).
-- DB backups: nightly cron writes to `/mnt/wheelbot-storage/backups/` (after Sprint 5).
+- Dashboard: <http://127.0.0.1:8889> — run with `uvicorn dashboard.app:create_app --factory --host 127.0.0.1 --port 8889`. HTTP Basic auth: username from `config.dashboard.basic_auth_user`, password from `WHEELBOT_DASHBOARD_PASSWORD`. Reach via Tailscale or SSH tunnel.
+- Manual close: `python -m scripts.manual_close --symbol F` (or `--all`); `--dry-run` previews, `--force` bypasses risk gates.
+- Replay cycle: `python -m scripts.replay_cycle --cycle-id 42` (or `--latest [--symbol F]`).
+- DB backups: `30 23 * * * /opt/wheelbot/.venv/bin/python -m scripts.backup_db` writes `wheelbot-YYYY-MM-DD.sql.gz` to `<db-dir>/backups/` and keeps 30 days.

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Risk{% endblock %}
+{% block content %}
+<h1>Risk &amp; controls</h1>
+
+<section class="panel">
+  <h2>Account</h2>
+  {% if account %}
+    <dl class="kv">
+      <dt>Cash</dt><dd>{{ "%.2f"|format(account.cash) }}</dd>
+      <dt>Buying power</dt><dd>{{ "%.2f"|format(account.buying_power) }}</dd>
+      <dt>Equity</dt><dd>{{ "%.2f"|format(account.equity) }}</dd>
+      <dt>BP used</dt><dd>{% if bp_used_pct is not none %}{{ "%.1f"|format(bp_used_pct) }}%{% else %}—{% endif %}</dd>
+    </dl>
+  {% else %}
+    <p class="empty">Broker unreachable.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>Active positions ({{ active_positions|length }})</h2>
+  <ul>
+    {% for p in active_positions %}<li>{{ p.symbol }} — {{ p.state }}</li>{% endfor %}
+    {% if not active_positions %}<li class="empty">none</li>{% endif %}
+  </ul>
+</section>
+
+<section class="panel">
+  <h2>Regime</h2>
+  {% if regime %}
+    <dl class="kv">
+      <dt>Snapshot</dt><dd>{{ regime.snapshot_date }}</dd>
+      <dt>Regime</dt><dd>{{ regime.regime or "—" }}</dd>
+      <dt>SPY &gt; SMA</dt><dd>{{ regime.spy_above_sma }}</dd>
+      <dt>VIX</dt><dd>{{ regime.vix_close or "—" }}</dd>
+      <dt>CSPs allowed</dt><dd>{{ regime.csps_allowed }}</dd>
+    </dl>
+  {% else %}
+    <p class="empty">No regime snapshot yet (Sprint 7).</p>
+  {% endif %}
+</section>
+
+<section class="panel {% if kill_switch.armed or kill_switch.stop_file_present %}panel-bad{% endif %}">
+  <h2>Kill switch</h2>
+  <dl class="kv">
+    <dt>Armed</dt><dd>{{ kill_switch.armed }}</dd>
+    <dt>Reason</dt><dd>{{ kill_switch.reason or "—" }}</dd>
+    <dt>Stop file present</dt><dd>{{ kill_switch.stop_file_present }}</dd>
+    <dt>Session-open equity</dt><dd>{% if kill_switch.session_open_equity is not none %}{{ "%.2f"|format(kill_switch.session_open_equity) }}{% else %}—{% endif %}</dd>
+  </dl>
+  <form method="post" action="/risk/manual_stop"
+        onsubmit="return confirm('Are you sure? This halts all new orders.');">
+    {% if kill_switch.stop_file_present %}
+      <input type="hidden" name="action" value="release">
+      <button type="submit">Release manual stop</button>
+    {% else %}
+      <input type="hidden" name="action" value="engage">
+      <button type="submit" class="danger">Engage manual stop</button>
+    {% endif %}
+  </form>
+  <p class="caption">Stop file: <code>{{ stop_file or "(not configured)" }}</code></p>
+</section>
+{% endblock %}

@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Positions{% endblock %}
+{% block status_pill %}
+  <span class="pill {% if kill_switch.armed %}pill-bad{% else %}pill-ok{% endif %}">
+    Kill switch: {% if kill_switch.armed %}ARMED{% else %}ok{% endif %}
+  </span>
+{% endblock %}
+{% block content %}
+  <h1>Positions</h1>
+  {% include "_positions_table.html" %}
+{% endblock %}

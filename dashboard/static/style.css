@@ -1,0 +1,91 @@
+/* WheelBot dashboard — minimal, no build step. */
+
+:root {
+  --fg: #1a1a1a;
+  --fg-muted: #666;
+  --bg: #fafafa;
+  --panel: #fff;
+  --border: #d0d0d0;
+  --pos: #128a30;
+  --neg: #b22222;
+  --bad: #b22222;
+  --warn: #c97700;
+  --ok: #128a30;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+nav.topbar {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 0.6rem 1rem;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+nav.topbar .brand { font-weight: 600; margin-right: 1rem; }
+nav.topbar a { color: var(--fg); text-decoration: none; padding: 0.25rem 0.5rem; }
+nav.topbar a:hover { background: #eee; border-radius: 4px; }
+
+main { padding: 1rem 1.5rem; max-width: 1200px; margin: 0 auto; }
+h1 { margin-top: 0.4rem; }
+
+table.grid {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+table.grid th, table.grid td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.92rem;
+}
+table.grid th { background: #f3f3f3; }
+table.grid tr:last-child td { border-bottom: 0; }
+
+.pos { color: var(--pos); }
+.neg { color: var(--neg); }
+.empty { color: var(--fg-muted); font-style: italic; }
+.rationale { max-width: 30em; }
+code { background: #eee; padding: 0.05rem 0.35rem; border-radius: 3px; font-size: 0.85em; }
+
+.pill {
+  margin-left: auto;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.pill-ok { background: #e1f3e6; color: var(--ok); }
+.pill-bad { background: #fde2e2; color: var(--bad); }
+
+.filters { margin: 0.75rem 0 1rem; display: flex; gap: 0.75rem; align-items: end; }
+.filters label { display: flex; flex-direction: column; font-size: 0.85rem; color: var(--fg-muted); }
+.filters input, .filters select { padding: 0.3rem 0.4rem; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+}
+.panel-bad { border-color: var(--bad); background: #fff7f7; }
+.panel h2 { margin: 0 0 0.5rem; font-size: 1.05rem; }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0; }
+dl.kv dt { color: var(--fg-muted); }
+
+button { padding: 0.4rem 0.8rem; cursor: pointer; }
+button.danger { background: var(--bad); color: white; border: 1px solid var(--bad); border-radius: 4px; }
+button.danger:hover { filter: brightness(1.1); }
+
+pre { font-size: 0.78rem; background: #fafafa; padding: 0.5rem; border: 1px solid var(--border); }
+.caption { color: var(--fg-muted); font-size: 0.85rem; }

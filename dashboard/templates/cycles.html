@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Cycles{% endblock %}
+{% block content %}
+<h1>Wheel cycles</h1>
+<form method="get" class="filters">
+  <label>Symbol <input type="text" name="symbol" value="{{ filter_symbol }}" placeholder="any"></label>
+  <label>Outcome
+    <select name="outcome">
+      <option value="">any</option>
+      <option value="CSP_EXPIRED" {% if filter_outcome == 'CSP_EXPIRED' %}selected{% endif %}>CSP_EXPIRED</option>
+      <option value="CSP_CLOSED_PROFIT" {% if filter_outcome == 'CSP_CLOSED_PROFIT' %}selected{% endif %}>CSP_CLOSED_PROFIT</option>
+      <option value="CC_EXPIRED" {% if filter_outcome == 'CC_EXPIRED' %}selected{% endif %}>CC_EXPIRED</option>
+      <option value="CC_CLOSED_PROFIT" {% if filter_outcome == 'CC_CLOSED_PROFIT' %}selected{% endif %}>CC_CLOSED_PROFIT</option>
+      <option value="CC_CALLED_AWAY" {% if filter_outcome == 'CC_CALLED_AWAY' %}selected{% endif %}>CC_CALLED_AWAY</option>
+      <option value="MANUAL_CLOSE" {% if filter_outcome == 'MANUAL_CLOSE' %}selected{% endif %}>MANUAL_CLOSE</option>
+    </select>
+  </label>
+  <button type="submit">Filter</button>
+</form>
+{% if cycles %}
+<table class="grid">
+  <thead>
+    <tr><th>ID</th><th>Symbol</th><th>Started</th><th>Ended</th><th>Outcome</th><th>Days held</th><th>Realized P&amp;L</th><th>P&amp;L %</th></tr>
+  </thead>
+  <tbody>
+    {% for c in cycles %}
+    <tr>
+      <td>{{ c.id }}</td>
+      <td>{{ c.symbol }}</td>
+      <td>{{ c.started_at }}</td>
+      <td>{% if c.ended_at %}{{ c.ended_at }}{% else %}<em>open</em>{% endif %}</td>
+      <td>{{ c.cycle_outcome or "—" }}</td>
+      <td>{{ c.days_held if c.days_held is not none else "—" }}</td>
+      <td class="{% if c.final_pnl is not none and c.final_pnl < 0 %}neg{% elif c.final_pnl is not none and c.final_pnl > 0 %}pos{% endif %}">
+        {% if c.final_pnl is not none %}{{ "%+.2f"|format(c.final_pnl) }}{% else %}—{% endif %}
+      </td>
+      <td>{% if c.final_pnl_pct is not none %}{{ "%+.2f"|format(c.final_pnl_pct) }}%{% else %}—{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No cycles match the filter.</p>
+{% endif %}
+{% endblock %}
