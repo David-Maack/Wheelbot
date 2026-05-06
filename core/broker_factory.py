@@ -33,6 +33,11 @@ def make_broker(config: dict[str, Any]) -> Broker:
         return AlpacaBroker(account_id=account_id)
 
     if name in ("tastytrade", "tastytrade_sandbox"):
-        raise NotImplementedError(f"{name} broker arrives in Sprint 6")
+        from platforms.tastytrade_broker import TastytradeBroker
+
+        return TastytradeBroker(
+            is_test=(name == "tastytrade_sandbox"),
+            account_id=account_id,
+        )
 
     raise ValueError(f"unknown broker {name!r}; check config.account.broker")

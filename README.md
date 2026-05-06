@@ -7,14 +7,16 @@ See `wheelbot_spec.md.pdf` for the full technical specification.
 
 ## Status
 
-Sprint 5 — Operations. FastAPI + HTMX dashboard on :8889 with five views
-(positions, cycles, candidates, orders, risk) plus `/healthz` and a manual-stop
-toggle. CLI tools: `scripts/manual_close.py` (per-symbol or `--all`, optional
-`--dry-run` / `--force`), `scripts/replay_cycle.py` (narrative replay of a
-closed cycle with P&L decomposition), `scripts/backup_db.py` (online SQLite
-backup → gzipped daily file with 30-day retention). Structured JSON logging
-via `core/logs.py` with daily rotation; `ops/logrotate.conf` for OS-level
-rotation if you prefer that.
+Sprint 6 — Tastytrade & Live Prep. `platforms/tastytrade_broker.py` against
+the tastyware/tastytrade SDK 12.x (fully async, OAuth2). Broker factory wires
+`tastytrade` → prod, `tastytrade_sandbox` → cert.tastyworks.com. One-time
+OAuth bootstrap (`scripts/bootstrap_tastytrade.py`) supports both interactive
+and `--password-stdin` headless flows; refuses to clobber an existing prod
+token with sandbox credentials (or vice versa) without `--force`.
+`scripts/preflight_live.py` runs read-only readiness checks (broker auth,
+universe, DB, MANUAL_INTERVENTION queue, kill switch, stop file, regime/IV
+history thinness) before flipping config to production. The reconciler's
+mismatch coverage is reinforced by a dedicated test suite per spec §13 #29.
 
 ## Quick start
 
@@ -68,3 +70,5 @@ Three layers, each overlays the previous:
 - Manual close: `python -m scripts.manual_close --symbol F` (or `--all`); `--dry-run` previews, `--force` bypasses risk gates.
 - Replay cycle: `python -m scripts.replay_cycle --cycle-id 42` (or `--latest [--symbol F]`).
 - DB backups: `30 23 * * * /opt/wheelbot/.venv/bin/python -m scripts.backup_db` writes `wheelbot-YYYY-MM-DD.sql.gz` to `<db-dir>/backups/` and keeps 30 days.
+- Tastytrade bootstrap: register an app at <https://developer.tastytrade.com>, write `TASTYTRADE_PROVIDER_SECRET=...` into `config/secrets.env`, then `python -m scripts.bootstrap_tastytrade --sandbox` (interactive) or `python -m scripts.bootstrap_tastytrade --sandbox --username you@example.com --password-stdin <pw.txt`. Add `--prod` later for production. The script writes `TASTYTRADE_REMEMBER_TOKEN`, `TASTYTRADE_USE_SANDBOX`, optionally `TASTYTRADE_ACCOUNT_NUMBER` — leaves all other lines untouched.
+- Pre-live checks: `python -m scripts.preflight_live` (text) or `--json`. Exits non-zero if any required check fails. Run before flipping `account.broker` to `tastytrade`.
