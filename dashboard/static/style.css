@@ -89,3 +89,6 @@ button.danger:hover { filter: brightness(1.1); }
 
 pre { font-size: 0.78rem; background: #fafafa; padding: 0.5rem; border: 1px solid var(--border); }
 .caption { color: var(--fg-muted); font-size: 0.85rem; }
+
+tr.row-bad td { background: #fff5f5; }
+tr.row-warn td { background: #fffaeb; }

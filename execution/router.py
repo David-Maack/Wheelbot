@@ -42,11 +42,14 @@ class RouterConfig:
 @dataclass(frozen=True, slots=True)
 class RouteResult:
     proposal: Proposal
-    placed: Order | None  # None when dry-run or risk-failed
+    placed: Order | None  # None when dry-run, risk-failed, or news-blocked
     risk_failed: bool = False
     risk_failure_rule: str | None = None
     risk_failure_detail: str | None = None
     dry_run: bool = False
+    news_decision: str | None = None  # "proceed" | "caution" | "block" | None
+    news_rationale: str | None = None
+    quantity_adjusted: int | None = None  # final qty if news_check forced a halve
 
 
 def _utcnow() -> datetime:
@@ -91,6 +94,8 @@ class OrderRouter:
         repos: Repos,
         config: dict[str, Any],
         universe: dict[str, Any],
+        *,
+        news_checker: Any = None,
     ) -> None:
         self._broker = broker
         self._repos = repos
@@ -98,6 +103,10 @@ class OrderRouter:
         self._universe = universe
         self._cfg = _router_config(config)
         self._gate = RiskGate(broker, repos, config, universe)
+        # News checker is an awaitable that takes (symbol) and returns a
+        # NewsCheckResult-shaped object with .decision / .rationale. Optional —
+        # tests pass a stub or None to disable.
+        self._news_checker = news_checker
 
     async def place(
         self,
@@ -125,6 +134,60 @@ class OrderRouter:
                 risk_failure_detail=exc.detail,
             )
 
+        # News check (only for new short-option opens — closes/rolls are
+        # closing exposure and don't need a fresh news read).
+        news_decision: str | None = None
+        news_rationale: str | None = None
+        effective_qty = proposal.quantity
+        if (
+            self._news_checker is not None
+            and proposal.order_type == OrderType.SELL_TO_OPEN
+        ):
+            check = await self._news_checker(proposal.symbol)
+            news_decision = getattr(check, "decision", None)
+            news_rationale = getattr(check, "rationale", None)
+            log_checkpoint(
+                "router_news_check",
+                status="ok",
+                symbol=proposal.symbol,
+                decision=news_decision,
+            )
+            if news_decision == "block":
+                return RouteResult(
+                    proposal=proposal,
+                    placed=None,
+                    news_decision="block",
+                    news_rationale=news_rationale,
+                )
+            if news_decision == "caution":
+                halved = effective_qty // 2
+                if halved == 0:
+                    # Spec-stretch: caution + qty=1 → block (halving a single
+                    # contract isn't possible).
+                    log_checkpoint(
+                        "router_news_caution_block",
+                        status="ok",
+                        symbol=proposal.symbol,
+                        original_qty=effective_qty,
+                    )
+                    return RouteResult(
+                        proposal=proposal,
+                        placed=None,
+                        news_decision="caution",
+                        news_rationale=(news_rationale or "")
+                        + " | qty=1 cannot be halved — treated as block",
+                    )
+                effective_qty = halved
+                proposal = Proposal(
+                    symbol=proposal.symbol,
+                    contract=proposal.contract,
+                    order_type=proposal.order_type,
+                    quantity=halved,
+                    rationale=proposal.rationale + " (size halved by news_check)",
+                    requires_screen=proposal.requires_screen,
+                    requires_human=proposal.requires_human,
+                )
+
         if self._cfg.dry_run:
             log_checkpoint(
                 "router_dry_run",
@@ -133,7 +196,14 @@ class OrderRouter:
                 occ=proposal.contract.occ_symbol,
                 qty=proposal.quantity,
             )
-            return RouteResult(proposal=proposal, placed=None, dry_run=True)
+            return RouteResult(
+                proposal=proposal,
+                placed=None,
+                dry_run=True,
+                news_decision=news_decision,
+                news_rationale=news_rationale,
+                quantity_adjusted=effective_qty if news_decision == "caution" else None,
+            )
 
         order = self._build_order(proposal, today=today)
         placed = await self._submit_with_retry(order, sleep=sleep)
@@ -142,7 +212,13 @@ class OrderRouter:
         await self._persist_order(placed)
         await self._upsert_position_pending(proposal, placed)
 
-        return RouteResult(proposal=proposal, placed=placed)
+        return RouteResult(
+            proposal=proposal,
+            placed=placed,
+            news_decision=news_decision,
+            news_rationale=news_rationale,
+            quantity_adjusted=effective_qty if news_decision == "caution" else None,
+        )
 
     # -- Internals ------------------------------------------------------------
 

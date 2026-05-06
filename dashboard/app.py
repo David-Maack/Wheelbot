@@ -179,6 +179,51 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         recent = await deps.repos.orders.list_recent(account_id, limit=100)
         return TEMPLATES.TemplateResponse(request, "orders.html", {"orders": recent})
 
+    @app.get("/decisions", response_class=HTMLResponse)
+    async def decisions_view(
+        request: Request,
+        decision_type: str | None = None,
+        decision: str | None = None,
+        _user: str = Depends(authorize),
+    ) -> Any:
+        """Recent LLM decisions — screener, news_check, roll advisor."""
+        c = await deps.repos.db.connect()
+        sql = "SELECT * FROM llm_decisions"
+        params: list[Any] = []
+        wheres: list[str] = []
+        if decision_type:
+            wheres.append("decision_type = ?")
+            params.append(decision_type)
+        if decision:
+            wheres.append("LOWER(decision) = LOWER(?)")
+            params.append(decision)
+        if wheres:
+            sql += " WHERE " + " AND ".join(wheres)
+        sql += " ORDER BY created_at DESC LIMIT 200"
+        async with c.execute(sql, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        decisions = [dict(r) for r in rows]
+
+        async with c.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_decisions "
+            "WHERE date(created_at) = date('now')"
+        ) as cur:
+            spent_today = float((await cur.fetchone())[0])
+        budget_cap = float(
+            deps.config.get("intelligence", {}).get("daily_budget_usd", 1.0)
+        )
+        return TEMPLATES.TemplateResponse(
+            request,
+            "decisions.html",
+            {
+                "decisions": decisions,
+                "filter_type": decision_type or "",
+                "filter_decision": decision or "",
+                "spent_today": spent_today,
+                "budget_cap": budget_cap,
+            },
+        )
+
     @app.get("/risk", response_class=HTMLResponse)
     async def risk_view(request: Request, _user: str = Depends(authorize)) -> Any:
         account_id = deps.config.get("account", {}).get("id", "primary")

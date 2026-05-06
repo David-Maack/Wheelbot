@@ -7,16 +7,17 @@ See `wheelbot_spec.md.pdf` for the full technical specification.
 
 ## Status
 
-Sprint 6 — Tastytrade & Live Prep. `platforms/tastytrade_broker.py` against
-the tastyware/tastytrade SDK 12.x (fully async, OAuth2). Broker factory wires
-`tastytrade` → prod, `tastytrade_sandbox` → cert.tastyworks.com. One-time
-OAuth bootstrap (`scripts/bootstrap_tastytrade.py`) supports both interactive
-and `--password-stdin` headless flows; refuses to clobber an existing prod
-token with sandbox credentials (or vice versa) without `--force`.
-`scripts/preflight_live.py` runs read-only readiness checks (broker auth,
-universe, DB, MANUAL_INTERVENTION queue, kill switch, stop file, regime/IV
-history thinness) before flipping config to production. The reconciler's
-mismatch coverage is reinforced by a dedicated test suite per spec §13 #29.
+Sprint 7 — Intelligence Layer. Daily LLM screener (`intelligence/screener.py`)
+ranks the universe via Opus and writes to the `candidates` table. Pre-trade
+news check (`intelligence/news_check.py`) consults Haiku and gates the order
+router with `proceed/caution/block` decisions — caution halves the position
+(or blocks if quantity=1). Multi-model ensemble voting helper for Sprint 8's
+roll advisor. Daily macro snapshot (`risk/regime.py`) writes SPY/VIX/choppiness
+into `regime_snapshots`; the §8 #7 regime gate becomes load-bearing once
+populated. Daily LLM-spend cap (default $1) tracked in `llm_decisions.cost_usd`
+and enforced before every Anthropic call. Pluggable `NewsSource` ABC
+(Finnhub primary, swap-friendly). Earnings module gains a Finnhub source with
+yfinance fallback. New `/decisions` dashboard view with filter + today's spend.
 
 ## Quick start
 
@@ -72,3 +73,7 @@ Three layers, each overlays the previous:
 - DB backups: `30 23 * * * /opt/wheelbot/.venv/bin/python -m scripts.backup_db` writes `wheelbot-YYYY-MM-DD.sql.gz` to `<db-dir>/backups/` and keeps 30 days.
 - Tastytrade bootstrap: register an app at <https://developer.tastytrade.com>, write `TASTYTRADE_PROVIDER_SECRET=...` into `config/secrets.env`, then `python -m scripts.bootstrap_tastytrade --sandbox` (interactive) or `python -m scripts.bootstrap_tastytrade --sandbox --username you@example.com --password-stdin <pw.txt`. Add `--prod` later for production. The script writes `TASTYTRADE_REMEMBER_TOKEN`, `TASTYTRADE_USE_SANDBOX`, optionally `TASTYTRADE_ACCOUNT_NUMBER` — leaves all other lines untouched.
 - Pre-live checks: `python -m scripts.preflight_live` (text) or `--json`. Exits non-zero if any required check fails. Run before flipping `account.broker` to `tastytrade`.
+- Daily LLM screener: `0 8 * * 1-5 /opt/wheelbot/.venv/bin/python -m scripts.run_screener` writes top-N rows to `candidates`. Visible at `/candidates` in the dashboard.
+- Daily regime snapshot: `30 16 * * 1-5 /opt/wheelbot/.venv/bin/python -m scripts.run_regime` writes one row to `regime_snapshots`. Once present the §8 #7 gate enforces (CSPs blocked when `csps_allowed=false`).
+- LLM spend cap: configured at `intelligence.daily_budget_usd` (default $1). Tracked at `/decisions` with today's spend vs cap. When cap is hit, screener and news_check fail-open (skip + log); router still places orders.
+- News source backups: when Finnhub rate-limits, news_check fails-open (treats as `proceed`). Recommended backups to obtain: `NEWSAPI_API_KEY` (newsapi.org, 100 req/day free), Marketaux, Polygon.io, or Alpaca News (uses your existing Alpaca key). Add a single adapter file in `intelligence/news.py` to plug in.

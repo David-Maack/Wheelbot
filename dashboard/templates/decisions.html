@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Decisions{% endblock %}
+{% block content %}
+<h1>LLM decisions</h1>
+
+<section class="panel">
+  <h2>Today's spend</h2>
+  <dl class="kv">
+    <dt>Spent</dt><dd>${{ "%.4f"|format(spent_today) }}</dd>
+    <dt>Cap</dt><dd>${{ "%.2f"|format(budget_cap) }}</dd>
+    <dt>Remaining</dt>
+    <dd class="{% if spent_today >= budget_cap %}neg{% endif %}">
+      ${{ "%.4f"|format(budget_cap - spent_today) }}
+    </dd>
+  </dl>
+</section>
+
+<form method="get" class="filters">
+  <label>Type
+    <select name="decision_type">
+      <option value="">any</option>
+      <option value="SCREEN" {% if filter_type == 'SCREEN' %}selected{% endif %}>SCREEN</option>
+      <option value="NEWS_CHECK" {% if filter_type == 'NEWS_CHECK' %}selected{% endif %}>NEWS_CHECK</option>
+      <option value="ROLL_ADVISE" {% if filter_type == 'ROLL_ADVISE' %}selected{% endif %}>ROLL_ADVISE</option>
+    </select>
+  </label>
+  <label>Decision
+    <select name="decision">
+      <option value="">any</option>
+      <option value="proceed" {% if filter_decision == 'proceed' %}selected{% endif %}>proceed</option>
+      <option value="caution" {% if filter_decision == 'caution' %}selected{% endif %}>caution</option>
+      <option value="block" {% if filter_decision == 'block' %}selected{% endif %}>block</option>
+    </select>
+  </label>
+  <button type="submit">Filter</button>
+</form>
+
+{% if decisions %}
+<table class="grid">
+  <thead>
+    <tr>
+      <th>Created</th><th>Type</th><th>Model</th><th>Decision</th>
+      <th>Confidence</th><th>Tokens (in/out)</th><th>Cost</th><th>Acted on</th><th>Detail</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for d in decisions %}
+    <tr class="{% if d.decision == 'block' %}row-bad{% elif d.decision == 'caution' %}row-warn{% endif %}">
+      <td>{{ d.created_at }}</td>
+      <td><code>{{ d.decision_type }}</code></td>
+      <td>{{ d.model or "—" }}</td>
+      <td><strong>{{ d.decision or "—" }}</strong></td>
+      <td>{% if d.confidence is not none %}{{ "%.2f"|format(d.confidence) }}{% else %}—{% endif %}</td>
+      <td>{{ d.tokens_in or 0 }}/{{ d.tokens_out or 0 }}</td>
+      <td>{% if d.cost_usd is not none %}${{ "%.4f"|format(d.cost_usd) }}{% else %}—{% endif %}</td>
+      <td>{{ d.acted_on if d.acted_on is not none else "—" }}</td>
+      <td>
+        <details>
+          <summary>raw</summary>
+          <pre><strong>context</strong>
+{{ d.context }}
+
+<strong>response</strong>
+{{ d.response }}</pre>
+        </details>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No LLM decisions yet — screener and news_check arrive with Sprint 7.</p>
+{% endif %}
+{% endblock %}

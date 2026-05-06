@@ -368,6 +368,15 @@ class LlmDecisionsRepo(_Repo):
     async def set_outcome(self, decision_id: int, outcome: str) -> None:
         await self._update(decision_id, {"outcome": outcome})
 
+    async def total_cost_today(self) -> float:
+        c = await self.db.connect()
+        async with c.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_decisions "
+            "WHERE date(created_at) = date('now')"
+        ) as cur:
+            row = await cur.fetchone()
+        return float(row[0]) if row else 0.0
+
 
 class IvHistoryRepo(_Repo):
     table = "iv_history"

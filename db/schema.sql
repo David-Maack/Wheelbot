@@ -134,7 +134,10 @@ CREATE TABLE IF NOT EXISTS llm_decisions (
     confidence     REAL,
     acted_on       BOOLEAN,
     outcome        TEXT,                               -- backfilled later when result known
-    created_at     DATETIME NOT NULL
+    created_at     DATETIME NOT NULL,
+    tokens_in      INTEGER,
+    tokens_out     INTEGER,
+    cost_usd       REAL                                -- per-call cost; sum per day for budget gate
 );
 
 CREATE INDEX IF NOT EXISTS idx_llm_decisions_type ON llm_decisions(decision_type);
