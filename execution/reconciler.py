@@ -47,6 +47,7 @@ from core.models import (
     StateLogTrigger,
     WheelCycle,
 )
+from core.notify import notify
 from db.repo import Repos
 
 
@@ -63,6 +64,7 @@ class ReconcileSummary:
     manual_interventions: int = 0
     cycles_closed: int = 0
     cycles_opened: int = 0
+    rolls_evaluated: int = 0
     transitions: list[tuple[str, PositionState, PositionState, str]] = field(default_factory=list)
 
 
@@ -72,11 +74,19 @@ class Reconciler:
         broker: Broker,
         repos: Repos,
         config: dict[str, Any],
+        *,
+        roll_evaluator: Any = None,
+        universe: dict[str, Any] | None = None,
     ) -> None:
         self._broker = broker
         self._repos = repos
         self._config = config
         self._account_id = config.get("account", {}).get("id", "primary")
+        # Optional callback `(position, short_order, current_quote) -> RollOutcome`.
+        # When provided, the reconciler runs the roll trigger scan after the
+        # standard fill/expiration/assignment sweep. Tests pass a stub.
+        self._roll_evaluator = roll_evaluator
+        self._universe = universe or {"tickers": [], "banned": [], "banned_rules": []}
         # In-memory cursor for "orders updated since"; persists across reconcile_once
         # calls within a single Reconciler instance. Loop runner re-uses the
         # instance so this stays tight.
@@ -92,13 +102,65 @@ class Reconciler:
 
             await self._process_orders(broker_orders, summary)
             await self._reconcile_positions(broker_positions, summary)
+            if self._roll_evaluator is not None:
+                await self._scan_roll_triggers(summary)
 
             ctx["fills"] = summary.fills_processed
             ctx["assignments"] = summary.assignments_processed
             ctx["called_aways"] = summary.called_aways_processed
             ctx["expirations"] = summary.expirations_processed
             ctx["manual_interventions"] = summary.manual_interventions
+            ctx["rolls_evaluated"] = summary.rolls_evaluated
         return summary
+
+    async def _scan_roll_triggers(self, summary: ReconcileSummary) -> None:
+        """For each open short option, check if the trigger is met. The actual
+        evaluation is the orchestrator's job — passed in via roll_evaluator."""
+        active = await self._repos.positions.list_active(self._account_id)
+        for pos in active:
+            if pos.id is None:
+                continue
+            state = pos.state.value if hasattr(pos.state, "value") else str(pos.state)
+            if state not in ("CSP_OPEN", "CC_OPEN"):
+                continue
+            short = await self._latest_short_order_for_position(pos)
+            if short is None or short.contract_symbol is None:
+                continue
+            try:
+                quote = await self._broker.get_quote(short.contract_symbol)
+            except Exception:
+                continue
+            mid = quote.mid if quote.mid is not None else (quote.last or 0.0)
+            try:
+                outcome = await self._roll_evaluator(pos, short, mid)
+            except Exception as exc:
+                log_checkpoint(
+                    "roll_eval_fail", status="fail", symbol=pos.symbol, error=str(exc)
+                )
+                continue
+            if outcome is None or getattr(outcome, "action", None) is None:
+                continue
+            summary.rolls_evaluated += 1
+
+    async def _latest_short_order_for_position(self, pos: Position) -> Order | None:
+        if pos.current_cycle_id is None:
+            return None
+        c = await self._repos.db.connect()
+        async with c.execute(
+            "SELECT * FROM orders WHERE cycle_id = ? AND order_type = ? "
+            "AND status = ? ORDER BY placed_at DESC LIMIT 1",
+            (
+                pos.current_cycle_id,
+                OrderType.SELL_TO_OPEN.value,
+                OrderStatus.FILLED.value,
+            ),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        from db.repo import _row_to_dict, JSON_FIELDS_BY_TABLE
+
+        return Order(**_row_to_dict(row, JSON_FIELDS_BY_TABLE["orders"]))
 
     # -- Order processing -----------------------------------------------------
 
@@ -287,6 +349,12 @@ class Reconciler:
 
     async def _on_assignment(self, local: Position, summary: ReconcileSummary) -> None:
         summary.assignments_processed += 1
+        await notify(
+            "position.assigned",
+            f"{local.symbol} assigned",
+            symbol=local.symbol,
+            cycle_id=local.current_cycle_id,
+        )
         # cost_basis = strike - premium_collected_per_share
         cycle = (
             await self._repos.cycles.get(local.current_cycle_id)
@@ -344,6 +412,12 @@ class Reconciler:
 
     async def _on_called_away(self, local: Position, summary: ReconcileSummary) -> None:
         summary.called_aways_processed += 1
+        await notify(
+            "position.called_away",
+            f"{local.symbol} called away",
+            symbol=local.symbol,
+            cycle_id=local.current_cycle_id,
+        )
         if local.current_cycle_id:
             await self._close_cycle(local.current_cycle_id, CycleOutcome.CC_CALLED_AWAY, summary)
         if local.id is not None:
@@ -365,6 +439,12 @@ class Reconciler:
         summary: ReconcileSummary,
     ) -> None:
         summary.manual_interventions += 1
+        await notify(
+            "position.manual_intervention",
+            f"{symbol} flagged for review",
+            symbol=symbol,
+            reason=reason,
+        )
         existing = await self._repos.positions.get_by_symbol(self._account_id, symbol)
         now = _utcnow()
         if existing is None:
@@ -478,6 +558,16 @@ class Reconciler:
             outcome=outcome.value,
             pnl=pnl,
         )
+        if pnl < 0:
+            await notify(
+                "cycle.closed_loss",
+                f"{cycle.symbol} cycle closed at a loss",
+                cycle_id=cycle_id,
+                symbol=cycle.symbol,
+                pnl_usd=round(pnl, 2),
+                outcome=outcome.value,
+                days_held=days_held,
+            )
 
     async def _compute_cycle_pnl(self, cycle_id: int) -> float:
         c = await self._repos.db.connect()

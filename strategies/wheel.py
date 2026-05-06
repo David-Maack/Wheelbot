@@ -18,12 +18,12 @@ proposals are produced. Selectors here only enforce strike-selection rules
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
-from core.models import OptionContract, OrderType, PositionState
+from core.models import ChainSnapshot, OptionContract, OrderType, PositionState
 from data.ivr import IVRProvider
 from db.repo import Repos
 from strategies.cc_selector import select_cc
@@ -70,6 +70,40 @@ def _build_proposal(
     )
 
 
+def _make_chain_recorder(repos: Repos, *, cycle_id: int | None = None) -> Any:
+    """Returns an async callback the selectors hand the post-filter chain to.
+
+    Fail-safe: when the repos bundle has no chain_snapshots attribute (some
+    tests use a partial fake), skip the snapshot rather than crashing — the
+    snapshot is observability, not load-bearing for the trade itself.
+    """
+    chain_repo = getattr(repos, "chain_snapshots", None)
+    if chain_repo is None:
+        async def _noop(symbol: str, side: str, contracts: list[OptionContract]) -> None:
+            return None
+        return _noop
+
+    async def _record(symbol: str, side: str, contracts: list[OptionContract]) -> None:
+        if not contracts:
+            return
+        underlying_price = next(
+            (c.underlying_price for c in contracts if c.underlying_price is not None),
+            None,
+        )
+        await chain_repo.insert(
+            ChainSnapshot(
+                captured_at=datetime.now(UTC).replace(tzinfo=None),
+                symbol=symbol,
+                side=side,
+                underlying_price=underlying_price,
+                contracts=[c.model_dump(mode="json") for c in contracts],
+                cycle_id=cycle_id,
+            )
+        )
+
+    return _record
+
+
 async def propose_for_symbol(
     broker: Broker,
     repos: Repos,
@@ -84,9 +118,12 @@ async def propose_for_symbol(
     account_id = config.get("account", {}).get("id", "primary")
     position = await repos.positions.get_by_symbol(account_id, symbol)
     state = position.state if position else PositionState.IDLE
+    record = _make_chain_recorder(repos, cycle_id=position.current_cycle_id if position else None)
 
     if state == PositionState.IDLE:
-        contract = await select_csp(broker, symbol, config, universe, ivr, today=today)
+        contract = await select_csp(
+            broker, symbol, config, universe, ivr, today=today, record_chain=record
+        )
         if contract is None:
             return None
         rationale = (
@@ -111,7 +148,13 @@ async def propose_for_symbol(
         if contracts == 0:
             return None
         contract = await select_cc(
-            broker, symbol, position.cost_basis, config, universe, today=today
+            broker,
+            symbol,
+            position.cost_basis,
+            config,
+            universe,
+            today=today,
+            record_chain=record,
         )
         if contract is None:
             return None

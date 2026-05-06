@@ -169,3 +169,24 @@ CREATE TABLE IF NOT EXISTS daily_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_daily_state_date ON daily_state(snapshot_date);
+
+-- Captured option chain at each strategy decision point. The cycle backtester
+-- replays decisions against the stored chain instead of re-fetching live data
+-- (which would have moved). One row per decision; `contracts` holds the
+-- post-filter list the selector evaluated.
+CREATE TABLE IF NOT EXISTS chain_snapshots (
+    id              INTEGER PRIMARY KEY,
+    captured_at     DATETIME NOT NULL,
+    symbol          TEXT NOT NULL,
+    side            TEXT NOT NULL,           -- "put" | "call"
+    underlying_price REAL,
+    contracts       JSON NOT NULL,           -- list of OptionContract dicts
+    decision_id     INTEGER,                 -- FK to llm_decisions when LLM-driven
+    cycle_id        INTEGER,                 -- FK to wheel_cycles when known
+    notes           TEXT,
+    FOREIGN KEY (decision_id) REFERENCES llm_decisions(id),
+    FOREIGN KEY (cycle_id) REFERENCES wheel_cycles(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chain_snapshots_symbol_date ON chain_snapshots(symbol, captured_at);
+CREATE INDEX IF NOT EXISTS idx_chain_snapshots_cycle ON chain_snapshots(cycle_id);

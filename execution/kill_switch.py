@@ -25,6 +25,7 @@ from typing import Any
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.models import DailyState
+from core.notify import notify
 from db.repo import Repos
 
 
@@ -139,6 +140,17 @@ class KillSwitch:
             tripped=result.tripped,
             reasons=reasons,
         )
+        # Edge-trigger: only notify on the transition into armed (avoid spamming
+        # every tick once tripped). `anchor.kill_switch_armed` reflects the
+        # state going INTO this check; we now know whether to write True.
+        was_armed = bool(anchor.kill_switch_armed) if anchor else False
+        if result.tripped and not was_armed:
+            await notify(
+                "risk.kill_switch_armed",
+                "Kill switch armed",
+                account_id=account_id,
+                reasons="; ".join(reasons),
+            )
         return result
 
     async def _consecutive_losses(self, account_id: str, look: int) -> int:

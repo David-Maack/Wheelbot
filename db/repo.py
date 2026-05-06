@@ -18,6 +18,7 @@ import aiosqlite
 
 from core.models import (
     Candidate,
+    ChainSnapshot,
     DailyState,
     IvHistory,
     LlmDecision,
@@ -34,6 +35,7 @@ JSON_FIELDS_BY_TABLE: dict[str, tuple[str, ...]] = {
     "state_log": ("metadata",),
     "candidates": ("raw_llm_response",),
     "llm_decisions": ("context", "response"),
+    "chain_snapshots": ("contracts",),
 }
 
 
@@ -434,6 +436,33 @@ class DailyStateRepo(_Repo):
         await c.commit()
 
 
+class ChainSnapshotsRepo(_Repo):
+    table = "chain_snapshots"
+    json_fields = JSON_FIELDS_BY_TABLE["chain_snapshots"]
+
+    async def insert(self, snapshot: ChainSnapshot) -> int:
+        return await self._insert(self._serialize(snapshot))
+
+    async def get(self, snapshot_id: int) -> ChainSnapshot | None:
+        row = await self._fetch_one("SELECT * FROM chain_snapshots WHERE id = ?", (snapshot_id,))
+        return ChainSnapshot(**row) if row else None
+
+    async def for_cycle(self, cycle_id: int) -> list[ChainSnapshot]:
+        rows = await self._fetch_all(
+            "SELECT * FROM chain_snapshots WHERE cycle_id = ? ORDER BY captured_at",
+            (cycle_id,),
+        )
+        return [ChainSnapshot(**r) for r in rows]
+
+    async def latest_for(self, symbol: str, side: str) -> ChainSnapshot | None:
+        row = await self._fetch_one(
+            "SELECT * FROM chain_snapshots WHERE symbol = ? AND side = ? "
+            "ORDER BY captured_at DESC LIMIT 1",
+            (symbol.upper(), side),
+        )
+        return ChainSnapshot(**row) if row else None
+
+
 class Repos:
     """Convenience bundle so callers can pass a single object."""
 
@@ -448,3 +477,4 @@ class Repos:
         self.llm_decisions = LlmDecisionsRepo(db)
         self.iv_history = IvHistoryRepo(db)
         self.daily_state = DailyStateRepo(db)
+        self.chain_snapshots = ChainSnapshotsRepo(db)

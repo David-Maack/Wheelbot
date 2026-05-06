@@ -25,7 +25,7 @@ Out of scope here (lives in risk/limits.py — Sprint 4):
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
@@ -33,6 +33,11 @@ from core.config import effective_wheel_params
 from core.models import OptionContract
 from data.chain import ChainFilters, annualized_yield, fetch_filtered_chain
 from data.ivr import IVRProvider
+
+# Optional callback that persists the chain we evaluated so the cycle backtester
+# can replay decisions. Caller is responsible for the storage details; selector
+# just hands off the (symbol, side, contracts) tuple.
+ChainRecorder = Callable[[str, str, list[OptionContract]], Awaitable[None]]
 
 
 async def select_csp(
@@ -43,6 +48,7 @@ async def select_csp(
     ivr: IVRProvider,
     *,
     today: date | None = None,
+    record_chain: ChainRecorder | None = None,
 ) -> OptionContract | None:
     """Return the best CSP candidate, or None if nothing passes the filters."""
     today = today or date.today()
@@ -71,6 +77,8 @@ async def select_csp(
     )
 
     candidates = await fetch_filtered_chain(broker, symbol, "put", filters, today=today)
+    if record_chain is not None:
+        await record_chain(symbol, "put", candidates)
     if not candidates:
         log_checkpoint("csp_no_candidates", status="ok", symbol=symbol)
         return None

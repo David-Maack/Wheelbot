@@ -7,17 +7,19 @@ See `wheelbot_spec.md.pdf` for the full technical specification.
 
 ## Status
 
-Sprint 7 — Intelligence Layer. Daily LLM screener (`intelligence/screener.py`)
-ranks the universe via Opus and writes to the `candidates` table. Pre-trade
-news check (`intelligence/news_check.py`) consults Haiku and gates the order
-router with `proceed/caution/block` decisions — caution halves the position
-(or blocks if quantity=1). Multi-model ensemble voting helper for Sprint 8's
-roll advisor. Daily macro snapshot (`risk/regime.py`) writes SPY/VIX/choppiness
-into `regime_snapshots`; the §8 #7 regime gate becomes load-bearing once
-populated. Daily LLM-spend cap (default $1) tracked in `llm_decisions.cost_usd`
-and enforced before every Anthropic call. Pluggable `NewsSource` ABC
-(Finnhub primary, swap-friendly). Earnings module gains a Finnhub source with
-yfinance fallback. New `/decisions` dashboard view with filter + today's spend.
+Sprint 8 — Polish (the last sprint per spec §13). Rule-based roll advisor
+(`strategies/roll_advisor.py`) decides `ROLL` / `LET_ASSIGN` / `CLOSE` for
+ITM short options; LLM ensemble (`intelligence/roll_advisor_llm.py`,
+default off) provides a second pair of eyes. The roll orchestrator halts
+the position for human review on disagreement. Reconciler runs the
+roll-trigger scan each tick. New `chain_snapshots` table captures the
+post-filter chain at each strategy decision so the new
+`scripts/backtest_cycle.py` can replay decisions through current strategy
+code and report divergences. Discord webhook notifier
+(`core/notify.py`) emits state-change and risk events: position assigned,
+called away, MANUAL_INTERVENTION, broker down, kill switch armed, daily
+LLM budget exceeded, roll disagreement, cycle closed at a loss.
+Notifier defaults to a NullNotifier when no `DISCORD_WEBHOOK_URL` is set.
 
 ## Quick start
 
@@ -77,3 +79,5 @@ Three layers, each overlays the previous:
 - Daily regime snapshot: `30 16 * * 1-5 /opt/wheelbot/.venv/bin/python -m scripts.run_regime` writes one row to `regime_snapshots`. Once present the §8 #7 gate enforces (CSPs blocked when `csps_allowed=false`).
 - LLM spend cap: configured at `intelligence.daily_budget_usd` (default $1). Tracked at `/decisions` with today's spend vs cap. When cap is hit, screener and news_check fail-open (skip + log); router still places orders.
 - News source backups: when Finnhub rate-limits, news_check fails-open (treats as `proceed`). Recommended backups to obtain: `NEWSAPI_API_KEY` (newsapi.org, 100 req/day free), Marketaux, Polygon.io, or Alpaca News (uses your existing Alpaca key). Add a single adapter file in `intelligence/news.py` to plug in.
+- Cycle backtester: `python -m scripts.backtest_cycle --cycle-id 42` (or `--json`) replays the cycle's decisions through the *current* strategy code using the chain captured at decision time. Useful for measuring parameter drift after you tune wheel params.
+- Discord notifications: paste a webhook URL into `DISCORD_WEBHOOK_URL` (Discord → Server Settings → Integrations → Webhooks). The bot posts state-change events (assignments, called-away, MANUAL_INTERVENTION) and risk events (kill switch armed, budget exhausted, broker down, roll disagreement, cycle closed at a loss). Disable via `notifications.enabled: false` in config.

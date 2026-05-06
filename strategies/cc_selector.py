@@ -12,13 +12,15 @@ best yield, we won't sell it.
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.config import effective_wheel_params
 from core.models import OptionContract
 from data.chain import ChainFilters, annualized_yield, fetch_filtered_chain
+
+ChainRecorder = Callable[[str, str, list[OptionContract]], Awaitable[None]]
 
 
 async def select_cc(
@@ -29,6 +31,7 @@ async def select_cc(
     universe: dict[str, Any],
     *,
     today: date | None = None,
+    record_chain: ChainRecorder | None = None,
 ) -> OptionContract | None:
     """Return the best CC candidate at or above cost basis, or None."""
     today = today or date.today()
@@ -45,6 +48,8 @@ async def select_cc(
     )
 
     candidates = await fetch_filtered_chain(broker, symbol, "call", filters, today=today)
+    if record_chain is not None:
+        await record_chain(symbol, "call", candidates)
     if not candidates:
         log_checkpoint("cc_no_candidates", status="ok", symbol=symbol)
         return None

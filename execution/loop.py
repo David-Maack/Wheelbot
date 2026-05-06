@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.models import PositionState
+from core.notify import notify
 from db.repo import Repos
 from execution.kill_switch import KillSwitch, KillSwitchResult
 from execution.market_hours import is_market_hours
@@ -102,6 +103,12 @@ class ReconcilerLoop:
         log_checkpoint(
             "loop_broker_down",
             status="fail",
+            n_positions=len(active),
+            consecutive_failures=self._consecutive_failures,
+        )
+        await notify(
+            "position.broker_down",
+            "Broker connection failing — positions paused",
             n_positions=len(active),
             consecutive_failures=self._consecutive_failures,
         )

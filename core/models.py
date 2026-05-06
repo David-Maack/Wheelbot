@@ -213,6 +213,20 @@ class DailyState(_Base):
     kill_switch_reason: str | None = None
 
 
+class ChainSnapshot(_Base):
+    """Captured option chain at a decision point. Used by the cycle backtester."""
+
+    id: int | None = None
+    captured_at: datetime
+    symbol: str
+    side: str  # "put" | "call"
+    underlying_price: float | None = None
+    contracts: list[dict[str, Any]]
+    decision_id: int | None = None
+    cycle_id: int | None = None
+    notes: str | None = None
+
+
 class OptionContract(_Base):
     """Pure data — not persisted. Used by chain selectors and broker adapters."""
 

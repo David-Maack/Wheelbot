@@ -20,8 +20,10 @@ in config.yaml when Anthropic adjusts pricing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from typing import Any
 
+from core.notify import notify
 from db.repo import LlmDecisionsRepo
 
 
@@ -60,6 +62,7 @@ class BudgetTracker:
         for model, prices in overrides.items():
             base = self._pricing.get(model, {"input_per_mtok": 0.0, "output_per_mtok": 0.0})
             self._pricing[model] = {**base, **prices}
+        self._notified_for_date: date | None = None
 
     @property
     def daily_cap_usd(self) -> float:
@@ -100,6 +103,16 @@ class BudgetTracker:
             output_tokens=max_output_tokens,
         ).total
         if spent + worst_case > self._daily_cap:
+            today = datetime.now(UTC).date()
+            if self._notified_for_date != today:
+                self._notified_for_date = today
+                await notify(
+                    "risk.budget_exceeded",
+                    "Daily LLM budget hit",
+                    cap_usd=self._daily_cap,
+                    spent_usd=round(spent, 4),
+                    blocked_call_model=model,
+                )
             raise BudgetExceeded(
                 f"projected ${spent + worst_case:.4f} exceeds daily cap "
                 f"${self._daily_cap:.2f} (already spent ${spent:.4f})"
