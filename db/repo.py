@@ -18,6 +18,7 @@ import aiosqlite
 
 from core.models import (
     Candidate,
+    DailyState,
     IvHistory,
     LlmDecision,
     Order,
@@ -390,6 +391,40 @@ class IvHistoryRepo(_Repo):
         return [IvHistory(**r) for r in rows]
 
 
+class DailyStateRepo(_Repo):
+    table = "daily_state"
+
+    async def get(self, account_id: str, snapshot_date: date) -> DailyState | None:
+        row = await self._fetch_one(
+            "SELECT * FROM daily_state WHERE account_id = ? AND snapshot_date = ?",
+            (account_id, snapshot_date.isoformat()),
+        )
+        return DailyState(**row) if row else None
+
+    async def upsert(self, entry: DailyState) -> None:
+        c = await self.db.connect()
+        await c.execute(
+            "INSERT INTO daily_state "
+            "(account_id, snapshot_date, session_open_equity, consecutive_losses, "
+            " kill_switch_armed, kill_switch_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(account_id, snapshot_date) DO UPDATE SET "
+            " session_open_equity = COALESCE(excluded.session_open_equity, daily_state.session_open_equity), "
+            " consecutive_losses = excluded.consecutive_losses, "
+            " kill_switch_armed = excluded.kill_switch_armed, "
+            " kill_switch_reason = excluded.kill_switch_reason",
+            (
+                entry.account_id,
+                entry.snapshot_date.isoformat(),
+                entry.session_open_equity,
+                entry.consecutive_losses,
+                int(entry.kill_switch_armed),
+                entry.kill_switch_reason,
+            ),
+        )
+        await c.commit()
+
+
 class Repos:
     """Convenience bundle so callers can pass a single object."""
 
@@ -403,3 +438,4 @@ class Repos:
         self.regime = RegimeSnapshotsRepo(db)
         self.llm_decisions = LlmDecisionsRepo(db)
         self.iv_history = IvHistoryRepo(db)
+        self.daily_state = DailyStateRepo(db)

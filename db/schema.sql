@@ -150,3 +150,19 @@ CREATE TABLE IF NOT EXISTS iv_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_iv_history_symbol_date ON iv_history(symbol, snapshot_date);
+
+-- Per-day per-account anchor row used by the kill switch (rules 8-9 of §8).
+-- session_open_equity is captured at the first reconcile-tick of the day so a
+-- mid-day restart doesn't lose the daily-P&L baseline.
+CREATE TABLE IF NOT EXISTS daily_state (
+    id                    INTEGER PRIMARY KEY,
+    account_id            TEXT    NOT NULL,
+    snapshot_date         DATE    NOT NULL,
+    session_open_equity   REAL,
+    consecutive_losses    INTEGER NOT NULL DEFAULT 0,
+    kill_switch_armed     BOOLEAN NOT NULL DEFAULT 0,
+    kill_switch_reason    TEXT,
+    UNIQUE(account_id, snapshot_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_state_date ON daily_state(snapshot_date);

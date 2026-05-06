@@ -198,6 +198,18 @@ class IvHistory(_Base):
     iv_30d: float | None = None
 
 
+class DailyState(_Base):
+    """Per-day per-account anchor row used by execution/kill_switch.py."""
+
+    id: int | None = None
+    account_id: str
+    snapshot_date: date
+    session_open_equity: float | None = None
+    consecutive_losses: int = 0
+    kill_switch_armed: bool = False
+    kill_switch_reason: str | None = None
+
+
 class OptionContract(_Base):
     """Pure data — not persisted. Used by chain selectors and broker adapters."""
 

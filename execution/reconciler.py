@@ -1,0 +1,505 @@
+"""Reconciliation loop — single source of truth for state-after-fill.
+
+Per spec §10:
+
+  Bot can crash, broker can lag, fills can happen overnight (assignments). The
+  reconciler is the source of truth.
+
+  Runs every 5 minutes during market hours, every 30 off-hours.
+
+  For each account_id:
+    1. Fetch current positions from broker.
+    2. Fetch all orders updated since last reconcile.
+    3. Compare to local DB:
+       - New fill → update order, transition state, log.
+       - Assignment → CSP_OPEN → SHARES_HELD, cost_basis = strike - premium.
+       - Worthless expiration → CSP_OPEN → IDLE (or CC_OPEN → SHARES_HELD), close
+         cycle if applicable.
+       - Called away → CC_OPEN → IDLE, close cycle, calc realized P&L.
+       - Mismatch (broker shows position we don't have, or vice versa) → flag
+         MANUAL_INTERVENTION, do NOT auto-correct.
+    4. Recompute cost_basis after every state change.
+
+  The reconciler is the only thing that writes state changes for fills. The order
+  router only writes PENDING. This separation prevents double-counting and means
+  bot crashes mid-order are recoverable.
+
+This module is the most heavily-tested. Every transition path needs a test.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any
+
+from core.broker import Broker
+from core.checkpoint import checkpoint, log_checkpoint
+from core.models import (
+    CycleOutcome,
+    Order,
+    OrderStatus,
+    OrderType,
+    OptionType,
+    Position,
+    PositionState,
+    StateLog,
+    StateLogTrigger,
+    WheelCycle,
+)
+from db.repo import Repos
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+@dataclass(slots=True)
+class ReconcileSummary:
+    fills_processed: int = 0
+    expirations_processed: int = 0
+    assignments_processed: int = 0
+    called_aways_processed: int = 0
+    manual_interventions: int = 0
+    cycles_closed: int = 0
+    cycles_opened: int = 0
+    transitions: list[tuple[str, PositionState, PositionState, str]] = field(default_factory=list)
+
+
+class Reconciler:
+    def __init__(
+        self,
+        broker: Broker,
+        repos: Repos,
+        config: dict[str, Any],
+    ) -> None:
+        self._broker = broker
+        self._repos = repos
+        self._config = config
+        self._account_id = config.get("account", {}).get("id", "primary")
+        # In-memory cursor for "orders updated since"; persists across reconcile_once
+        # calls within a single Reconciler instance. Loop runner re-uses the
+        # instance so this stays tight.
+        self._orders_cursor: datetime | None = None
+
+    async def reconcile_once(self) -> ReconcileSummary:
+        summary = ReconcileSummary()
+        with checkpoint("reconcile_once", account_id=self._account_id) as ctx:
+            broker_positions = await self._broker.get_positions()
+            since = self._orders_cursor or datetime(2000, 1, 1)
+            broker_orders = await self._broker.get_orders_since(since)
+            self._orders_cursor = _utcnow()
+
+            await self._process_orders(broker_orders, summary)
+            await self._reconcile_positions(broker_positions, summary)
+
+            ctx["fills"] = summary.fills_processed
+            ctx["assignments"] = summary.assignments_processed
+            ctx["called_aways"] = summary.called_aways_processed
+            ctx["expirations"] = summary.expirations_processed
+            ctx["manual_interventions"] = summary.manual_interventions
+        return summary
+
+    # -- Order processing -----------------------------------------------------
+
+    async def _process_orders(
+        self,
+        broker_orders: list[Order],
+        summary: ReconcileSummary,
+    ) -> None:
+        for broker_view in broker_orders:
+            if broker_view.client_order_id is None and broker_view.broker_order_id is None:
+                continue
+            local = None
+            if broker_view.client_order_id:
+                local = await self._repos.orders.get_by_client_id(broker_view.client_order_id)
+            if local is None and broker_view.broker_order_id:
+                local = await self._repos.orders.get_by_broker_id(broker_view.broker_order_id)
+            if local is None:
+                # Order at broker we don't know about — flag the affected position.
+                await self._flag_manual_intervention(
+                    broker_view.symbol,
+                    f"unknown order {broker_view.broker_order_id} at broker",
+                    summary,
+                )
+                continue
+            if local.id is None:
+                continue
+
+            # Persist any new fields broker has but DB doesn't.
+            updates: dict[str, Any] = {}
+            if broker_view.broker_order_id and broker_view.broker_order_id != local.broker_order_id:
+                updates["broker_order_id"] = broker_view.broker_order_id
+            if broker_view.status != local.status:
+                updates["status"] = broker_view.status.value if hasattr(broker_view.status, "value") else str(broker_view.status)
+            if broker_view.fill_price is not None and broker_view.fill_price != local.fill_price:
+                updates["fill_price"] = broker_view.fill_price
+            if broker_view.filled_at is not None and broker_view.filled_at != local.filled_at:
+                updates["filled_at"] = broker_view.filled_at.isoformat()
+            if broker_view.raw_response is not None and broker_view.raw_response != local.raw_response:
+                updates["raw_response"] = broker_view.raw_response
+            if updates:
+                await self._repos.orders.update(local.id, **updates)
+
+            # Handle the fill transition.
+            local_was_pending = local.status in (OrderStatus.PENDING, OrderStatus.PARTIAL)
+            now_filled = broker_view.status == OrderStatus.FILLED
+            if local_was_pending and now_filled:
+                await self._on_fill(local, broker_view, summary)
+
+    async def _on_fill(
+        self,
+        local: Order,
+        broker_view: Order,
+        summary: ReconcileSummary,
+    ) -> None:
+        summary.fills_processed += 1
+        symbol = local.symbol
+        position = await self._repos.positions.get_by_symbol(self._account_id, symbol)
+        fill_price = broker_view.fill_price if broker_view.fill_price is not None else (local.limit_price or 0.0)
+
+        if local.order_type == OrderType.SELL_TO_OPEN:
+            # CSP_PENDING → CSP_OPEN, or CC_PENDING → CC_OPEN.
+            is_put = local.option_type == OptionType.PUT
+            new_state = PositionState.CSP_OPEN if is_put else PositionState.CC_OPEN
+            cycle_id = await self._open_cycle_if_csp(local, fill_price, summary) if is_put else None
+            await self._set_position_state(
+                position,
+                symbol,
+                new_state,
+                f"fill:{local.client_order_id}",
+                cycle_id=cycle_id or (position.current_cycle_id if position else None),
+            )
+            if cycle_id is not None and local.id is not None:
+                await self._repos.orders.update(local.id, cycle_id=cycle_id)
+
+        elif local.order_type == OrderType.BUY_TO_CLOSE:
+            # The reconciler infers the resulting state from the contract type +
+            # whether shares are still held. CSP close → IDLE (cycle continues
+            # only if assignment didn't already happen — but if we're buying back
+            # the put, no assignment); CC close → SHARES_HELD.
+            is_put = local.option_type == OptionType.PUT
+            new_state = PositionState.IDLE if is_put else PositionState.SHARES_HELD
+            await self._set_position_state(
+                position,
+                symbol,
+                new_state,
+                f"close:{local.client_order_id}",
+            )
+            if is_put and position and position.current_cycle_id is not None:
+                await self._close_cycle(
+                    position.current_cycle_id,
+                    CycleOutcome.CSP_CLOSED_PROFIT,
+                    summary,
+                )
+
+    async def _open_cycle_if_csp(
+        self,
+        order: Order,
+        fill_price: float,
+        summary: ReconcileSummary,
+    ) -> int | None:
+        if order.order_type != OrderType.SELL_TO_OPEN or order.option_type != OptionType.PUT:
+            return None
+        cycle = WheelCycle(
+            account_id=self._account_id,
+            symbol=order.symbol,
+            started_at=_utcnow(),
+            initial_csp_strike=order.strike,
+            initial_csp_premium=fill_price * 100 * order.quantity,
+            initial_capital_at_risk=(order.strike or 0) * 100 * order.quantity,
+            n_orders=1,
+        )
+        cycle_id = await self._repos.cycles.insert(cycle)
+        summary.cycles_opened += 1
+        return cycle_id
+
+    # -- Position reconciliation ---------------------------------------------
+
+    async def _reconcile_positions(
+        self,
+        broker_positions: list[Position],
+        summary: ReconcileSummary,
+    ) -> None:
+        broker_by_symbol = {p.symbol.upper(): p for p in broker_positions}
+        local_positions = await self._repos.positions.list_all(self._account_id)
+        local_by_symbol = {p.symbol.upper(): p for p in local_positions}
+
+        # Detect transitions implied purely by *position state* that fills alone
+        # don't surface — assignments and worthless expirations.
+        for symbol, local in local_by_symbol.items():
+            broker = broker_by_symbol.get(symbol)
+            await self._diff_one(symbol, local, broker, summary)
+
+        # Symbols at broker we don't track at all.
+        for symbol, broker in broker_by_symbol.items():
+            if symbol in local_by_symbol:
+                continue
+            # Newly discovered position — treat as MANUAL_INTERVENTION rather
+            # than guess at state. Spec §10: "do NOT auto-correct."
+            await self._flag_manual_intervention(
+                broker.symbol,
+                f"broker shows {broker.state} for {broker.symbol} but no local row",
+                summary,
+            )
+
+    async def _diff_one(
+        self,
+        symbol: str,
+        local: Position,
+        broker: Position | None,
+        summary: ReconcileSummary,
+    ) -> None:
+        # Case: local says CSP_OPEN. Broker shows shares → assignment.
+        # Broker shows nothing → worthless expiration.
+        if local.state == PositionState.CSP_OPEN:
+            if broker is None or broker.shares == 0 and broker.state not in (
+                PositionState.CSP_OPEN,
+                PositionState.SHARES_HELD,
+            ):
+                await self._on_csp_expiration(local, summary)
+                return
+            if broker.shares >= 100 or broker.state == PositionState.SHARES_HELD:
+                await self._on_assignment(local, summary)
+                return
+            # Still open at broker — nothing to do.
+            return
+
+        if local.state == PositionState.CC_OPEN:
+            if broker is None or (broker.shares == 0 and broker.state not in (
+                PositionState.CC_OPEN,
+                PositionState.SHARES_HELD,
+            )):
+                await self._on_called_away(local, summary)
+                return
+            if broker.shares > 0 and broker.state == PositionState.SHARES_HELD:
+                await self._on_cc_expiration(local, summary)
+                return
+            return
+
+        if local.state in (PositionState.CSP_PENDING, PositionState.CC_PENDING):
+            # Pending means we have an order but no fill yet. No transition here;
+            # _on_fill drives it.
+            return
+
+        # Anything else: no implied transition from position-shape alone.
+        return
+
+    async def _on_assignment(self, local: Position, summary: ReconcileSummary) -> None:
+        summary.assignments_processed += 1
+        # cost_basis = strike - premium_collected_per_share
+        cycle = (
+            await self._repos.cycles.get(local.current_cycle_id)
+            if local.current_cycle_id
+            else None
+        )
+        strike = (cycle.initial_csp_strike if cycle else None) or 0.0
+        premium_per_share = (
+            (cycle.initial_csp_premium / 100.0)
+            if (cycle and cycle.initial_csp_premium)
+            else 0.0
+        )
+        cost_basis = strike - premium_per_share
+        if local.id is not None:
+            await self._repos.positions.update(
+                local.id,
+                state=PositionState.SHARES_HELD.value,
+                shares=100,  # one assigned put → 100 shares; multi-contract tracked by quantity at fill time
+                cost_basis=cost_basis,
+                state_change_reason="assignment",
+                state_changed_at=_utcnow().isoformat(),
+            )
+            await self._log_state(local.id, local.state, PositionState.SHARES_HELD, "assignment")
+
+    async def _on_csp_expiration(self, local: Position, summary: ReconcileSummary) -> None:
+        summary.expirations_processed += 1
+        if local.current_cycle_id:
+            await self._close_cycle(local.current_cycle_id, CycleOutcome.CSP_EXPIRED, summary)
+        if local.id is not None:
+            await self._repos.positions.update(
+                local.id,
+                state=PositionState.IDLE.value,
+                shares=0,
+                cost_basis=None,
+                current_cycle_id=None,
+                state_change_reason="csp_expired_worthless",
+                state_changed_at=_utcnow().isoformat(),
+            )
+            await self._log_state(
+                local.id, local.state, PositionState.IDLE, "csp_expired_worthless"
+            )
+
+    async def _on_cc_expiration(self, local: Position, summary: ReconcileSummary) -> None:
+        summary.expirations_processed += 1
+        if local.id is not None:
+            await self._repos.positions.update(
+                local.id,
+                state=PositionState.SHARES_HELD.value,
+                state_change_reason="cc_expired_worthless",
+                state_changed_at=_utcnow().isoformat(),
+            )
+            await self._log_state(
+                local.id, local.state, PositionState.SHARES_HELD, "cc_expired_worthless"
+            )
+
+    async def _on_called_away(self, local: Position, summary: ReconcileSummary) -> None:
+        summary.called_aways_processed += 1
+        if local.current_cycle_id:
+            await self._close_cycle(local.current_cycle_id, CycleOutcome.CC_CALLED_AWAY, summary)
+        if local.id is not None:
+            await self._repos.positions.update(
+                local.id,
+                state=PositionState.IDLE.value,
+                shares=0,
+                cost_basis=None,
+                current_cycle_id=None,
+                state_change_reason="called_away",
+                state_changed_at=_utcnow().isoformat(),
+            )
+            await self._log_state(local.id, local.state, PositionState.IDLE, "called_away")
+
+    async def _flag_manual_intervention(
+        self,
+        symbol: str,
+        reason: str,
+        summary: ReconcileSummary,
+    ) -> None:
+        summary.manual_interventions += 1
+        existing = await self._repos.positions.get_by_symbol(self._account_id, symbol)
+        now = _utcnow()
+        if existing is None:
+            inserted_id = await self._repos.positions.insert(
+                Position(
+                    account_id=self._account_id,
+                    symbol=symbol,
+                    state=PositionState.MANUAL_INTERVENTION,
+                    shares=0,
+                    state_changed_at=now,
+                    state_change_reason=reason,
+                )
+            )
+            await self._log_state(inserted_id, None, PositionState.MANUAL_INTERVENTION, reason)
+            return
+        if existing.state == PositionState.MANUAL_INTERVENTION:
+            return  # already flagged
+        if existing.id is not None:
+            await self._repos.positions.update_state(
+                existing.id,
+                PositionState.MANUAL_INTERVENTION,
+                reason,
+                when=now,
+            )
+            await self._log_state(
+                existing.id, existing.state, PositionState.MANUAL_INTERVENTION, reason
+            )
+
+    # -- Helpers --------------------------------------------------------------
+
+    async def _set_position_state(
+        self,
+        position: Position | None,
+        symbol: str,
+        new_state: PositionState,
+        reason: str,
+        *,
+        cycle_id: int | None = None,
+    ) -> None:
+        now = _utcnow()
+        if position is None:
+            inserted_id = await self._repos.positions.insert(
+                Position(
+                    account_id=self._account_id,
+                    symbol=symbol,
+                    state=new_state,
+                    shares=0,
+                    current_cycle_id=cycle_id,
+                    state_changed_at=now,
+                    state_change_reason=reason,
+                )
+            )
+            await self._log_state(inserted_id, None, new_state, reason)
+            return
+        if position.id is None:
+            return
+        update_kwargs: dict[str, Any] = {
+            "state": new_state.value,
+            "state_changed_at": now.isoformat(),
+            "state_change_reason": reason,
+        }
+        if cycle_id is not None and position.current_cycle_id != cycle_id:
+            update_kwargs["current_cycle_id"] = cycle_id
+        await self._repos.positions.update(position.id, **update_kwargs)
+        await self._log_state(position.id, position.state, new_state, reason)
+
+    async def _log_state(
+        self,
+        position_id: int,
+        from_state: PositionState | None,
+        to_state: PositionState,
+        reason: str,
+    ) -> None:
+        await self._repos.state_log.insert(
+            StateLog(
+                position_id=position_id,
+                from_state=from_state,
+                to_state=to_state,
+                reason=reason,
+                triggered_by=StateLogTrigger.RECONCILER,
+                created_at=_utcnow(),
+            )
+        )
+
+    async def _close_cycle(
+        self,
+        cycle_id: int,
+        outcome: CycleOutcome,
+        summary: ReconcileSummary,
+    ) -> None:
+        cycle = await self._repos.cycles.get(cycle_id)
+        if cycle is None or cycle.ended_at is not None:
+            return
+        pnl = await self._compute_cycle_pnl(cycle_id)
+        days_held = max((_utcnow() - cycle.started_at).days, 0) if cycle.started_at else None
+        capital = cycle.initial_capital_at_risk or 0
+        pct = (pnl / capital * 100.0) if capital else None
+        await self._repos.cycles.update(
+            cycle_id,
+            ended_at=_utcnow().isoformat(),
+            final_pnl=pnl,
+            final_pnl_pct=pct,
+            cycle_outcome=outcome.value,
+            days_held=days_held,
+        )
+        summary.cycles_closed += 1
+        log_checkpoint(
+            "cycle_closed",
+            status="ok",
+            cycle_id=cycle_id,
+            outcome=outcome.value,
+            pnl=pnl,
+        )
+
+    async def _compute_cycle_pnl(self, cycle_id: int) -> float:
+        c = await self._repos.db.connect()
+        async with c.execute(
+            "SELECT order_type, quantity, fill_price FROM orders "
+            "WHERE cycle_id = ? AND status = ? AND fill_price IS NOT NULL",
+            (cycle_id, OrderStatus.FILLED.value),
+        ) as cur:
+            rows = await cur.fetchall()
+        pnl = 0.0
+        for row in rows:
+            qty = row["quantity"] or 0
+            price = row["fill_price"] or 0
+            ot = row["order_type"]
+            # SELL credits; BUY debits. Options multiplier 100; stock 1.
+            sign = 1 if ot in (OrderType.SELL_TO_OPEN.value, OrderType.SELL_TO_CLOSE.value) else -1
+            multiplier = 1 if ot in (OrderType.BUY_TO_OPEN.value, OrderType.SELL_TO_CLOSE.value) else 100
+            # BUY_TO_OPEN of stock and SELL_TO_CLOSE of stock are share trades; STO/BTC are option trades.
+            # Heuristic: treat SELL_TO_OPEN/BUY_TO_CLOSE as 100x (option), others as 1x.
+            if ot in (OrderType.SELL_TO_OPEN.value, OrderType.BUY_TO_CLOSE.value):
+                multiplier = 100
+            else:
+                multiplier = 1
+            pnl += sign * price * qty * multiplier
+        return pnl

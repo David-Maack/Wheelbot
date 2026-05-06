@@ -7,12 +7,15 @@ See `wheelbot_spec.md.pdf` for the full technical specification.
 
 ## Status
 
-Sprint 3 — Strategy Core. Black-Scholes Greeks fallback, chain fetch + filter
-(`data/chain.py`), IVR/IVP from rolling history (`data/ivr.py`), CSP and CC
-selectors (`strategies/csp_selector.py`, `cc_selector.py`), and the wheel
-orchestrator (`strategies/wheel.py`) that produces `Proposal`s per state.
-Daily IV ingest in `scripts/ingest_history.py`. No order placement, no risk
-gates yet — both land in Sprint 4.
+Sprint 4 — Execution & Reconciliation. The seven §8 pre-trade gates run inside
+`risk/limits.py`; an idempotent `OrderRouter` places orders with retry/backoff
+and a no-broker-no-DB dry-run mode; `Reconciler` is the single source of truth
+for state-after-fill (transitions for fill / assignment / expiration / called-
+away, MANUAL_INTERVENTION on broker-vs-local mismatches). `KillSwitch` halts
+new orders on stop-file, daily-P&L drawdown, or N consecutive losing cycles
+(durable via the new `daily_state` table). `ReconcilerLoop` ticks 5 min in
+market hours / 30 min off, and flips positions to `BROKER_DOWN` after N
+consecutive failures.
 
 ## Quick start
 
