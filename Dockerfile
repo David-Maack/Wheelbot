@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /opt/wheelbot
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini \
+ && apt-get install -y --no-install-recommends tini curl \
  && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
@@ -36,4 +36,6 @@ USER wheelbot
 EXPOSE 8889
 
 ENTRYPOINT ["tini", "--"]
-CMD ["python", "-m", "strategies.wheel"]
+# Default CMD runs the bot. The dashboard is a separate compose service that
+# overrides CMD with `uvicorn dashboard.app:create_app --factory ...`.
+CMD ["python", "-m", "scripts.run_bot"]

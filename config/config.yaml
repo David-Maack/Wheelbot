@@ -72,14 +72,48 @@ regime:
 intelligence:
   llm_screener_enabled: true
   llm_news_check_enabled: true
-  llm_roll_advisor_enabled: false
+  llm_roll_advisor_enabled: false   # turn on after collecting 3+ months of data
   llm_provider: anthropic
   screener_model: claude-opus-4-7
   news_check_model: claude-haiku-4-5
-  roll_advisor_models:
+  roll_advisor_models:              # ensemble vote
     - claude-opus-4-7
     - claude-haiku-4-5
-  ensemble_quorum: 2
+  ensemble_quorum: 2                # need N agreeing models to act
+
+  # Daily LLM-spend cap. The Anthropic client refuses calls that would push
+  # today's total above this. Screener and news_check fail-open (skip + log)
+  # when exceeded; the router still places orders.
+  daily_budget_usd: 1.00
+
+  # Per-call output token budgets — also used as the worst-case max for the
+  # pre-call budget check.
+  screener_max_tokens: 2048
+  news_check_max_tokens: 256
+  roll_advisor_max_tokens: 384
+
+  # Pluggable news source. make_news_source() in intelligence/news.py
+  # dispatches on this. Currently implemented: "finnhub". Plug in
+  # newsapi.org / Marketaux / Polygon / Alpaca News by adding a single
+  # adapter class.
+  news_source: finnhub
+
+  # Pricing overrides ($ per 1M tokens). Only set when Anthropic adjusts
+  # prices. Defaults are baked into intelligence/budget.py:
+  #   claude-opus-4-7    $15.00 / $75.00
+  #   claude-sonnet-4-6   $3.00 / $15.00
+  #   claude-haiku-4-5    $1.00 /  $5.00
+  # pricing:
+  #   claude-opus-4-7:
+  #     input_per_mtok: 15.0
+  #     output_per_mtok: 75.0
+
+notifications:
+  # NullNotifier when false (events still logged via core/checkpoint).
+  enabled: true
+  # When DISCORD_WEBHOOK_URL is set in secrets.env AND this is true,
+  # state-change + risk events post to the Discord webhook.
+  discord_enabled: true
 
 execution:
   dry_run: false

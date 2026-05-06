@@ -1,0 +1,45 @@
+# Local overrides — copy to config.local.yaml (gitignored).
+#
+# This file is loaded AFTER config.yaml and overlays per top-level section.
+# Use it for environment-specific tweaks (paper vs live, tighter limits during
+# the §12 phased rollout, dry-run during smoke testing).
+#
+# Recommended starting point for §12 Phase 1 (single ticker, Alpaca paper):
+
+account:
+  broker: alpaca_paper
+
+wheel:
+  # Single position during initial paper-trading phase.
+  max_concurrent_positions: 1
+  # Full deployment in that one position so we exercise the cycle quickly.
+  max_position_pct_of_account: 100
+
+risk:
+  # Tighter while learning — 3% drawdown halts new trades for the day.
+  daily_loss_kill_switch_pct: 3
+
+intelligence:
+  # Turn the LLM screener off for Phase 1 — manual ticker selection (just F)
+  # so we can isolate any execution bugs before adding the LLM signal.
+  llm_screener_enabled: false
+  llm_news_check_enabled: false
+  # Keep the LLM roll advisor off until you have ~3 months of cycle data
+  # (spec §12 Phase 6).
+  llm_roll_advisor_enabled: false
+
+# When you're ready to flip to Tastytrade sandbox:
+# account:
+#   broker: tastytrade_sandbox
+#
+# When you're ready to go live:
+# account:
+#   broker: tastytrade
+# wheel:
+#   max_concurrent_positions: 4         # back to default
+#   max_position_pct_of_account: 30
+# risk:
+#   daily_loss_kill_switch_pct: 5
+# intelligence:
+#   llm_screener_enabled: true
+#   llm_news_check_enabled: true

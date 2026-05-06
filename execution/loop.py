@@ -37,13 +37,18 @@ class ReconcilerLoop:
         config: dict[str, Any],
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        reconciler: Reconciler | None = None,
+        post_tick: Callable[["ReconcilerLoop", "KillSwitchResult | None"], Awaitable[None]] | None = None,
     ) -> None:
         self._broker = broker
         self._repos = repos
         self._config = config
         self._sleep = sleep
-        self._reconciler = Reconciler(broker, repos, config)
+        # Production callers pass an injected Reconciler so they can wire a
+        # roll_evaluator etc.; tests/the simple case construct one inline.
+        self._reconciler = reconciler or Reconciler(broker, repos, config)
         self._kill_switch = KillSwitch(broker, repos, config)
+        self._post_tick = post_tick
         self._consecutive_failures = 0
         section = config.get("reconciler", {})
         self._market_interval = float(section.get("market_hours_interval_seconds", 300))
@@ -77,6 +82,15 @@ class ReconcilerLoop:
             return self._reconciler, None
 
         ks = await self._kill_switch.check()
+        if self._post_tick is not None:
+            try:
+                await self._post_tick(self, ks)
+            except Exception as exc:
+                log_checkpoint(
+                    "loop_post_tick_fail",
+                    status="fail",
+                    error=str(exc),
+                )
         return self._reconciler, ks
 
     async def run_forever(self) -> None:
