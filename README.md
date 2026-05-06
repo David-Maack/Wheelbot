@@ -7,20 +7,28 @@ See `wheelbot_spec.md.pdf` for the full technical specification.
 
 ## Status
 
-Sprint 1 — Foundation. Repo skeleton, DB schema, Pydantic models, repo layer, config loader,
-and checkpoint logger. No broker integration, no live orders.
+Sprint 2 — Broker Abstraction. Async `Broker` ABC, in-memory `PaperBroker` for unit
+tests, and an `AlpacaBroker` adapter against Alpaca paper. Strategy code (Sprint 3+)
+goes through `core.broker_factory.make_broker`. No live orders.
 
 ## Quick start
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -e ".[dev,broker]"     # 'broker' brings alpaca-py + tastytrade
 
 cp config/secrets.env.example config/secrets.env
 # edit config/secrets.env with your keys
 
 python scripts/bootstrap_db.py
+```
+
+## Tests
+
+```bash
+pytest tests/unit                  # always run, no creds needed
+pytest tests/integration -v        # auto-skips if ALPACA_API_KEY/SECRET unset
 ```
 
 ## Layout

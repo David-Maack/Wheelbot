@@ -219,6 +219,36 @@ class OptionContract(_Base):
     underlying_price: float | None = None
 
 
+class Account(_Base):
+    """Snapshot of broker-reported account state. Not persisted."""
+
+    account_id: str
+    cash: float
+    buying_power: float
+    equity: float
+    options_buying_power: float | None = None
+    maintenance_margin: float | None = None
+    pattern_day_trader: bool | None = None
+
+
+class Quote(_Base):
+    """Top-of-book snapshot for a stock or option. Not persisted."""
+
+    symbol: str
+    bid: float | None = None
+    ask: float | None = None
+    last: float | None = None
+    bid_size: int | None = None
+    ask_size: int | None = None
+    timestamp: datetime | None = None
+
+    @property
+    def mid(self) -> float | None:
+        if self.bid is None or self.ask is None:
+            return None
+        return (self.bid + self.ask) / 2
+
+
 class UniverseEntry(_Base):
     symbol: str
     name: str | None = None

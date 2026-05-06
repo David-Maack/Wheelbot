@@ -60,6 +60,9 @@ packages = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: hits a live broker sandbox; needs creds in config/secrets.env",
+]
 
 [tool.ruff]
 line-length = 100
