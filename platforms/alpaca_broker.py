@@ -58,8 +58,21 @@ def _strip_tz(dt: datetime | None) -> datetime | None:
     return dt
 
 
-def _map_status(alpaca_status: str) -> OrderStatus:
-    s = alpaca_status.lower() if isinstance(alpaca_status, str) else str(alpaca_status).lower()
+def _map_status(alpaca_status: Any) -> OrderStatus:
+    """Map alpaca-py OrderStatus to our OrderStatus.
+
+    alpaca-py's OrderStatus is `class OrderStatus(str, Enum)`. The instance
+    IS a string with content like "filled", but `str(instance)` returns
+    `"OrderStatus.FILLED"` (Enum's __str__ override). We need the value, not
+    the qualname — `.value` is the canonical accessor; `str(.value)` is
+    defensive against future changes.
+    """
+    if hasattr(alpaca_status, "value"):
+        s = str(alpaca_status.value).lower()
+    elif isinstance(alpaca_status, str):
+        s = alpaca_status.lower()
+    else:
+        s = str(alpaca_status).lower()
     if s == "filled":
         return OrderStatus.FILLED
     if s == "partially_filled":
@@ -376,7 +389,7 @@ class AlpacaBroker(Broker):
             quantity=int(float(raw.qty or 0)),
             limit_price=float(raw.limit_price) if raw.limit_price else None,
             fill_price=float(raw.filled_avg_price) if raw.filled_avg_price else None,
-            status=_map_status(str(raw.status)),
+            status=_map_status(raw.status),
             placed_at=_strip_tz(raw.submitted_at) or _utcnow(),
             filled_at=_strip_tz(raw.filled_at),
             raw_request=None,
