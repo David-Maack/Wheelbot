@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Performance{% endblock %}
+{% block content %}
+<h1>Performance</h1>
+
+<section class="stat-grid">
+  <div class="stat">
+    <div class="stat-label">Realized P&amp;L</div>
+    <div class="stat-value {% if data.stats.total_realized_pnl_usd > 0 %}pos{% elif data.stats.total_realized_pnl_usd < 0 %}neg{% endif %}">
+      {% if data.stats.n_closed %}{{ "%+.2f"|format(data.stats.total_realized_pnl_usd) }}{% else %}—{% endif %}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Wins / Losses</div>
+    <div class="stat-value">
+      <span class="pos">{{ data.stats.wins }}</span>
+      / <span class="neg">{{ data.stats.losses }}</span>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Win rate</div>
+    <div class="stat-value">
+      {% if data.stats.win_rate_pct is not none %}{{ "%.1f"|format(data.stats.win_rate_pct) }}%{% else %}—{% endif %}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Closed cycles</div>
+    <div class="stat-value">{{ data.stats.n_closed }}</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Open cycles</div>
+    <div class="stat-value">{{ data.stats.open_cycles }}</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Avg days held</div>
+    <div class="stat-value">
+      {% if data.stats.avg_days_held is not none %}{{ "%.1f"|format(data.stats.avg_days_held) }}{% else %}—{% endif %}
+    </div>
+  </div>
+</section>
+
+{% if data.stats.n_closed == 0 %}
+<section class="panel">
+  <p class="empty">No closed cycles yet — charts will populate as the bot completes its first wheel.
+  Phase 1 (single position, 30–45 DTE) typically produces 1–2 cycles per month.</p>
+</section>
+{% else %}
+<section class="panel">
+  <h2>Cumulative realized P&amp;L</h2>
+  <canvas id="cumChart" height="120"></canvas>
+</section>
+
+<div class="two-col">
+  <section class="panel">
+    <h2>Per-cycle P&amp;L</h2>
+    <canvas id="cycleChart" height="200"></canvas>
+  </section>
+
+  <section class="panel">
+    <h2>Outcomes</h2>
+    <canvas id="outcomeChart" height="200"></canvas>
+  </section>
+</div>
+{% endif %}
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+  const PERF = {{ data | tojson }};
+
+  function fmtDate(iso) {
+    if (!iso) return "—";
+    return iso.slice(0, 10);
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    if (PERF.stats.n_closed === 0) return;
+
+    const labels = PERF.cumulative.map(p => fmtDate(p.ended_at));
+    const running = PERF.cumulative.map(p => p.running);
+    const cyclePnl = PERF.cumulative.map(p => p.pnl);
+    const cycleColors = cyclePnl.map(v => v >= 0 ? "#128a30" : "#b22222");
+    const cycleLabels = PERF.cumulative.map(p => p.symbol + " " + fmtDate(p.ended_at));
+
+    new Chart(document.getElementById("cumChart"), {
+      type: "line",
+      data: {
+        labels: labels,
+        datasets: [{
+          label: "Cumulative P&L",
+          data: running,
+          borderColor: "#128a30",
+          backgroundColor: "rgba(18, 138, 48, 0.12)",
+          fill: true,
+          tension: 0.2,
+          pointRadius: 4,
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: { y: { ticks: { callback: v => "$" + v.toFixed(2) } } },
+        plugins: { legend: { display: false } }
+      }
+    });
+
+    new Chart(document.getElementById("cycleChart"), {
+      type: "bar",
+      data: {
+        labels: cycleLabels,
+        datasets: [{
+          label: "Cycle P&L",
+          data: cyclePnl,
+          backgroundColor: cycleColors,
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: { y: { ticks: { callback: v => "$" + v.toFixed(0) } } },
+        plugins: { legend: { display: false } }
+      }
+    });
+
+    const outcomeLabels = Object.keys(PERF.outcomes);
+    const outcomeValues = outcomeLabels.map(k => PERF.outcomes[k]);
+    const palette = ["#128a30", "#1e7eb1", "#c97700", "#b22222", "#8a4ec0", "#666"];
+    new Chart(document.getElementById("outcomeChart"), {
+      type: "doughnut",
+      data: {
+        labels: outcomeLabels,
+        datasets: [{
+          data: outcomeValues,
+          backgroundColor: outcomeLabels.map((_, i) => palette[i % palette.length])
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { position: "bottom" } }
+      }
+    });
+  });
+</script>
+{% endblock %}

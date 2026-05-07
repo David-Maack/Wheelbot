@@ -92,3 +92,36 @@ pre { font-size: 0.78rem; background: #fafafa; padding: 0.5rem; border: 1px soli
 
 tr.row-bad td { background: #fff5f5; }
 tr.row-warn td { background: #fffaeb; }
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.stat {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.6rem 0.9rem;
+}
+.stat-label {
+  font-size: 0.78rem;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.stat-value {
+  font-size: 1.4rem;
+  font-weight: 600;
+  margin-top: 0.2rem;
+}
+
+.two-col {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 1rem;
+}
+@media (max-width: 800px) {
+  .two-col { grid-template-columns: 1fr; }
+}

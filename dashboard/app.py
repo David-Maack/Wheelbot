@@ -224,6 +224,15 @@ def build_app(deps: DashboardDeps) -> FastAPI:
             },
         )
 
+    @app.get("/performance", response_class=HTMLResponse)
+    async def performance_view(request: Request, _user: str = Depends(authorize)) -> Any:
+        data = await _performance_data(deps)
+        return TEMPLATES.TemplateResponse(
+            request,
+            "performance.html",
+            {"data": data},
+        )
+
     @app.get("/risk", response_class=HTMLResponse)
     async def risk_view(request: Request, _user: str = Depends(authorize)) -> Any:
         account_id = deps.config.get("account", {}).get("id", "primary")
@@ -362,6 +371,75 @@ async def _latest_regime_row(deps: DashboardDeps) -> dict[str, Any] | None:
     ) as cur:
         row = await cur.fetchone()
     return dict(row) if row else None
+
+
+async def _performance_data(deps: DashboardDeps) -> dict[str, Any]:
+    """Aggregate stats + time series for the /performance view.
+
+    All numbers come from wheel_cycles. The cumulative P&L list is sorted by
+    cycle close time so Chart.js can plot it as a single line.
+    """
+    account_id = deps.config.get("account", {}).get("id", "primary")
+    c = await deps.repos.db.connect()
+
+    async with c.execute(
+        "SELECT id, symbol, started_at, ended_at, final_pnl, "
+        "       cycle_outcome, days_held "
+        "FROM wheel_cycles "
+        "WHERE account_id = ? AND ended_at IS NOT NULL AND final_pnl IS NOT NULL "
+        "ORDER BY ended_at",
+        (account_id,),
+    ) as cur:
+        closed_rows = await cur.fetchall()
+    closed = [dict(r) for r in closed_rows]
+
+    async with c.execute(
+        "SELECT COUNT(*) FROM wheel_cycles "
+        "WHERE account_id = ? AND ended_at IS NULL",
+        (account_id,),
+    ) as cur:
+        open_count = (await cur.fetchone())[0]
+
+    cumulative: list[dict[str, Any]] = []
+    running = 0.0
+    for row in closed:
+        running += float(row["final_pnl"] or 0)
+        cumulative.append(
+            {
+                "ended_at": row["ended_at"],
+                "symbol": row["symbol"],
+                "pnl": float(row["final_pnl"] or 0),
+                "running": running,
+                "outcome": row["cycle_outcome"],
+            }
+        )
+
+    wins = sum(1 for r in closed if (r["final_pnl"] or 0) > 0)
+    losses = sum(1 for r in closed if (r["final_pnl"] or 0) < 0)
+    total_pnl = sum(float(r["final_pnl"] or 0) for r in closed)
+    win_rate = (wins / len(closed) * 100.0) if closed else None
+
+    days_held = [int(r["days_held"]) for r in closed if r["days_held"] is not None]
+    avg_days = (sum(days_held) / len(days_held)) if days_held else None
+
+    outcomes: dict[str, int] = {}
+    for r in closed:
+        key = r["cycle_outcome"] or "UNKNOWN"
+        outcomes[key] = outcomes.get(key, 0) + 1
+
+    return {
+        "stats": {
+            "total_realized_pnl_usd": total_pnl,
+            "wins": wins,
+            "losses": losses,
+            "n_closed": len(closed),
+            "win_rate_pct": win_rate,
+            "open_cycles": int(open_count),
+            "avg_days_held": avg_days,
+        },
+        "cumulative": cumulative,
+        "outcomes": outcomes,
+    }
 
 
 # --- Production factory -------------------------------------------------------
