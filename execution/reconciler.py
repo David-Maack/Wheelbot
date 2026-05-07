@@ -30,7 +30,7 @@ This module is the most heavily-tested. Every transition path needs a test.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.broker import Broker
@@ -96,7 +96,19 @@ class Reconciler:
         summary = ReconcileSummary()
         with checkpoint("reconcile_once", account_id=self._account_id) as ctx:
             broker_positions = await self._broker.get_positions()
+            # Cursor is the upper bound on what we've already processed, but
+            # we MUST always include any in-flight (PENDING/PARTIAL) orders so
+            # we catch their eventual FILLED status. Alpaca's get_orders_since
+            # filters by submitted_at, not updated_at — so an order submitted
+            # before the cursor would otherwise be invisible to subsequent ticks.
             since = self._orders_cursor or datetime(2000, 1, 1)
+            oldest_pending = await self._repos.orders.oldest_pending_placed_at(
+                self._account_id
+            )
+            if oldest_pending is not None and oldest_pending < since:
+                # Hold the lookback window to include the oldest pending order
+                # (small safety margin for clock skew).
+                since = oldest_pending - timedelta(seconds=5)
             broker_orders = await self._broker.get_orders_since(since)
             self._orders_cursor = _utcnow()
 

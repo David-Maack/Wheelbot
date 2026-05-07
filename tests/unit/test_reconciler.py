@@ -317,6 +317,44 @@ async def test_called_away_persists_synthetic_stock_sell_for_cycle_pnl(db_repos)
 
 
 @pytest.mark.asyncio
+async def test_pending_orders_keep_cursor_from_advancing_past_them(db_repos):
+    """Regression: Alpaca returns 'accepted' + filled_avg_price set briefly
+    before flipping to 'filled'. If our cursor advances past placed_at, we
+    miss the eventual FILLED transition. Reconciler must hold lookback to
+    include the oldest in-flight order."""
+
+    class _RecordingBroker(PaperBroker):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.since_calls: list[datetime] = []
+
+        async def get_orders_since(self, since: datetime):
+            self.since_calls.append(since)
+            return await super().get_orders_since(since)
+
+    broker = _RecordingBroker(cash=20_000)
+    pos, broker_order = await _seed_csp_pending(db_repos, broker)
+    rec = Reconciler(broker, db_repos, _config())
+
+    # First tick — sees the pending order, advances cursor.
+    await rec.reconcile_once()
+    cursor_after_tick1 = rec._orders_cursor
+    assert cursor_after_tick1 is not None
+
+    # Sleep-equivalent: bump the cursor as if 5 minutes passed.
+    rec._orders_cursor = cursor_after_tick1 + timedelta(seconds=300)
+    placed_at = (await db_repos.orders.get_by_client_id("wb-test-csp-1")).placed_at
+
+    # Second tick — there's still a pending order. The lookback must extend
+    # back to (at least) the pending order's placed_at, not the bumped cursor.
+    await rec.reconcile_once()
+    last_since = broker.since_calls[-1]
+    assert last_since <= placed_at, (
+        f"reconciler cursor advanced past pending order ({last_since} > {placed_at})"
+    )
+
+
+@pytest.mark.asyncio
 async def test_already_idle_position_stays_idle(db_repos):
     broker = PaperBroker(cash=20_000)
     await db_repos.positions.insert(

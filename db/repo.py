@@ -235,6 +235,24 @@ class OrdersRepo(_Repo):
         )
         return [Order(**r) for r in rows]
 
+    async def oldest_pending_placed_at(self, account_id: str) -> datetime | None:
+        """Earliest placed_at among PENDING/PARTIAL orders for this account.
+
+        Used by Reconciler to keep the orders cursor from advancing past
+        in-flight orders so subsequent get_orders_since() calls still see them
+        when the broker eventually flips them to FILLED.
+        """
+        c = await self.db.connect()
+        async with c.execute(
+            "SELECT MIN(placed_at) AS placed_at FROM orders "
+            "WHERE account_id = ? AND status IN ('PENDING','PARTIAL')",
+            (account_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or row["placed_at"] is None:
+            return None
+        return datetime.fromisoformat(row["placed_at"])
+
     async def list_recent(self, account_id: str, limit: int = 50) -> list[Order]:
         rows = await self._fetch_all(
             "SELECT * FROM orders WHERE account_id = ? ORDER BY placed_at DESC LIMIT ?",
