@@ -73,9 +73,21 @@ async def _make_news_check_callable(news, anthropic, config):
 
 
 async def _make_roll_evaluator(
-    broker: Broker, repos: Repos, anthropic, config, universe
+    broker: Broker,
+    repos: Repos,
+    anthropic,
+    config,
+    universe,
+    *,
+    router: OrderRouter | None = None,
 ):
-    """Returns the callable the Reconciler's roll-trigger scan invokes."""
+    """Returns the callable the Reconciler's roll-trigger scan invokes.
+
+    When `router` is provided, ROLL/CLOSE outcomes are *executed* leg-by-leg
+    through the same router (full risk gates + idempotency). LET_ASSIGN is a
+    no-op by design — wait for the broker to assign. Disagreement halts the
+    position via the orchestrator and never reaches here.
+    """
 
     async def _eval(position: Position, short: Order, current_mid: float):
         if short.contract_symbol is None or short.option_type is None or short.strike is None:
@@ -141,26 +153,78 @@ async def _make_roll_evaluator(
             config=config,
             universe=universe,
         )
+        # Execute the action through the router (leg-by-leg; no multi-leg
+        # primitive in the broker ABC by design).
+        if router is not None and outcome.action is not None and not outcome.halted:
+            await _execute_roll_action(
+                router=router,
+                outcome=outcome,
+                position=position,
+                short=short,
+                short_contract=short_contract,
+            )
         return outcome
 
     return _eval
 
 
-async def _execute_roll_outcomes(
+async def _execute_roll_action(
     *,
-    broker: Broker,
-    repos: Repos,
     router: OrderRouter,
-    config: dict[str, Any],
+    outcome,
+    position: Position,
+    short: Order,
+    short_contract,
 ):
-    """After a reconcile pass, walk active positions whose roll_evaluator
-    returned a non-None action and place the corresponding orders. Today the
-    evaluator runs inside the reconciler and only stores the outcome via
-    log_checkpoint + state_log; this hook is where future multi-leg roll
-    execution would land. Punt-marker: leg-by-leg execution is deliberately
-    not wired here because the orchestrator's halt-on-disagreement path
-    already serves the common case (rules + LLM both off → rule-only)."""
-    return  # see docstring
+    """Place the BTC (and optional STO) implied by the roll outcome."""
+    from strategies.roll_advisor import RollAction
+    from strategies.wheel import Proposal
+
+    qty = max(short.quantity, 1)
+    if outcome.action in (RollAction.ROLL, RollAction.CLOSE):
+        btc = Proposal(
+            symbol=position.symbol,
+            contract=short_contract,
+            order_type=OrderType.BUY_TO_CLOSE,
+            quantity=qty,
+            rationale=f"roll_advisor:{outcome.action.value}",
+        )
+        try:
+            btc_result = await router.place(btc)
+            log_checkpoint(
+                "roll_btc",
+                status="ok",
+                symbol=position.symbol,
+                action=outcome.action.value,
+                placed=btc_result.placed is not None,
+            )
+        except Exception as exc:
+            log_checkpoint(
+                "roll_btc_fail", status="fail", symbol=position.symbol, error=str(exc)
+            )
+            return
+
+    if outcome.action == RollAction.ROLL and outcome.rule and outcome.rule.new_contract:
+        sto = Proposal(
+            symbol=position.symbol,
+            contract=outcome.rule.new_contract,
+            order_type=OrderType.SELL_TO_OPEN,
+            quantity=qty,
+            rationale=f"roll_advisor:ROLL credit {outcome.rule.expected_credit_per_share}",
+        )
+        try:
+            sto_result = await router.place(sto)
+            log_checkpoint(
+                "roll_sto",
+                status="ok",
+                symbol=position.symbol,
+                placed=sto_result.placed is not None,
+                new_strike=outcome.rule.new_contract.strike,
+            )
+        except Exception as exc:
+            log_checkpoint(
+                "roll_sto_fail", status="fail", symbol=position.symbol, error=str(exc)
+            )
 
 
 async def _propose_and_route(
@@ -240,9 +304,10 @@ async def main(argv: list[str] | None = None) -> int:
     ivr = IVRProvider(repos.iv_history)
 
     news_check_callable = await _make_news_check_callable(news, anthropic, config)
-    roll_evaluator = await _make_roll_evaluator(broker, repos, anthropic, config, universe)
-
     router = OrderRouter(broker, repos, config, universe, news_checker=news_check_callable)
+    roll_evaluator = await _make_roll_evaluator(
+        broker, repos, anthropic, config, universe, router=router
+    )
 
     reconciler = Reconciler(
         broker, repos, config, roll_evaluator=roll_evaluator, universe=universe

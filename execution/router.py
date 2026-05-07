@@ -134,14 +134,18 @@ class OrderRouter:
                 risk_failure_detail=exc.detail,
             )
 
-        # News check (only for new short-option opens — closes/rolls are
-        # closing exposure and don't need a fresh news read).
+        # News check (spec §9.2: "Before placing any new CSP" — puts only).
+        # CCs are about closing existing exposure on already-held shares; a
+        # news catalyst is a different decision class. Closes/rolls also skip.
         news_decision: str | None = None
         news_rationale: str | None = None
         effective_qty = proposal.quantity
+        from core.models import OptionType
+
         if (
             self._news_checker is not None
             and proposal.order_type == OrderType.SELL_TO_OPEN
+            and proposal.contract.option_type == OptionType.PUT
         ):
             check = await self._news_checker(proposal.symbol)
             news_decision = getattr(check, "decision", None)

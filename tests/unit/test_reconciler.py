@@ -18,6 +18,7 @@ import pytest
 
 from core.broker import BrokerUnavailable
 from core.models import (
+    CycleOutcome,
     Order,
     OrderStatus,
     OrderType,
@@ -25,8 +26,9 @@ from core.models import (
     Position,
     PositionState,
     Quote,
+    WheelCycle,
 )
-from execution.reconciler import Reconciler
+from execution.reconciler import ReconcileSummary, Reconciler
 from platforms.paper_broker import PaperBroker
 
 
@@ -202,6 +204,116 @@ async def test_pending_order_not_yet_filled_is_a_noop(db_repos):
     assert summary.cycles_opened == 0
     pos = await db_repos.positions.get_by_symbol("test", "F")
     assert pos.state == PositionState.CSP_PENDING
+
+
+@pytest.mark.asyncio
+async def test_assignment_persists_synthetic_stock_buy_for_cycle_pnl(db_repos):
+    """Assignment must write a BUY_TO_OPEN row so cycle P&L includes the cost
+    basis. Without it, manual_close after a stock drop reports a fake gain."""
+    broker = PaperBroker(cash=20_000)
+    _pos, broker_order = await _seed_csp_pending(db_repos, broker)
+    await broker.fill_order(broker_order.broker_order_id, fill_price=0.50)
+    rec = Reconciler(broker, db_repos, _config())
+    await rec.reconcile_once()  # CSP_OPEN + cycle opened
+
+    await broker.assign("F250706P00009500")
+    await rec.reconcile_once()
+
+    # Cycle order log should now contain a BUY_TO_OPEN at strike 9.5 for 100 shares.
+    pos = await db_repos.positions.get_by_symbol("test", "F")
+    cycle = await db_repos.cycles.get(pos.current_cycle_id) if pos.current_cycle_id else None
+    if cycle is None:
+        # cycle was closed in this assignment? assignment alone shouldn't close it.
+        c = await db_repos.db.connect()
+        async with c.execute("SELECT * FROM orders WHERE order_type = ?", (OrderType.BUY_TO_OPEN.value,)) as cur:
+            rows = await cur.fetchall()
+    else:
+        c = await db_repos.db.connect()
+        async with c.execute(
+            "SELECT * FROM orders WHERE cycle_id = ? AND order_type = ?",
+            (pos.current_cycle_id, OrderType.BUY_TO_OPEN.value),
+        ) as cur:
+            rows = await cur.fetchall()
+    assert any(
+        int(r["quantity"]) == 100 and float(r["fill_price"]) == pytest.approx(9.5)
+        for r in rows
+    ), "expected synthetic BUY_TO_OPEN @ strike 9.5 × 100 shares for the cycle"
+
+
+@pytest.mark.asyncio
+async def test_called_away_persists_synthetic_stock_sell_for_cycle_pnl(db_repos):
+    """Called-away must persist a SELL_TO_CLOSE @ CC strike so cycle P&L
+    captures the share gain. Pre-fix this returned +80 (premium only)."""
+    # Seed a closed-cycle's prior orders directly (the paper broker collapses
+    # a stock-+-short-call pair into one position row, which would prevent the
+    # reconciler from seeing the CC_OPEN state — fine for real brokers, but a
+    # surprise here. So we test _on_called_away as a unit.)
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(
+            account_id="test", symbol="F", started_at=_utc(),
+            initial_csp_strike=9.5, initial_csp_premium=50.0, n_orders=2,
+        )
+    )
+    # CSP fill: collected $50 premium.
+    await db_repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", cycle_id=cycle_id,
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol="F250706P00009500",
+            strike=9.5, expiration=date(2025, 7, 6),
+            option_type=OptionType.PUT,
+            quantity=1, fill_price=0.50,
+            status=OrderStatus.FILLED,
+            placed_at=_utc(),
+            client_order_id="wb-csp",
+        )
+    )
+    # Synthetic BUY_TO_OPEN from assignment (this is what _on_assignment writes).
+    await db_repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", cycle_id=cycle_id,
+            order_type=OrderType.BUY_TO_OPEN,
+            contract_symbol=None, strike=None, expiration=None, option_type=None,
+            quantity=100, fill_price=9.0,
+            status=OrderStatus.FILLED,
+            placed_at=_utc(),
+            client_order_id="wb-csp-assign",
+        )
+    )
+    # CC fill at strike 10.5 / premium 0.30.
+    await db_repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", cycle_id=cycle_id,
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol="F250706C00010500",
+            strike=10.5, expiration=date(2025, 7, 6),
+            option_type=OptionType.CALL,
+            quantity=1, fill_price=0.30,
+            status=OrderStatus.FILLED,
+            placed_at=_utc(),
+            client_order_id="wb-cc",
+        )
+    )
+    pos_id = await db_repos.positions.insert(
+        Position(
+            account_id="test", symbol="F",
+            state=PositionState.CC_OPEN,
+            shares=100, cost_basis=9.0,
+            current_cycle_id=cycle_id,
+            state_changed_at=_utc(),
+        )
+    )
+
+    broker = PaperBroker(cash=30_000)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    pos = await db_repos.positions.get(pos_id)
+    await rec._on_called_away(pos, summary)
+
+    closed = await db_repos.cycles.get(cycle_id)
+    # Expected P&L:  +50 (CSP) - 900 (BTO @ 9.0) + 30 (CC) + 1050 (STC @ 10.5) = +230
+    assert closed.cycle_outcome == "CC_CALLED_AWAY"
+    assert closed.final_pnl == pytest.approx(230.0)
 
 
 @pytest.mark.asyncio

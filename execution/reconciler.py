@@ -368,16 +368,44 @@ class Reconciler:
             else 0.0
         )
         cost_basis = strike - premium_per_share
+        # Recover the quantity from the cycle's CSP fill so multi-contract
+        # assignments end up with the right share count.
+        n_contracts = await self._cycle_csp_quantity(local.current_cycle_id) or 1
+        shares = 100 * n_contracts
         if local.id is not None:
             await self._repos.positions.update(
                 local.id,
                 state=PositionState.SHARES_HELD.value,
-                shares=100,  # one assigned put → 100 shares; multi-contract tracked by quantity at fill time
+                shares=shares,
                 cost_basis=cost_basis,
                 state_change_reason="assignment",
                 state_changed_at=_utcnow().isoformat(),
             )
             await self._log_state(local.id, local.state, PositionState.SHARES_HELD, "assignment")
+        # Persist a synthetic BUY_TO_OPEN order so cycle P&L captures the
+        # share cost. Assignment is a corporate action, not a broker order;
+        # without this stand-in, _compute_cycle_pnl misses the cost basis.
+        if local.current_cycle_id is not None:
+            await self._repos.orders.insert(
+                Order(
+                    account_id=self._account_id,
+                    symbol=local.symbol,
+                    cycle_id=local.current_cycle_id,
+                    order_type=OrderType.BUY_TO_OPEN,
+                    contract_symbol=None,
+                    strike=None,
+                    expiration=None,
+                    option_type=None,
+                    quantity=shares,
+                    limit_price=None,
+                    fill_price=strike,
+                    status=OrderStatus.FILLED,
+                    placed_at=_utcnow(),
+                    filled_at=_utcnow(),
+                    raw_request=None,
+                    raw_response={"synthetic": "assignment"},
+                )
+            )
 
     async def _on_csp_expiration(self, local: Position, summary: ReconcileSummary) -> None:
         summary.expirations_processed += 1
@@ -418,6 +446,31 @@ class Reconciler:
             symbol=local.symbol,
             cycle_id=local.current_cycle_id,
         )
+        # Persist a synthetic SELL_TO_CLOSE order at the CC strike so cycle
+        # P&L captures the share leg. Same reason as _on_assignment.
+        cc_strike = await self._cycle_cc_strike(local.current_cycle_id)
+        shares_sold = local.shares
+        if local.current_cycle_id is not None and shares_sold > 0 and cc_strike is not None:
+            await self._repos.orders.insert(
+                Order(
+                    account_id=self._account_id,
+                    symbol=local.symbol,
+                    cycle_id=local.current_cycle_id,
+                    order_type=OrderType.SELL_TO_CLOSE,
+                    contract_symbol=None,
+                    strike=None,
+                    expiration=None,
+                    option_type=None,
+                    quantity=shares_sold,
+                    limit_price=None,
+                    fill_price=cc_strike,
+                    status=OrderStatus.FILLED,
+                    placed_at=_utcnow(),
+                    filled_at=_utcnow(),
+                    raw_request=None,
+                    raw_response={"synthetic": "called_away"},
+                )
+            )
         if local.current_cycle_id:
             await self._close_cycle(local.current_cycle_id, CycleOutcome.CC_CALLED_AWAY, summary)
         if local.id is not None:
@@ -568,6 +621,43 @@ class Reconciler:
                 outcome=outcome.value,
                 days_held=days_held,
             )
+
+    async def _cycle_csp_quantity(self, cycle_id: int | None) -> int | None:
+        """Look up the original CSP fill quantity (in contracts) for a cycle."""
+        if cycle_id is None:
+            return None
+        c = await self._repos.db.connect()
+        async with c.execute(
+            "SELECT quantity FROM orders WHERE cycle_id = ? AND order_type = ? "
+            "AND option_type = ? AND status = ? ORDER BY placed_at LIMIT 1",
+            (
+                cycle_id,
+                OrderType.SELL_TO_OPEN.value,
+                OptionType.PUT.value,
+                OrderStatus.FILLED.value,
+            ),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["quantity"]) if row and row["quantity"] is not None else None
+
+    async def _cycle_cc_strike(self, cycle_id: int | None) -> float | None:
+        """Strike of the most recent filled CC for the cycle (used for the
+        synthetic stock SELL_TO_CLOSE on called-away)."""
+        if cycle_id is None:
+            return None
+        c = await self._repos.db.connect()
+        async with c.execute(
+            "SELECT strike FROM orders WHERE cycle_id = ? AND order_type = ? "
+            "AND option_type = ? AND status = ? ORDER BY placed_at DESC LIMIT 1",
+            (
+                cycle_id,
+                OrderType.SELL_TO_OPEN.value,
+                OptionType.CALL.value,
+                OrderStatus.FILLED.value,
+            ),
+        ) as cur:
+            row = await cur.fetchone()
+        return float(row["strike"]) if row and row["strike"] is not None else None
 
     async def _compute_cycle_pnl(self, cycle_id: int) -> float:
         c = await self._repos.db.connect()
