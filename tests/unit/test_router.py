@@ -184,6 +184,33 @@ async def test_dry_run_skips_broker_and_db(db_repos):
     assert len(await db_repos.orders.list_recent("test")) == 0
 
 
+def test_option_limit_price_pennies_below_three_dollars():
+    from execution.router import _option_limit_price
+    # 0.13/0.14 → mid 0.135 → 0.14 (nearest cent, banker's rounding goes to 0.14)
+    assert _option_limit_price(0.13, 0.14) in (0.13, 0.14)
+    # 0.50/0.52 → mid 0.51 → 0.51
+    assert _option_limit_price(0.50, 0.52) == pytest.approx(0.51)
+    # Sub-penny mid floors to 0.01 (we never send 0.00 limit on SELL)
+    assert _option_limit_price(0.00, 0.01) == pytest.approx(0.01)
+
+
+def test_option_limit_price_nickels_at_or_above_three_dollars():
+    from execution.router import _option_limit_price
+    # 3.00/3.10 → mid 3.05 → 3.05 (already on nickel)
+    assert _option_limit_price(3.00, 3.10) == pytest.approx(3.05)
+    # 4.13/4.18 → mid 4.155 → 4.15 (nearest nickel)
+    assert _option_limit_price(4.13, 4.18) == pytest.approx(4.15)
+    # 7.97/8.05 → mid 8.01 → 8.00
+    assert _option_limit_price(7.97, 8.05) == pytest.approx(8.00)
+
+
+def test_option_limit_price_returns_none_on_missing_quote():
+    from execution.router import _option_limit_price
+    assert _option_limit_price(None, 0.50) is None
+    assert _option_limit_price(0.50, None) is None
+    assert _option_limit_price(None, None) is None
+
+
 @pytest.mark.asyncio
 async def test_client_order_id_is_deterministic_per_day():
     p1 = _proposal()

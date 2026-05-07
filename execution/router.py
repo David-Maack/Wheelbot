@@ -56,6 +56,30 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def _option_limit_price(bid: float | None, ask: float | None) -> float | None:
+    """Mid-price rounded to a valid options tick.
+
+    OCC tick rules: penny increments below $3, nickel increments at/above $3.
+    Alpaca enforces this at submission time — sending 3-decimal mids triggers
+    `limit price must be limited to 2 decimal places`. Tastytrade is more
+    forgiving but still rejects sub-penny on cheap options.
+
+    Returns None when bid/ask aren't both present.
+    """
+    if bid is None or ask is None:
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    if mid >= 3.0:
+        # Nearest $0.05.
+        snapped = round(mid * 20) / 20
+    else:
+        snapped = round(mid, 2)
+    # Floor at $0.01 — Alpaca rejects $0.00 limit on a SELL.
+    return max(snapped, 0.01)
+
+
 def _client_order_id(proposal: Proposal, today: date | None = None) -> str:
     """Deterministic per-(proposal, day) so a retry of the same proposal on the
     same day collides with the prior attempt — broker idempotency does the rest."""
@@ -237,7 +261,7 @@ class OrderRouter:
             expiration=contract.expiration,
             option_type=contract.option_type,
             quantity=proposal.quantity,
-            limit_price=((contract.bid + contract.ask) / 2) if (contract.bid is not None and contract.ask is not None) else None,
+            limit_price=_option_limit_price(contract.bid, contract.ask),
             status=OrderStatus.PENDING,
             placed_at=_utcnow(),
             client_order_id=_client_order_id(proposal, today),
