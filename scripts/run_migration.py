@@ -61,22 +61,51 @@ def _applied_versions(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in rows}
 
 
+def _split_statements(sql: str) -> list[str]:
+    """Tokenize a migration SQL file into individual statements.
+
+    Strips full-line comments and splits on ';'. Migration files don't
+    contain semicolons inside strings so this naive split is safe.
+    """
+    lines = []
+    for raw in sql.split("\n"):
+        stripped = raw.strip()
+        if stripped.startswith("--") or not stripped:
+            continue
+        lines.append(raw)
+    text = "\n".join(lines)
+    return [s.strip() for s in text.split(";") if s.strip()]
+
+
 def apply_migration(conn: sqlite3.Connection, migration: Migration) -> None:
+    """Apply a migration atomically.
+
+    `conn` runs in Python sqlite3's default deferred-transaction mode. We
+    use `with conn:` which COMMITs on clean exit and ROLLBACKs on exception.
+    Each statement runs via `conn.execute()` (NOT `executescript`, which
+    interferes with explicit transactions). On failure the partially-applied
+    statements are rolled back and the original SQL error is re-raised with
+    the failing statement attached for diagnosis.
+    """
     sql = migration.path.read_text(encoding="utf-8")
-    # SQLite executes statements one at a time. executescript() runs the whole
-    # file in implicit transactions; wrap explicitly so a partial failure
-    # doesn't leave the schema half-migrated.
-    try:
-        conn.execute("BEGIN")
-        conn.executescript(sql)
+    statements = _split_statements(sql)
+    if not statements:
+        raise ValueError(f"migration {migration.version} has no statements")
+
+    with conn:
+        for i, stmt in enumerate(statements, start=1):
+            try:
+                conn.execute(stmt)
+            except sqlite3.Error as exc:
+                preview = stmt.replace("\n", " ")[:140]
+                raise sqlite3.Error(
+                    f"migration {migration.version} statement {i}/{len(statements)} failed: "
+                    f"{preview!r} — {exc}"
+                ) from exc
         conn.execute(
             "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
             (migration.version, migration.name),
         )
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,6 +114,12 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--list", action="store_true", help="List migrations + status")
     group.add_argument("--version", help="Apply a specific migration version")
     group.add_argument("--all-pending", action="store_true", help="Apply all unapplied migrations")
+    group.add_argument(
+        "--mark-applied",
+        help="Record a migration as applied WITHOUT running its SQL. Use "
+        "after a manual recovery from a broken migration runner — DO NOT "
+        "use to skip a migration that hasn't actually been applied.",
+    )
     parser.add_argument(
         "--db-path",
         type=Path,
@@ -103,6 +138,22 @@ def main(argv: list[str] | None = None) -> int:
     _ensure_schema_migrations(conn)
     applied = _applied_versions(conn)
     discovered = _discover()
+
+    if args.mark_applied:
+        m = next((x for x in discovered if x.version == args.mark_applied), None)
+        if m is None:
+            print(f"No migration with version {args.mark_applied}", file=sys.stderr)
+            return 1
+        if m.version in applied:
+            print(f"Migration {m.version} already marked applied — no-op")
+            return 0
+        with conn:
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
+                (m.version, m.name),
+            )
+        print(f"Marked {m.version}_{m.name} as applied (without running SQL).")
+        return 0
 
     if args.list or (not args.version and not args.all_pending):
         print(f"DB: {db_path}")
