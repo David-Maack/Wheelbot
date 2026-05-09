@@ -144,6 +144,7 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         request: Request,
         symbol: str | None = None,
         outcome: str | None = None,
+        strategy: str | None = None,
         _user: str = Depends(authorize),
     ) -> Any:
         account_id = deps.config.get("account", {}).get("id", "primary")
@@ -154,11 +155,19 @@ def build_app(deps: DashboardDeps) -> FastAPI:
             cycles = [c for c in cycles if c.symbol.upper() == symbol.upper()]
         if outcome:
             cycles = [c for c in cycles if (c.cycle_outcome or "").upper() == outcome.upper()]
+        if strategy:
+            cycles = [c for c in cycles if (c.strategy_id or "") == strategy]
         cycles.sort(key=lambda c: (c.final_pnl is None, -(c.final_pnl or 0)))
         return TEMPLATES.TemplateResponse(
             request,
             "cycles.html",
-            {"cycles": cycles, "filter_symbol": symbol or "", "filter_outcome": outcome or ""},
+            {
+                "cycles": cycles,
+                "filter_symbol": symbol or "",
+                "filter_outcome": outcome or "",
+                "filter_strategy": strategy or "",
+                "strategies": _known_strategies(deps),
+            },
         )
 
     @app.get("/candidates", response_class=HTMLResponse)
@@ -174,10 +183,24 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         )
 
     @app.get("/orders", response_class=HTMLResponse)
-    async def orders_view(request: Request, _user: str = Depends(authorize)) -> Any:
+    async def orders_view(
+        request: Request,
+        strategy: str | None = None,
+        _user: str = Depends(authorize),
+    ) -> Any:
         account_id = deps.config.get("account", {}).get("id", "primary")
         recent = await deps.repos.orders.list_recent(account_id, limit=100)
-        return TEMPLATES.TemplateResponse(request, "orders.html", {"orders": recent})
+        if strategy:
+            recent = [o for o in recent if (o.strategy_id or "") == strategy]
+        return TEMPLATES.TemplateResponse(
+            request,
+            "orders.html",
+            {
+                "orders": recent,
+                "filter_strategy": strategy or "",
+                "strategies": _known_strategies(deps),
+            },
+        )
 
     @app.get("/decisions", response_class=HTMLResponse)
     async def decisions_view(
@@ -314,6 +337,7 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
         out.append(
             {
                 "symbol": p.symbol,
+                "strategy_id": p.strategy_id,
                 "state": str(p.state),
                 "days_in_state": days_in_state,
                 "shares": p.shares,
@@ -362,6 +386,24 @@ async def _kill_switch_state(deps: DashboardDeps) -> dict[str, Any]:
         "stop_file_present": stop_file_present,
         "session_open_equity": anchor.session_open_equity if anchor else None,
     }
+
+
+def _known_strategies(deps: DashboardDeps) -> list[dict[str, str]]:
+    """Strategies block from config — list of {id, display_name} for the
+    filter dropdown. Falls back to a single monthly_wheel entry for legacy
+    config without a strategies section."""
+    raw = deps.config.get("strategies") or []
+    if not raw:
+        return [{"id": "monthly_wheel", "display_name": "Monthly Wheel"}]
+    out: list[dict[str, str]] = []
+    for s in raw:
+        if not isinstance(s, dict):
+            continue
+        sid = str(s.get("id", "")).strip()
+        if not sid:
+            continue
+        out.append({"id": sid, "display_name": str(s.get("display_name", sid))})
+    return out
 
 
 async def _latest_regime_row(deps: DashboardDeps) -> dict[str, Any] | None:

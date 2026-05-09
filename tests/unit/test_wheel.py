@@ -15,7 +15,9 @@ class _FakePositionsRepo:
     def __init__(self, positions: dict[tuple[str, str], Position] | None = None):
         self._by_key = positions or {}
 
-    async def get_by_symbol(self, account_id: str, symbol: str) -> Position | None:
+    async def get_by_symbol(
+        self, account_id: str, symbol: str, strategy_id: str | None = None
+    ) -> Position | None:
         return self._by_key.get((account_id, symbol))
 
 

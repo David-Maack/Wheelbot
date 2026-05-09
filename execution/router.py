@@ -81,10 +81,15 @@ def _option_limit_price(bid: float | None, ask: float | None) -> float | None:
 
 
 def _client_order_id(proposal: Proposal, today: date | None = None) -> str:
-    """Deterministic per-(proposal, day) so a retry of the same proposal on the
-    same day collides with the prior attempt — broker idempotency does the rest."""
+    """Deterministic per-(proposal, day, strategy) so a retry of the same proposal
+    on the same day collides with the prior attempt — broker idempotency does
+    the rest. Strategy is part of the key so two strategies trading the same
+    symbol/contract on the same day get distinct client_order_ids."""
     today = today or datetime.now(UTC).date()
-    raw = f"{proposal.symbol}|{proposal.contract.occ_symbol}|{proposal.order_type.value}|{proposal.quantity}|{today.isoformat()}"
+    raw = (
+        f"{proposal.strategy_id}|{proposal.symbol}|{proposal.contract.occ_symbol}|"
+        f"{proposal.order_type.value}|{proposal.quantity}|{today.isoformat()}"
+    )
     digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
     return f"wb-{digest}"
 
@@ -255,6 +260,7 @@ class OrderRouter:
         return Order(
             account_id=self._config.get("account", {}).get("id", "primary"),
             symbol=proposal.symbol,
+            strategy_id=proposal.strategy_id,
             order_type=proposal.order_type,
             contract_symbol=contract.occ_symbol,
             strike=contract.strike,
@@ -322,13 +328,16 @@ class OrderRouter:
         account_id = self._config.get("account", {}).get("id", "primary")
         contract_is_put = proposal.contract.option_type == OptionType.PUT
         new_state = _pending_state_for(proposal.order_type, contract_is_put)
-        existing = await self._repos.positions.get_by_symbol(account_id, proposal.symbol)
+        existing = await self._repos.positions.get_by_symbol(
+            account_id, proposal.symbol, strategy_id=proposal.strategy_id
+        )
         now = _utcnow()
         if existing is None:
             await self._repos.positions.insert(
                 Position(
                     account_id=account_id,
                     symbol=proposal.symbol,
+                    strategy_id=proposal.strategy_id,
                     state=new_state,
                     shares=0,
                     state_changed_at=now,

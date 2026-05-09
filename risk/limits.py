@@ -172,9 +172,13 @@ class RiskGate:
     ) -> None:
         cap = int(params.get("max_concurrent_positions", 4))
         account_id = self._config.get("account", {}).get("id", "primary")
-        active = await self._repos.positions.list_active(account_id)
-        # If a position already exists for this symbol in non-IDLE state, don't
-        # double-count it; we're rolling, not opening a new slot.
+        # Per-strategy concurrent cap: count only positions belonging to the
+        # same strategy. Different strategies share the account but have
+        # independent slot accounting.
+        strategy_id = proposal.strategy_id
+        active = await self._repos.positions.list_active(
+            account_id, strategy_id=strategy_id
+        )
         symbol = proposal.symbol.upper()
         new_slot = not any(p.symbol.upper() == symbol for p in active)
         projected = len(active) + (1 if new_slot else 0)
@@ -182,7 +186,7 @@ class RiskGate:
             result.add(
                 "concurrent_positions_cap",
                 "fail",
-                f"projected {projected} > cap {cap} (active={len(active)})",
+                f"projected {projected} > cap {cap} (strategy={strategy_id}, active={len(active)})",
             )
         else:
             result.add("concurrent_positions_cap", "pass")

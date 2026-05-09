@@ -24,6 +24,7 @@ from typing import Any
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.models import ChainSnapshot, OptionContract, OrderType, PositionState
+from core.strategies import StrategyDefinition
 from data.ivr import IVRProvider
 from db.repo import Repos
 from strategies.cc_selector import select_cc
@@ -32,14 +33,15 @@ from strategies.csp_selector import select_csp
 
 @dataclass(frozen=True, slots=True)
 class Proposal:
-    """A trade the orchestrator wants the router to place. The router (Sprint 4)
-    decides idempotency, retries, and dry-run behavior."""
+    """A trade the orchestrator wants the router to place. The router decides
+    idempotency, retries, and dry-run behavior."""
 
     symbol: str
     contract: OptionContract
     order_type: OrderType  # SELL_TO_OPEN for both CSP and CC at this stage
     quantity: int
     rationale: str  # short human-readable, e.g. "csp 30d delta 0.24 yield 0.32"
+    strategy_id: str = "monthly_wheel"
     requires_screen: bool = False  # tier 2
     requires_human: bool = False  # tier 3
 
@@ -56,6 +58,7 @@ def _build_proposal(
     contract: OptionContract,
     universe: dict[str, Any],
     rationale: str,
+    strategy_id: str,
     quantity: int = 1,
 ) -> Proposal:
     needs_screen, needs_human = _tier_flags(symbol, universe)
@@ -65,17 +68,22 @@ def _build_proposal(
         order_type=OrderType.SELL_TO_OPEN,
         quantity=quantity,
         rationale=rationale,
+        strategy_id=strategy_id,
         requires_screen=needs_screen,
         requires_human=needs_human,
     )
 
 
-def _make_chain_recorder(repos: Repos, *, cycle_id: int | None = None) -> Any:
+def _make_chain_recorder(
+    repos: Repos,
+    *,
+    cycle_id: int | None = None,
+    strategy_id: str | None = None,
+) -> Any:
     """Returns an async callback the selectors hand the post-filter chain to.
 
     Fail-safe: when the repos bundle has no chain_snapshots attribute (some
-    tests use a partial fake), skip the snapshot rather than crashing — the
-    snapshot is observability, not load-bearing for the trade itself.
+    tests use a partial fake), skip the snapshot rather than crashing.
     """
     chain_repo = getattr(repos, "chain_snapshots", None)
     if chain_repo is None:
@@ -94,6 +102,7 @@ def _make_chain_recorder(repos: Repos, *, cycle_id: int | None = None) -> Any:
             ChainSnapshot(
                 captured_at=datetime.now(UTC).replace(tzinfo=None),
                 symbol=symbol,
+                strategy_id=strategy_id,
                 side=side,
                 underlying_price=underlying_price,
                 contracts=[c.model_dump(mode="json") for c in contracts],
@@ -102,6 +111,17 @@ def _make_chain_recorder(repos: Repos, *, cycle_id: int | None = None) -> Any:
         )
 
     return _record
+
+
+def _config_for_strategy(
+    config: dict[str, Any], strategy: StrategyDefinition
+) -> dict[str, Any]:
+    """Synthesize a config dict where the `wheel` section reflects this
+    strategy's params overlaid on the legacy wheel block. Selectors read
+    from `wheel`, so this lets one selector serve all wheel-type strategies."""
+    base_wheel = config.get("wheel", {}) or {}
+    merged_wheel = strategy.merged_wheel_params(base_wheel)
+    return {**config, "wheel": merged_wheel}
 
 
 async def propose_for_symbol(
@@ -113,26 +133,33 @@ async def propose_for_symbol(
     ivr: IVRProvider,
     *,
     today: date | None = None,
+    strategy: StrategyDefinition | None = None,
 ) -> Proposal | None:
     today = today or date.today()
     account_id = config.get("account", {}).get("id", "primary")
-    position = await repos.positions.get_by_symbol(account_id, symbol)
+    strategy_id = strategy.id if strategy is not None else "monthly_wheel"
+    position = await repos.positions.get_by_symbol(account_id, symbol, strategy_id=strategy_id)
     state = position.state if position else PositionState.IDLE
-    record = _make_chain_recorder(repos, cycle_id=position.current_cycle_id if position else None)
+    record = _make_chain_recorder(
+        repos,
+        cycle_id=position.current_cycle_id if position else None,
+        strategy_id=strategy_id,
+    )
+    effective_config = _config_for_strategy(config, strategy) if strategy else config
 
     if state == PositionState.IDLE:
         contract = await select_csp(
-            broker, symbol, config, universe, ivr, today=today, record_chain=record
+            broker, symbol, effective_config, universe, ivr, today=today, record_chain=record
         )
         if contract is None:
             return None
         rationale = (
-            f"csp dte={(contract.expiration - today).days} "
+            f"csp[{strategy_id}] dte={(contract.expiration - today).days} "
             f"delta={contract.delta:.2f} strike={contract.strike}"
             if contract.delta is not None
-            else f"csp strike={contract.strike}"
+            else f"csp[{strategy_id}] strike={contract.strike}"
         )
-        return _build_proposal(symbol, contract, universe, rationale)
+        return _build_proposal(symbol, contract, universe, rationale, strategy_id)
 
     if state == PositionState.SHARES_HELD:
         if position is None or position.cost_basis is None:
@@ -140,6 +167,7 @@ async def propose_for_symbol(
                 "wheel_skip_no_cost_basis",
                 status="fail",
                 symbol=symbol,
+                strategy=strategy_id,
                 state=str(state),
             )
             return None
@@ -151,7 +179,7 @@ async def propose_for_symbol(
             broker,
             symbol,
             position.cost_basis,
-            config,
+            effective_config,
             universe,
             today=today,
             record_chain=record,
@@ -159,14 +187,22 @@ async def propose_for_symbol(
         if contract is None:
             return None
         rationale = (
-            f"cc dte={(contract.expiration - today).days} "
+            f"cc[{strategy_id}] dte={(contract.expiration - today).days} "
             f"delta={contract.delta:.2f} strike={contract.strike} cb={position.cost_basis}"
             if contract.delta is not None
-            else f"cc strike={contract.strike} cb={position.cost_basis}"
+            else f"cc[{strategy_id}] strike={contract.strike} cb={position.cost_basis}"
         )
-        return _build_proposal(symbol, contract, universe, rationale, quantity=contracts)
+        return _build_proposal(
+            symbol, contract, universe, rationale, strategy_id, quantity=contracts
+        )
 
-    log_checkpoint("wheel_skip_state", status="ok", symbol=symbol, state=str(state))
+    log_checkpoint(
+        "wheel_skip_state",
+        status="ok",
+        symbol=symbol,
+        strategy=strategy_id,
+        state=str(state),
+    )
     return None
 
 
@@ -178,13 +214,20 @@ async def propose_all(
     ivr: IVRProvider,
     *,
     today: date | None = None,
+    strategy: StrategyDefinition | None = None,
 ) -> list[Proposal]:
     out: list[Proposal] = []
     for entry in universe["tickers"]:
         proposal = await propose_for_symbol(
-            broker, repos, entry.symbol, config, universe, ivr, today=today
+            broker, repos, entry.symbol, config, universe, ivr,
+            today=today, strategy=strategy,
         )
         if proposal is not None:
             out.append(proposal)
-    log_checkpoint("wheel_propose_all", status="ok", n_proposals=len(out))
+    log_checkpoint(
+        "wheel_propose_all",
+        status="ok",
+        strategy=strategy.id if strategy else "default",
+        n_proposals=len(out),
+    )
     return out

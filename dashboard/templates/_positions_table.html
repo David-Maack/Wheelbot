@@ -2,12 +2,13 @@
 {% if rows %}
 <table class="grid">
   <thead>
-    <tr><th>Symbol</th><th>State</th><th>Days in state</th><th>Shares</th><th>Cost basis</th><th>DTE</th><th>Unrealized</th></tr>
+    <tr><th>Symbol</th><th>Strategy</th><th>State</th><th>Days in state</th><th>Shares</th><th>Cost basis</th><th>DTE</th><th>Unrealized</th></tr>
   </thead>
   <tbody>
     {% for r in rows %}
     <tr>
       <td>{{ r.symbol }}</td>
+      <td><code>{{ r.strategy_id or "—" }}</code></td>
       <td><code>{{ r.state }}</code></td>
       <td>{{ r.days_in_state }}</td>
       <td>{{ r.shares }}</td>

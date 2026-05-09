@@ -10,23 +10,25 @@ account:
   broker: alpaca_paper
 
 wheel:
-  # Single position during initial paper-trading phase.
-  max_concurrent_positions: 1
-  # Full deployment in that one position so we exercise the cycle quickly.
-  max_position_pct_of_account: 100
+  max_concurrent_positions: 4
+  # Alpaca paper feed returns no OI/volume — drop those gates and rely on
+  # bid_ask_spread_max_pct as the liquidity proxy. Restore real thresholds
+  # when you switch to Tastytrade.
+  open_interest_min: 0
+  volume_min: 0
 
 risk:
-  # Tighter while learning — 3% drawdown halts new trades for the day.
-  daily_loss_kill_switch_pct: 3
+  daily_loss_kill_switch_pct: 3   # tighter while learning
 
 intelligence:
-  # Turn the LLM screener off for Phase 1 — manual ticker selection (just F)
-  # so we can isolate any execution bugs before adding the LLM signal.
-  llm_screener_enabled: false
-  llm_news_check_enabled: false
-  # Keep the LLM roll advisor off until you have ~3 months of cycle data
-  # (spec §12 Phase 6).
-  llm_roll_advisor_enabled: false
+  llm_screener_enabled: false       # off in Phase 1
+  llm_news_check_enabled: true      # on — Haiku catches catalysts cheaply
+  llm_roll_advisor_enabled: false   # on after ~3 months of cycle data
+
+# Disable specific strategies without editing config.yaml. Strategies in
+# this list are skipped at load time even if enabled=true in config.yaml.
+disabled_strategies:
+  - put_spread     # comes online when multi-leg orders ship in sub-sprint 3
 
 # When you're ready to flip to Tastytrade sandbox:
 # account:

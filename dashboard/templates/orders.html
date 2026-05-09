@@ -2,16 +2,29 @@
 {% block title %}Orders{% endblock %}
 {% block content %}
 <h1>Recent orders</h1>
+<form method="get" class="filters">
+  <label>Strategy
+    <select name="strategy">
+      <option value="">any</option>
+      {% for s in strategies %}
+      <option value="{{ s.id }}" {% if filter_strategy == s.id %}selected{% endif %}>{{ s.display_name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">Filter</button>
+</form>
+
 {% if orders %}
 <table class="grid">
   <thead>
-    <tr><th>Placed</th><th>Symbol</th><th>Type</th><th>Contract</th><th>Qty</th><th>Limit</th><th>Fill</th><th>Status</th><th>Inspect</th></tr>
+    <tr><th>Placed</th><th>Symbol</th><th>Strategy</th><th>Type</th><th>Contract</th><th>Qty</th><th>Limit</th><th>Fill</th><th>Status</th><th>Inspect</th></tr>
   </thead>
   <tbody>
     {% for o in orders %}
     <tr>
       <td>{{ o.placed_at }}</td>
       <td>{{ o.symbol }}</td>
+      <td><code>{{ o.strategy_id or "—" }}</code></td>
       <td><code>{{ o.order_type }}</code></td>
       <td>{{ o.contract_symbol or "—" }}</td>
       <td>{{ o.quantity }}</td>

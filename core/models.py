@@ -90,6 +90,7 @@ class Position(_Base):
     id: int | None = None
     account_id: str
     symbol: str
+    strategy_id: str = "monthly_wheel"
     state: PositionState
     shares: int = 0
     cost_basis: float | None = None
@@ -102,6 +103,7 @@ class Order(_Base):
     id: int | None = None
     account_id: str
     symbol: str
+    strategy_id: str | None = None
     cycle_id: int | None = None
     broker_order_id: str | None = None
     client_order_id: str | None = None
@@ -124,6 +126,7 @@ class WheelCycle(_Base):
     id: int | None = None
     account_id: str
     symbol: str
+    strategy_id: str | None = None
     started_at: datetime
     ended_at: datetime | None = None
     initial_csp_strike: float | None = None
@@ -219,6 +222,7 @@ class ChainSnapshot(_Base):
     id: int | None = None
     captured_at: datetime
     symbol: str
+    strategy_id: str | None = None
     side: str  # "put" | "call"
     underlying_price: float | None = None
     contracts: list[dict[str, Any]]
@@ -282,5 +286,6 @@ class UniverseEntry(_Base):
     symbol: str
     name: str | None = None
     tier: int = Field(ge=1, le=3)
+    strategies: list[str] = Field(default_factory=lambda: ["monthly_wheel"])
     notes: str | None = None
     overrides: dict[str, Any] = Field(default_factory=dict)

@@ -163,25 +163,60 @@ class PositionsRepo(_Repo):
         row = await self._fetch_one("SELECT * FROM positions WHERE id = ?", (position_id,))
         return Position(**row) if row else None
 
-    async def get_by_symbol(self, account_id: str, symbol: str) -> Position | None:
-        row = await self._fetch_one(
-            "SELECT * FROM positions WHERE account_id = ? AND symbol = ?",
-            (account_id, symbol),
-        )
+    async def get_by_symbol(
+        self,
+        account_id: str,
+        symbol: str,
+        strategy_id: str | None = None,
+    ) -> Position | None:
+        """Look up a position. When strategy_id is None, returns the first
+        match for the symbol (legacy behavior — fine for single-strategy
+        callers, but multi-strategy callers should pass strategy_id)."""
+        if strategy_id is not None:
+            row = await self._fetch_one(
+                "SELECT * FROM positions WHERE account_id = ? AND symbol = ? AND strategy_id = ?",
+                (account_id, symbol, strategy_id),
+            )
+        else:
+            row = await self._fetch_one(
+                "SELECT * FROM positions WHERE account_id = ? AND symbol = ?",
+                (account_id, symbol),
+            )
         return Position(**row) if row else None
 
-    async def list_active(self, account_id: str) -> list[Position]:
-        rows = await self._fetch_all(
-            "SELECT * FROM positions WHERE account_id = ? AND state != ? ORDER BY symbol",
-            (account_id, PositionState.IDLE.value),
-        )
+    async def list_active(
+        self,
+        account_id: str,
+        strategy_id: str | None = None,
+    ) -> list[Position]:
+        if strategy_id is not None:
+            rows = await self._fetch_all(
+                "SELECT * FROM positions WHERE account_id = ? AND strategy_id = ? "
+                "AND state != ? ORDER BY symbol",
+                (account_id, strategy_id, PositionState.IDLE.value),
+            )
+        else:
+            rows = await self._fetch_all(
+                "SELECT * FROM positions WHERE account_id = ? AND state != ? ORDER BY symbol",
+                (account_id, PositionState.IDLE.value),
+            )
         return [Position(**r) for r in rows]
 
-    async def list_all(self, account_id: str) -> list[Position]:
-        rows = await self._fetch_all(
-            "SELECT * FROM positions WHERE account_id = ? ORDER BY symbol",
-            (account_id,),
-        )
+    async def list_all(
+        self,
+        account_id: str,
+        strategy_id: str | None = None,
+    ) -> list[Position]:
+        if strategy_id is not None:
+            rows = await self._fetch_all(
+                "SELECT * FROM positions WHERE account_id = ? AND strategy_id = ? ORDER BY symbol",
+                (account_id, strategy_id),
+            )
+        else:
+            rows = await self._fetch_all(
+                "SELECT * FROM positions WHERE account_id = ? ORDER BY symbol",
+                (account_id,),
+            )
         return [Position(**r) for r in rows]
 
     async def insert(self, position: Position) -> int:

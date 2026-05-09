@@ -4,37 +4,42 @@
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
--- Current state per (account, symbol)
+-- Current state per (account, symbol, strategy). A single ticker can be
+-- traded by multiple strategies simultaneously (e.g. monthly_wheel on F at
+-- one strike + weekly_wheel on F at another).
 CREATE TABLE IF NOT EXISTS positions (
     id                    INTEGER PRIMARY KEY,
     account_id            TEXT    NOT NULL,
     symbol                TEXT    NOT NULL,
-    state                 TEXT    NOT NULL,           -- IDLE, CSP_OPEN, SHARES_HELD, CC_OPEN, ...
+    strategy_id           TEXT    NOT NULL DEFAULT 'monthly_wheel',
+    state                 TEXT    NOT NULL,           -- IDLE, CSP_OPEN, SHARES_HELD, CC_OPEN, SPREAD_OPEN, ...
     shares                INTEGER NOT NULL DEFAULT 0,
     cost_basis            REAL,                       -- avg cost per share, premium-adjusted
     current_cycle_id      INTEGER,                    -- FK to wheel_cycles
     state_changed_at      DATETIME NOT NULL,
     state_change_reason   TEXT,
-    UNIQUE(account_id, symbol),
+    UNIQUE(account_id, symbol, strategy_id),
     FOREIGN KEY (current_cycle_id) REFERENCES wheel_cycles(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_positions_state ON positions(state);
 CREATE INDEX IF NOT EXISTS idx_positions_account_state ON positions(account_id, state);
+CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy_id);
 
 -- Every order ever submitted (CSP, CC, BTC, BTO)
 CREATE TABLE IF NOT EXISTS orders (
     id                INTEGER PRIMARY KEY,
     account_id        TEXT    NOT NULL,
     symbol            TEXT    NOT NULL,
+    strategy_id       TEXT,                           -- which strategy submitted this order; nullable for legacy rows
     cycle_id          INTEGER,
     broker_order_id   TEXT    UNIQUE,                 -- broker's ID (idempotency)
     client_order_id   TEXT    UNIQUE,                 -- our UUID (dedupe)
-    order_type        TEXT    NOT NULL,               -- SELL_TO_OPEN, BUY_TO_CLOSE, etc.
+    order_type        TEXT    NOT NULL,               -- SELL_TO_OPEN, BUY_TO_CLOSE, MULTI_LEG_OPEN, etc.
     contract_symbol   TEXT,                           -- OCC option symbol or stock ticker
     strike            REAL,
     expiration        DATE,
-    option_type       TEXT,                           -- PUT, CALL, NULL for stock
+    option_type       TEXT,                           -- PUT, CALL, NULL for stock or multi-leg
     quantity          INTEGER NOT NULL,
     limit_price       REAL,
     fill_price        REAL,
@@ -50,12 +55,14 @@ CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);
 CREATE INDEX IF NOT EXISTS idx_orders_placed_at ON orders(placed_at);
 CREATE INDEX IF NOT EXISTS idx_orders_cycle_id ON orders(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_orders_strategy ON orders(strategy_id);
 
 -- A wheel cycle = CSP open → ... → final close. One symbol can have many cycles over time.
 CREATE TABLE IF NOT EXISTS wheel_cycles (
     id                       INTEGER PRIMARY KEY,
     account_id               TEXT    NOT NULL,
     symbol                   TEXT    NOT NULL,
+    strategy_id              TEXT,                    -- which strategy owns this cycle; nullable for legacy rows
     started_at               DATETIME NOT NULL,
     ended_at                 DATETIME,
     initial_csp_strike       REAL,
@@ -63,13 +70,14 @@ CREATE TABLE IF NOT EXISTS wheel_cycles (
     initial_capital_at_risk  REAL,
     final_pnl                REAL,                    -- realized at cycle end
     final_pnl_pct            REAL,
-    cycle_outcome            TEXT,                    -- CSP_EXPIRED, CC_CALLED_AWAY, MANUAL_CLOSE
+    cycle_outcome            TEXT,                    -- CSP_EXPIRED, CC_CALLED_AWAY, SPREAD_EXPIRED_PROFIT, ...
     days_held                INTEGER,
     n_orders                 INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_cycles_symbol ON wheel_cycles(symbol);
 CREATE INDEX IF NOT EXISTS idx_cycles_ended_at ON wheel_cycles(ended_at);
+CREATE INDEX IF NOT EXISTS idx_cycles_strategy ON wheel_cycles(strategy_id);
 
 -- State transition log (full audit)
 CREATE TABLE IF NOT EXISTS state_log (
@@ -178,6 +186,7 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
     id              INTEGER PRIMARY KEY,
     captured_at     DATETIME NOT NULL,
     symbol          TEXT NOT NULL,
+    strategy_id     TEXT,                    -- which strategy was evaluating; nullable for legacy rows
     side            TEXT NOT NULL,           -- "put" | "call"
     underlying_price REAL,
     contracts       JSON NOT NULL,           -- list of OptionContract dicts

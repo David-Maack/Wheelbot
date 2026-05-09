@@ -5,50 +5,164 @@
 #   tier 1 — auto-traded if all risk gates pass
 #   tier 2 — requires LLM screener + risk gates
 #   tier 3 — requires manual human approval per cycle
+#
+# `strategies:` lists which strategies (from config.yaml strategies block)
+# are allowed to trade this ticker. A ticker can belong to multiple
+# strategies — but in practice we keep the universes separate so each
+# strategy is comparable in isolation.
 
 tickers:
-  # Tier 1 — Safe core for small accounts (under $30/share, large-cap, dividend-paying)
+  # ============================================================
+  # monthly_wheel — 30-45 DTE CSPs, stocks you'd own
+  # ============================================================
   - symbol: F
     name: "Ford Motor Company"
     tier: 1
+    strategies: [monthly_wheel]
     notes: "Liquid, dividend, low IV but reliable. Good for first live trades."
     overrides:
       csp_delta_max: 0.25         # tighter delta given low premium
 
-  - symbol: SOFI
-    name: "SoFi Technologies"
-    tier: 1
-    notes: "Higher IV fintech. Good monthly premium."
-
   - symbol: BAC
     name: "Bank of America"
     tier: 1
+    strategies: [monthly_wheel]
     notes: "Low IV but tight spreads, very liquid."
 
   - symbol: NOK
     name: "Nokia"
     tier: 1
+    strategies: [monthly_wheel]
 
-  # Tier 2 — Higher beta, higher premium, requires bigger BP cushion
-  - symbol: RIVN
-    name: "Rivian"
+  - symbol: SOFI
+    name: "SoFi Technologies"
+    tier: 1
+    strategies: [monthly_wheel]
+    notes: "Higher IV fintech. Good monthly premium."
+
+  - symbol: T
+    name: "AT&T"
+    tier: 1
+    strategies: [monthly_wheel]
+    notes: "Low IV, dividend, sub-$30/share — fits small accounts."
+
+  - symbol: VZ
+    name: "Verizon Communications"
+    tier: 1
+    strategies: [monthly_wheel]
+    notes: "Telco income stock; quiet IV."
+
+  - symbol: INTC
+    name: "Intel"
+    tier: 1
+    strategies: [monthly_wheel]
+    notes: "Cyclical, often in IV-rich pockets after misses."
+
+  - symbol: KMI
+    name: "Kinder Morgan"
+    tier: 1
+    strategies: [monthly_wheel]
+    notes: "Pipelines, dividend, sub-$25."
+
+  # ============================================================
+  # weekly_wheel — 7-14 DTE CSPs, high IV / liquid weeklies
+  # ============================================================
+  - symbol: HOOD
+    name: "Robinhood Markets"
     tier: 2
-    overrides:
-      max_position_pct_of_account: 20
+    strategies: [weekly_wheel]
+    notes: "Wheel the broker. Liquid weeklies; high IV."
 
   - symbol: PLTR
     name: "Palantir"
     tier: 2
+    strategies: [weekly_wheel]
+    notes: "Heavy retail flow, weeklies trade actively."
 
   - symbol: PLUG
     name: "Plug Power"
     tier: 2
+    strategies: [weekly_wheel]
+    notes: "Volatile, weekly options trade."
 
-  # Tier 3 — Trade only when LLM screener AND human approve
-  - symbol: HOOD
-    name: "Robinhood Markets"
-    tier: 3
-    notes: "Wheel the broker. Approved one cycle at a time."
+  - symbol: RIVN
+    name: "Rivian"
+    tier: 2
+    strategies: [weekly_wheel]
+    overrides:
+      max_position_pct_of_account: 20
+
+  - symbol: AMD
+    name: "Advanced Micro Devices"
+    tier: 1
+    strategies: [weekly_wheel]
+    notes: "Mega-cap semis, very liquid weeklies."
+
+  - symbol: MARA
+    name: "Marathon Digital"
+    tier: 2
+    strategies: [weekly_wheel]
+    notes: "BTC-correlated, high IV."
+
+  - symbol: COIN
+    name: "Coinbase Global"
+    tier: 2
+    strategies: [weekly_wheel]
+    notes: "Crypto-correlated, weeklies trade tight."
+
+  - symbol: AAL
+    name: "American Airlines"
+    tier: 1
+    strategies: [weekly_wheel]
+    notes: "Sub-$20 airline, weeklies + earnings IV."
+
+  # ============================================================
+  # put_spread — 30-45 DTE bull put credit spreads, defined risk
+  # ============================================================
+  - symbol: AAPL
+    name: "Apple"
+    tier: 1
+    strategies: [put_spread]
+    notes: "Mega-cap, tight option spreads."
+
+  - symbol: MSFT
+    name: "Microsoft"
+    tier: 1
+    strategies: [put_spread]
+
+  - symbol: META
+    name: "Meta Platforms"
+    tier: 1
+    strategies: [put_spread]
+
+  - symbol: GOOGL
+    name: "Alphabet"
+    tier: 1
+    strategies: [put_spread]
+
+  - symbol: TSLA
+    name: "Tesla"
+    tier: 1
+    strategies: [put_spread]
+    notes: "High IV, very liquid; defined risk caps the volatility risk."
+
+  - symbol: NVDA
+    name: "NVIDIA"
+    tier: 1
+    strategies: [put_spread]
+    notes: "Mega-cap semi; spreads keep BP requirement reasonable."
+
+  - symbol: SPY
+    name: "S&P 500 ETF"
+    tier: 1
+    strategies: [put_spread]
+    notes: "Broad-market hedge candidate too."
+
+  - symbol: QQQ
+    name: "NASDAQ-100 ETF"
+    tier: 1
+    strategies: [put_spread]
+    notes: "Tech-heavy ETF with deep options chain."
 
 # Banned list — explicitly never trade these even if screener suggests
 banned:

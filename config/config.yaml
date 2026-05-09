@@ -120,3 +120,55 @@ execution:
   retry_max_attempts: 5
   retry_initial_backoff_seconds: 1
   retry_max_backoff_seconds: 60
+
+# Strategies registry. The bot iterates these each tick and dispatches by
+# `type` to the right orchestrator. A ticker belongs to a strategy iff its
+# `strategies:` list in universe.yaml contains the strategy id.
+#
+# `params` overlays the legacy `wheel:` block above for `type: wheel`
+# strategies — anything in `params` wins.
+strategies:
+  - id: monthly_wheel
+    display_name: "Monthly Wheel"
+    type: wheel
+    enabled: true
+    max_concurrent: 4
+    params:
+      dte_min: 30
+      dte_max: 45
+      csp_delta_min: 0.20
+      csp_delta_max: 0.30
+      cc_delta_min: 0.20
+      cc_delta_max: 0.30
+      profit_close_pct: 50
+
+  - id: weekly_wheel
+    display_name: "Weekly Wheel"
+    type: wheel
+    enabled: true
+    max_concurrent: 4
+    params:
+      dte_min: 7
+      dte_max: 14
+      # Tighter delta band — weekly gamma is unforgiving, stay further OTM.
+      csp_delta_min: 0.15
+      csp_delta_max: 0.25
+      cc_delta_min: 0.15
+      cc_delta_max: 0.25
+      # Close earlier — capture theta then redeploy capital.
+      profit_close_pct: 50
+      # Higher trigger to roll because weeklies move into ITM faster.
+      roll_trigger_delta: 0.45
+
+  - id: put_spread
+    display_name: "Bull Put Spread"
+    type: vertical_spread
+    enabled: false   # Comes online in sub-sprint 3 (multi-leg orders)
+    max_concurrent: 4
+    params:
+      dte_min: 30
+      dte_max: 45
+      short_delta_min: 0.20
+      short_delta_max: 0.30
+      spread_width_dollars: 1.0   # short - long strike difference
+      profit_close_pct: 50

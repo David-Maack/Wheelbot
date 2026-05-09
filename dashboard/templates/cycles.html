@@ -15,18 +15,27 @@
       <option value="MANUAL_CLOSE" {% if filter_outcome == 'MANUAL_CLOSE' %}selected{% endif %}>MANUAL_CLOSE</option>
     </select>
   </label>
+  <label>Strategy
+    <select name="strategy">
+      <option value="">any</option>
+      {% for s in strategies %}
+      <option value="{{ s.id }}" {% if filter_strategy == s.id %}selected{% endif %}>{{ s.display_name }}</option>
+      {% endfor %}
+    </select>
+  </label>
   <button type="submit">Filter</button>
 </form>
 {% if cycles %}
 <table class="grid">
   <thead>
-    <tr><th>ID</th><th>Symbol</th><th>Started</th><th>Ended</th><th>Outcome</th><th>Days held</th><th>Realized P&amp;L</th><th>P&amp;L %</th></tr>
+    <tr><th>ID</th><th>Symbol</th><th>Strategy</th><th>Started</th><th>Ended</th><th>Outcome</th><th>Days held</th><th>Realized P&amp;L</th><th>P&amp;L %</th></tr>
   </thead>
   <tbody>
     {% for c in cycles %}
     <tr>
       <td>{{ c.id }}</td>
       <td>{{ c.symbol }}</td>
+      <td><code>{{ c.strategy_id or "—" }}</code></td>
       <td>{{ c.started_at }}</td>
       <td>{% if c.ended_at %}{{ c.ended_at }}{% else %}<em>open</em>{% endif %}</td>
       <td>{{ c.cycle_outcome or "—" }}</td>

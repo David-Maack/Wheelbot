@@ -39,6 +39,7 @@ from core.config import load_config, load_universe
 from core.logs import setup_logging
 from core.models import OptionType, Order, OrderType, Position
 from core.notify import make_notifier, set_dispatcher
+from core.strategies import StrategyDefinition, load_strategies, universe_for_strategy
 from data.ivr import IVRProvider
 from db.repo import Database, Repos
 from execution.kill_switch import KillSwitchResult
@@ -235,31 +236,82 @@ async def _propose_and_route(
     ivr: IVRProvider,
     config: dict[str, Any],
     universe: dict[str, Any],
+    strategies: list[StrategyDefinition],
 ):
-    proposals = await propose_all(broker, repos, config, universe, ivr)
-    placed = 0
-    blocked = 0
-    for p in proposals:
-        try:
-            result = await router.place(p)
-        except Exception as exc:
+    """Iterate enabled strategies; dispatch by type to the right orchestrator;
+    route each proposal through the router. Per-strategy summary lines so the
+    dashboard can show which strategy produced what."""
+    total_proposals = 0
+    total_placed = 0
+    total_blocked = 0
+    for strategy in strategies:
+        if not strategy.enabled:
+            continue
+        strategy_universe = universe_for_strategy(strategy, universe)
+        if not strategy_universe["tickers"]:
             log_checkpoint(
-                "bot_route_exception",
-                status="fail",
-                symbol=p.symbol,
-                error=str(exc),
+                "bot_strategy_empty_universe",
+                status="skip",
+                strategy=strategy.id,
             )
             continue
-        if result.placed is not None:
-            placed += 1
-        elif result.risk_failed or result.news_decision == "block":
-            blocked += 1
+        if strategy.type == "wheel":
+            proposals = await propose_all(
+                broker, repos, config, strategy_universe, ivr, strategy=strategy,
+            )
+        elif strategy.type == "vertical_spread":
+            # Sub-sprint 3 wires this in. Skip cleanly until then.
+            log_checkpoint(
+                "bot_strategy_not_implemented",
+                status="skip",
+                strategy=strategy.id,
+                type=strategy.type,
+            )
+            continue
+        else:
+            log_checkpoint(
+                "bot_strategy_unknown_type",
+                status="fail",
+                strategy=strategy.id,
+                type=strategy.type,
+            )
+            continue
+
+        placed = 0
+        blocked = 0
+        for p in proposals:
+            try:
+                result = await router.place(p)
+            except Exception as exc:
+                log_checkpoint(
+                    "bot_route_exception",
+                    status="fail",
+                    symbol=p.symbol,
+                    strategy=strategy.id,
+                    error=str(exc),
+                )
+                continue
+            if result.placed is not None:
+                placed += 1
+            elif result.risk_failed or result.news_decision == "block":
+                blocked += 1
+        log_checkpoint(
+            "bot_strategy_summary",
+            status="ok",
+            strategy=strategy.id,
+            n_proposals=len(proposals),
+            placed=placed,
+            blocked=blocked,
+        )
+        total_proposals += len(proposals)
+        total_placed += placed
+        total_blocked += blocked
     log_checkpoint(
         "bot_propose_route_summary",
         status="ok",
-        n_proposals=len(proposals),
-        placed=placed,
-        blocked=blocked,
+        n_proposals=total_proposals,
+        placed=total_placed,
+        blocked=total_blocked,
     )
 
 
@@ -313,13 +365,22 @@ async def main(argv: list[str] | None = None) -> int:
         broker, repos, config, roll_evaluator=roll_evaluator, universe=universe
     )
 
+    strategies = load_strategies(config)
+    enabled_strategies = [s for s in strategies if s.enabled]
+    log_checkpoint(
+        "bot_strategies_loaded",
+        status="ok",
+        enabled=[s.id for s in enabled_strategies],
+        disabled=[s.id for s in strategies if not s.enabled],
+    )
+
     async def _post_tick(_loop: ReconcilerLoop, ks: KillSwitchResult | None):
         if ks is not None and ks.tripped:
             log_checkpoint("bot_skip_kill_switch", status="ok", reason=ks.reason)
             return
         await _propose_and_route(
             broker=broker, repos=repos, router=router, ivr=ivr,
-            config=config, universe=universe,
+            config=config, universe=universe, strategies=enabled_strategies,
         )
 
     loop = ReconcilerLoop(
