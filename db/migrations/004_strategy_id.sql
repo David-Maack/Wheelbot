@@ -14,15 +14,12 @@
 -- Idempotent: the runner skips if migration 004 is already in
 -- schema_migrations. Safe to re-run on already-migrated DBs.
 
--- 1. Drop legacy implicit unique index (the one auto-created by
---    UNIQUE(account_id, symbol) on the original positions table).
---    SQLite name varies; this is a best-effort cleanup. Idempotent.
-DROP INDEX IF EXISTS sqlite_autoindex_positions_1;
-
--- 2. Rename old positions to a temp name.
+-- 1. Rename old positions to a temp name. SQLite renames the implicit
+--    UNIQUE index alongside the table, and DROP TABLE later cleans it up.
+--    SQLite refuses explicit DROP INDEX on UNIQUE-backing indexes anyway.
 ALTER TABLE positions RENAME TO positions_old;
 
--- 3. Create new positions with strategy_id + new UNIQUE constraint.
+-- 2. Create new positions with strategy_id + new UNIQUE constraint.
 CREATE TABLE positions (
     id                    INTEGER PRIMARY KEY,
     account_id            TEXT    NOT NULL,
