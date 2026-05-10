@@ -28,6 +28,7 @@ from core.checkpoint import checkpoint, log_checkpoint
 from core.models import Order, OrderStatus, OrderType, Position, PositionState
 from db.repo import Repos
 from risk.limits import RiskCheckFailed, RiskGate
+from strategies.spreads import MultiLegProposal
 from strategies.wheel import Proposal
 
 
@@ -41,7 +42,7 @@ class RouterConfig:
 
 @dataclass(frozen=True, slots=True)
 class RouteResult:
-    proposal: Proposal
+    proposal: Proposal | MultiLegProposal
     placed: Order | None  # None when dry-run, risk-failed, or news-blocked
     risk_failed: bool = False
     risk_failure_rule: str | None = None
@@ -78,6 +79,23 @@ def _option_limit_price(bid: float | None, ask: float | None) -> float | None:
         snapped = round(mid, 2)
     # Floor at $0.01 — Alpaca rejects $0.00 limit on a SELL.
     return max(snapped, 0.01)
+
+
+def _multi_leg_client_order_id(
+    proposal: MultiLegProposal, today: date | None = None
+) -> str:
+    """Deterministic per-(strategy, underlying, legs, day) so retries collide."""
+    today = today or datetime.now(UTC).date()
+    leg_key = "+".join(
+        f"{leg.contract_symbol}:{leg.action.value if hasattr(leg.action, 'value') else leg.action}:{leg.ratio_qty}"
+        for leg in proposal.legs
+    )
+    raw = (
+        f"{proposal.strategy_id}|mleg|{proposal.symbol}|{leg_key}|"
+        f"{proposal.quantity}|{today.isoformat()}"
+    )
+    digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
+    return f"wb-{digest}"
 
 
 def _client_order_id(proposal: Proposal, today: date | None = None) -> str:
@@ -253,6 +271,99 @@ class OrderRouter:
             quantity_adjusted=effective_qty if news_decision == "caution" else None,
         )
 
+    async def place_multi_leg(
+        self,
+        proposal: MultiLegProposal,
+        *,
+        sleep: Any = asyncio.sleep,
+        today: date | None = None,
+    ) -> RouteResult:
+        """Place a defined-risk multi-leg package atomically.
+
+        Differences vs `place(Proposal)`:
+          - News check is skipped: a credit-spread sizing decision factors
+            risk-vs-reward differently from "should I take naked exposure".
+          - Limit price is the proposal's net credit, snapped to a $0.01 tick.
+          - Position state goes to SPREAD_PENDING; reconciler upgrades to
+            SPREAD_OPEN on observed fill.
+        """
+        try:
+            await self._gate.evaluate(proposal, today=today)
+        except RiskCheckFailed as exc:
+            log_checkpoint(
+                "router_risk_fail",
+                status="fail",
+                symbol=proposal.symbol,
+                strategy=proposal.strategy_id,
+                rule=exc.rule,
+                detail=exc.detail,
+            )
+            return RouteResult(
+                proposal=proposal,
+                placed=None,
+                risk_failed=True,
+                risk_failure_rule=exc.rule,
+                risk_failure_detail=exc.detail,
+            )
+
+        if self._cfg.dry_run:
+            log_checkpoint(
+                "router_dry_run_mleg",
+                status="ok",
+                symbol=proposal.symbol,
+                strategy=proposal.strategy_id,
+                qty=proposal.quantity,
+                n_legs=len(proposal.legs),
+                net_credit=proposal.net_credit_per_spread,
+            )
+            return RouteResult(proposal=proposal, placed=None, dry_run=True)
+
+        client_id = _multi_leg_client_order_id(proposal, today)
+        limit_price = round(proposal.net_credit_per_spread, 2)
+
+        last_exc: Exception | None = None
+        backoff = self._cfg.retry_initial_backoff_seconds
+        placed: Order | None = None
+        for attempt in range(1, self._cfg.retry_max_attempts + 1):
+            with checkpoint(
+                "router_submit_mleg",
+                attempt=attempt,
+                symbol=proposal.symbol,
+                strategy=proposal.strategy_id,
+            ) as ctx:
+                try:
+                    placed = await self._broker.place_multi_leg_order(
+                        underlying=proposal.symbol,
+                        legs=list(proposal.legs),
+                        quantity=proposal.quantity,
+                        limit_price=limit_price,
+                        client_order_id=client_id,
+                        strategy_id=proposal.strategy_id,
+                        account_id=self._config.get("account", {}).get("id", "primary"),
+                    )
+                    ctx["broker_order_id"] = placed.broker_order_id
+                    ctx["status"] = (
+                        placed.status.value
+                        if hasattr(placed.status, "value")
+                        else str(placed.status)
+                    )
+                    break
+                except OrderRejected:
+                    raise
+                except BrokerUnavailable as exc:
+                    last_exc = exc
+                    ctx["error"] = str(exc)
+                    if attempt >= self._cfg.retry_max_attempts:
+                        raise
+            await sleep(min(backoff, self._cfg.retry_max_backoff_seconds))
+            backoff = min(backoff * 2, self._cfg.retry_max_backoff_seconds)
+        if placed is None:
+            raise BrokerUnavailable(str(last_exc) if last_exc else "exhausted retries")
+
+        await self._persist_order(placed)
+        await self._upsert_position_spread_pending(proposal, placed)
+        return RouteResult(proposal=proposal, placed=placed)
+
     # -- Internals ------------------------------------------------------------
 
     def _build_order(self, proposal: Proposal, *, today: date | None) -> Order:
@@ -361,5 +472,35 @@ class OrderRouter:
                 existing.id,
                 new_state,
                 f"router_pending:{placed.client_order_id}",
+                when=now,
+            )
+
+    async def _upsert_position_spread_pending(
+        self, proposal: MultiLegProposal, placed: Order
+    ) -> None:
+        account_id = self._config.get("account", {}).get("id", "primary")
+        existing = await self._repos.positions.get_by_symbol(
+            account_id, proposal.symbol, strategy_id=proposal.strategy_id
+        )
+        now = _utcnow()
+        reason = f"router_pending:{placed.client_order_id}"
+        if existing is None:
+            await self._repos.positions.insert(
+                Position(
+                    account_id=account_id,
+                    symbol=proposal.symbol,
+                    strategy_id=proposal.strategy_id,
+                    state=PositionState.SPREAD_PENDING,
+                    shares=0,
+                    state_changed_at=now,
+                    state_change_reason=reason,
+                )
+            )
+            return
+        if existing.id is not None:
+            await self._repos.positions.update_state(
+                existing.id,
+                PositionState.SPREAD_PENDING,
+                reason,
                 when=now,
             )

@@ -52,6 +52,7 @@ from intelligence.news import make_news_source
 from intelligence.news_check import news_check as run_news_check
 from strategies import roll_orchestrator
 from strategies.roll_advisor import RollAction, RollContext
+from strategies.spreads import MultiLegProposal, propose_all as propose_all_spreads
 from strategies.wheel import propose_all
 
 
@@ -260,14 +261,9 @@ async def _propose_and_route(
                 broker, repos, config, strategy_universe, ivr, strategy=strategy,
             )
         elif strategy.type == "vertical_spread":
-            # Sub-sprint 3 wires this in. Skip cleanly until then.
-            log_checkpoint(
-                "bot_strategy_not_implemented",
-                status="skip",
-                strategy=strategy.id,
-                type=strategy.type,
+            proposals = await propose_all_spreads(
+                broker, repos, config, strategy_universe, strategy=strategy,
             )
-            continue
         else:
             log_checkpoint(
                 "bot_strategy_unknown_type",
@@ -281,7 +277,10 @@ async def _propose_and_route(
         blocked = 0
         for p in proposals:
             try:
-                result = await router.place(p)
+                if isinstance(p, MultiLegProposal):
+                    result = await router.place_multi_leg(p)
+                else:
+                    result = await router.place(p)
             except Exception as exc:
                 log_checkpoint(
                     "bot_route_exception",

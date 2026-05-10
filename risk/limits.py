@@ -34,6 +34,7 @@ from core.config import effective_wheel_params
 from core.models import OptionType, OrderType, PositionState
 from data.earnings import in_blackout
 from db.repo import Repos
+from strategies.spreads import MultiLegProposal
 from strategies.wheel import Proposal
 
 
@@ -55,7 +56,7 @@ class RuleResult:
 
 @dataclass(slots=True)
 class RiskCheckResult:
-    proposal: Proposal
+    proposal: Proposal | MultiLegProposal
     results: list[RuleResult] = field(default_factory=list)
 
     def add(self, rule: str, status: str, detail: str = "") -> None:
@@ -70,8 +71,16 @@ class RiskCheckResult:
         return [r for r in self.results if r.status == "fail"]
 
 
-def _notional(proposal: Proposal) -> float:
-    """Cash secured for a put (strike × 100 × qty), share value for a call."""
+def _notional(proposal: Proposal | MultiLegProposal) -> float:
+    """Capital-at-risk for the proposal.
+
+    - CSP: cash secured = strike × 100 × qty
+    - CC: share value = underlying × 100 × qty
+    - Multi-leg defined-risk: max_loss × qty (spread max loss is dollars
+      per package; positive)
+    """
+    if isinstance(proposal, MultiLegProposal):
+        return proposal.max_loss_per_spread * proposal.quantity
     contract = proposal.contract
     if contract.option_type == OptionType.PUT:
         return contract.strike * 100 * proposal.quantity
@@ -94,7 +103,7 @@ class RiskGate:
 
     async def evaluate(
         self,
-        proposal: Proposal,
+        proposal: Proposal | MultiLegProposal,
         *,
         today: date | None = None,
         raise_on_fail: bool = True,
@@ -103,13 +112,20 @@ class RiskGate:
         params = effective_wheel_params(proposal.symbol, self._config, self._universe)
         account = await self._broker.get_account()
 
-        await self._rule_buying_power(result, proposal, account, params)
-        await self._rule_position_cap(result, proposal, account, params)
-        await self._rule_concurrent_cap(result, proposal, params)
-        await self._rule_earnings(result, proposal, params, today)
-        self._rule_cc_strike_floor(result, proposal)
-        self._rule_liquidity(result, proposal, params)
-        await self._rule_regime(result, proposal, params)
+        if isinstance(proposal, MultiLegProposal):
+            await self._rule_buying_power(result, proposal, account, params)
+            await self._rule_position_cap(result, proposal, account, params)
+            await self._rule_concurrent_cap(result, proposal, params)
+            await self._rule_earnings_multi_leg(result, proposal, params, today)
+            await self._rule_regime_multi_leg(result, proposal, params)
+        else:
+            await self._rule_buying_power(result, proposal, account, params)
+            await self._rule_position_cap(result, proposal, account, params)
+            await self._rule_concurrent_cap(result, proposal, params)
+            await self._rule_earnings(result, proposal, params, today)
+            self._rule_cc_strike_floor(result, proposal)
+            self._rule_liquidity(result, proposal, params)
+            await self._rule_regime(result, proposal, params)
 
         log_checkpoint(
             "risk_gate",
@@ -127,7 +143,7 @@ class RiskGate:
     async def _rule_buying_power(
         self,
         result: RiskCheckResult,
-        proposal: Proposal,
+        proposal: Proposal | MultiLegProposal,
         account: Any,
         params: dict[str, Any],
     ) -> None:
@@ -147,7 +163,7 @@ class RiskGate:
     async def _rule_position_cap(
         self,
         result: RiskCheckResult,
-        proposal: Proposal,
+        proposal: Proposal | MultiLegProposal,
         account: Any,
         params: dict[str, Any],
     ) -> None:
@@ -167,7 +183,7 @@ class RiskGate:
     async def _rule_concurrent_cap(
         self,
         result: RiskCheckResult,
-        proposal: Proposal,
+        proposal: Proposal | MultiLegProposal,
         params: dict[str, Any],
     ) -> None:
         cap = int(params.get("max_concurrent_positions", 4))
@@ -218,6 +234,68 @@ class RiskGate:
             )
         else:
             result.add("earnings_blackout", "pass")
+
+    # --- Rule 4 (multi-leg) -----------------------------------------------------
+    async def _rule_earnings_multi_leg(
+        self,
+        result: RiskCheckResult,
+        proposal: MultiLegProposal,
+        params: dict[str, Any],
+        today: date | None,
+    ) -> None:
+        """Use the short leg's expiration — it's the leg that bears assignment risk."""
+        days_before = int(params.get("earnings_blackout_days_before", 5))
+        days_after = int(params.get("earnings_blackout_days_after", 2))
+        short_leg = next(
+            (
+                leg for leg in proposal.legs
+                if str(leg.action) in ("SELL_TO_OPEN", "OrderType.SELL_TO_OPEN")
+                or (hasattr(leg.action, "value") and leg.action.value == "SELL_TO_OPEN")
+            ),
+            proposal.legs[0],
+        )
+        in_window = in_blackout(
+            proposal.symbol,
+            short_leg.expiration,
+            days_before=days_before,
+            days_after=days_after,
+            today=today,
+        )
+        if in_window is None:
+            result.add("earnings_blackout", "skip", "no earnings data")
+        elif in_window:
+            result.add(
+                "earnings_blackout",
+                "fail",
+                f"short-leg expiration {short_leg.expiration} inside blackout window",
+            )
+        else:
+            result.add("earnings_blackout", "pass")
+
+    # --- Rule 7 (multi-leg) -----------------------------------------------------
+    async def _rule_regime_multi_leg(
+        self,
+        result: RiskCheckResult,
+        proposal: MultiLegProposal,
+        params: dict[str, Any],
+    ) -> None:
+        """Bull put credit spreads sell premium with bullish bias — same gate as CSPs."""
+        if not self._config.get("regime", {}).get("enabled", False):
+            result.add("regime", "skip", "regime gating disabled in config")
+            return
+        c = await self._repos.db.connect()
+        async with c.execute(
+            "SELECT csps_allowed FROM regime_snapshots ORDER BY snapshot_date DESC LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            result.add("regime", "skip", "no regime snapshots yet")
+            return
+        csps_allowed = bool(row["csps_allowed"]) if row["csps_allowed"] is not None else True
+        if not csps_allowed:
+            result.add("regime", "fail", "current regime snapshot disallows new bullish-premium trades")
+        else:
+            result.add("regime", "pass")
 
     # --- Rule 5 ----------------------------------------------------------------
     def _rule_cc_strike_floor(self, result: RiskCheckResult, proposal: Proposal) -> None:

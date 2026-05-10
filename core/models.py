@@ -26,6 +26,13 @@ class PositionState(StrEnum):
     CC_OPEN = "CC_OPEN"
     CC_CLOSED = "CC_CLOSED"
     CALLED_AWAY = "CALLED_AWAY"
+    # Vertical credit-spread states (sub-sprint 3). The package is opened as
+    # a single multi-leg order; reconciler treats a fill as one state event.
+    SPREAD_PENDING = "SPREAD_PENDING"
+    SPREAD_OPEN = "SPREAD_OPEN"
+    SPREAD_CLOSED = "SPREAD_CLOSED"
+    # Both legs ITM at expiry — defined max loss already realized.
+    SPREAD_ASSIGNED = "SPREAD_ASSIGNED"
     BROKER_DOWN = "BROKER_DOWN"
     MANUAL_INTERVENTION = "MANUAL_INTERVENTION"
     KILLED = "KILLED"
@@ -62,6 +69,9 @@ class CycleOutcome(StrEnum):
     CC_EXPIRED = "CC_EXPIRED"
     CC_CLOSED_PROFIT = "CC_CLOSED_PROFIT"
     CC_CALLED_AWAY = "CC_CALLED_AWAY"
+    SPREAD_EXPIRED_PROFIT = "SPREAD_EXPIRED_PROFIT"   # both legs OTM at expiry
+    SPREAD_CLOSED_PROFIT = "SPREAD_CLOSED_PROFIT"     # closed at profit_close_pct
+    SPREAD_MAX_LOSS = "SPREAD_MAX_LOSS"               # both legs ITM at expiry
     MANUAL_CLOSE = "MANUAL_CLOSE"
 
 
