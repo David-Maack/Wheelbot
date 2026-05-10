@@ -14,9 +14,17 @@
 -- Idempotent: the runner skips if migration 004 is already in
 -- schema_migrations. Safe to re-run on already-migrated DBs.
 
+-- 0. Use legacy ALTER TABLE semantics for the rename so that FK
+--    references in OTHER tables (state_log → positions) are NOT auto-
+--    rewritten to point at positions_old. We want them to keep referring
+--    to "positions" by name so when the new positions table is created,
+--    the FKs resolve to it cleanly. The runner has FK enforcement
+--    disabled around the migration body; foreign_key_check verifies
+--    integrity before committing.
+PRAGMA legacy_alter_table = ON;
+
 -- 1. Rename old positions to a temp name. SQLite renames the implicit
 --    UNIQUE index alongside the table, and DROP TABLE later cleans it up.
---    SQLite refuses explicit DROP INDEX on UNIQUE-backing indexes anyway.
 ALTER TABLE positions RENAME TO positions_old;
 
 -- 2. Create new positions with strategy_id + new UNIQUE constraint.
@@ -64,3 +72,7 @@ UPDATE chain_snapshots SET strategy_id = 'monthly_wheel' WHERE strategy_id IS NU
 
 CREATE INDEX IF NOT EXISTS idx_orders_strategy ON orders(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_cycles_strategy ON wheel_cycles(strategy_id);
+
+-- Restore default ALTER TABLE behavior for any subsequent migrations
+-- run on the same connection.
+PRAGMA legacy_alter_table = OFF;

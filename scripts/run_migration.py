@@ -80,32 +80,46 @@ def _split_statements(sql: str) -> list[str]:
 def apply_migration(conn: sqlite3.Connection, migration: Migration) -> None:
     """Apply a migration atomically.
 
-    `conn` runs in Python sqlite3's default deferred-transaction mode. We
-    use `with conn:` which COMMITs on clean exit and ROLLBACKs on exception.
-    Each statement runs via `conn.execute()` (NOT `executescript`, which
-    interferes with explicit transactions). On failure the partially-applied
-    statements are rolled back and the original SQL error is re-raised with
-    the failing statement attached for diagnosis.
+    `with conn:` brackets the body in a transaction — COMMITs on clean
+    exit, ROLLBACKs on exception. Each statement runs via `conn.execute()`
+    (NOT `executescript`, which clobbers explicit transactions).
+
+    Foreign keys are disabled for the duration of the migration. This is
+    the canonical SQLite pattern for schema-changing migrations that
+    rename or recreate tables that other tables reference (alternative is
+    recreating every dependent table — bad). PRAGMA foreign_keys must run
+    OUTSIDE a transaction — it's a no-op inside. After the body runs, we
+    `PRAGMA foreign_key_check` (still inside the transaction) and abort the
+    commit if any orphans appear, so we never commit a broken FK graph.
     """
     sql = migration.path.read_text(encoding="utf-8")
     statements = _split_statements(sql)
     if not statements:
         raise ValueError(f"migration {migration.version} has no statements")
 
-    with conn:
-        for i, stmt in enumerate(statements, start=1):
-            try:
-                conn.execute(stmt)
-            except sqlite3.Error as exc:
-                preview = stmt.replace("\n", " ")[:140]
-                raise sqlite3.Error(
-                    f"migration {migration.version} statement {i}/{len(statements)} failed: "
-                    f"{preview!r} — {exc}"
-                ) from exc
-        conn.execute(
-            "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
-            (migration.version, migration.name),
-        )
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with conn:
+            for i, stmt in enumerate(statements, start=1):
+                try:
+                    conn.execute(stmt)
+                except sqlite3.Error as exc:
+                    preview = stmt.replace("\n", " ")[:140]
+                    raise sqlite3.Error(
+                        f"migration {migration.version} statement {i}/{len(statements)} failed: "
+                        f"{preview!r} — {exc}"
+                    ) from exc
+            violations = list(conn.execute("PRAGMA foreign_key_check"))
+            if violations:
+                raise sqlite3.IntegrityError(
+                    f"FK violations after migration {migration.version}: {violations[:5]}"
+                )
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
+                (migration.version, migration.name),
+            )
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def main(argv: list[str] | None = None) -> int:
