@@ -222,3 +222,203 @@ async def propose_all(
         n_proposals=len(out),
     )
     return out
+
+
+# -- Close orchestrator -----------------------------------------------------
+
+
+async def _open_order_for_position(repos: Repos, position_id: int) -> Any:
+    """Most recent FILLED MULTI_LEG_OPEN order for this position's cycle.
+
+    Used to recover the legs (and original credit) we need to construct the
+    matching MULTI_LEG_CLOSE proposal.
+    """
+    c = await repos.db.connect()
+    async with c.execute(
+        "SELECT * FROM orders WHERE cycle_id = ("
+        "SELECT current_cycle_id FROM positions WHERE id = ?"
+        ") AND order_type = ? AND status = ? "
+        "ORDER BY filled_at DESC LIMIT 1",
+        (position_id, OrderType.MULTI_LEG_OPEN.value, "FILLED"),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    from db.repo import _row_to_dict, JSON_FIELDS_BY_TABLE
+    from core.models import Order
+
+    return Order(**_row_to_dict(row, JSON_FIELDS_BY_TABLE["orders"]))
+
+
+def _flip_action(action: OrderType) -> OrderType:
+    """OPEN → CLOSE for the same side."""
+    if action == OrderType.SELL_TO_OPEN:
+        return OrderType.BUY_TO_CLOSE
+    if action == OrderType.BUY_TO_OPEN:
+        return OrderType.SELL_TO_CLOSE
+    return action
+
+
+async def _quote_mid(broker: Broker, symbol: str) -> float | None:
+    try:
+        q = await broker.get_quote(symbol)
+    except Exception:
+        return None
+    if q.mid is not None:
+        return q.mid
+    return q.last or q.bid or q.ask
+
+
+async def propose_close_for_symbol(
+    broker: Broker,
+    repos: Repos,
+    symbol: str,
+    config: dict[str, Any],
+    *,
+    today: date | None = None,
+    strategy: StrategyDefinition | None = None,
+) -> MultiLegProposal | None:
+    """Build a MULTI_LEG_CLOSE proposal for a SPREAD_OPEN position.
+
+    Triggers (any one is sufficient):
+      1. Profit close — current debit-to-close ≤ (1 - profit_close_pct/100) ×
+         original credit collected.
+      2. Time close — short leg DTE ≤ time_close_dte (force exit before
+         gamma/expiration risk dominates).
+    """
+    today = today or date.today()
+    if strategy is None:
+        return None
+    account_id = config.get("account", {}).get("id", "primary")
+    position = await repos.positions.get_by_symbol(
+        account_id, symbol, strategy_id=strategy.id
+    )
+    if position is None or position.state != PositionState.SPREAD_OPEN:
+        return None
+    if position.id is None:
+        return None
+
+    open_order = await _open_order_for_position(repos, position.id)
+    if open_order is None or not open_order.raw_request:
+        return None
+    legs_raw = open_order.raw_request.get("legs") or []
+    if not legs_raw:
+        return None
+
+    # Reconstruct OrderLegs in CLOSE direction.
+    close_legs: list[OrderLeg] = []
+    short_leg: OrderLeg | None = None
+    for leg in legs_raw:
+        # Each leg dict mirrors OrderLeg.model_dump(mode="json").
+        ol = OrderLeg(
+            contract_symbol=leg["contract_symbol"],
+            underlying=leg["underlying"],
+            option_type=leg["option_type"],
+            strike=leg["strike"],
+            expiration=leg["expiration"],
+            action=_flip_action(OrderType(leg["action"])),
+            ratio_qty=leg.get("ratio_qty", 1),
+        )
+        close_legs.append(ol)
+        if str(leg["action"]) == OrderType.SELL_TO_OPEN.value:
+            short_leg = ol  # remember for DTE check
+
+    # Re-quote each leg to compute current debit to close.
+    leg_mids: list[tuple[OrderLeg, float | None]] = []
+    for leg in close_legs:
+        mid = await _quote_mid(broker, leg.contract_symbol)
+        leg_mids.append((leg, mid))
+    if any(mid is None for _, mid in leg_mids):
+        log_checkpoint(
+            "spread_close_skip_no_quote",
+            status="skip",
+            symbol=symbol,
+            strategy=strategy.id,
+        )
+        return None
+
+    # Net debit-to-close per share = sum_buy_mid - sum_sell_mid (for the close
+    # legs). For a bull put credit spread close: buy short (debit) + sell long
+    # (credit). Convention: positive = we pay debit, negative = we still
+    # collect a credit (rare, only late in winning trades).
+    debit_to_close = 0.0
+    for leg, mid in leg_mids:
+        assert mid is not None
+        if leg.action == OrderType.BUY_TO_CLOSE:
+            debit_to_close += mid
+        elif leg.action == OrderType.SELL_TO_CLOSE:
+            debit_to_close -= mid
+
+    # Original credit collected per package = open_order.fill_price (signed).
+    original_credit_per_share = open_order.fill_price or 0.0
+    profit_close_pct = float(strategy.params.get("profit_close_pct", 50))
+    target_max_debit = (1 - profit_close_pct / 100.0) * original_credit_per_share
+
+    time_close_dte = int(strategy.params.get("time_close_dte", 7))
+    short_dte: int | None = None
+    if short_leg is not None:
+        short_dte = (short_leg.expiration - today).days
+
+    profit_trigger = debit_to_close <= target_max_debit and original_credit_per_share > 0
+    time_trigger = short_dte is not None and short_dte <= time_close_dte
+    if not (profit_trigger or time_trigger):
+        return None
+
+    quantity = open_order.quantity or 1
+    # MultiLegProposal.net_credit_per_spread for a CLOSE: signed net per share
+    # we'd receive. For a debit close, this is negative.
+    net_close_credit = -debit_to_close
+    rationale_parts = []
+    if profit_trigger:
+        rationale_parts.append(
+            f"profit_close at debit={debit_to_close:.2f} ≤ target {target_max_debit:.2f} "
+            f"(orig credit={original_credit_per_share:.2f}, pct={profit_close_pct})"
+        )
+    if time_trigger:
+        rationale_parts.append(f"time_close dte={short_dte} ≤ {time_close_dte}")
+    rationale = (
+        f"put_spread_close[{strategy.id}] " + "; ".join(rationale_parts)
+    )
+
+    return MultiLegProposal(
+        symbol=symbol,
+        legs=close_legs,
+        net_credit_per_spread=net_close_credit,
+        max_loss_per_spread=0.0,  # closing — no incremental risk
+        width_dollars=0.0,
+        quantity=quantity,
+        rationale=rationale,
+        strategy_id=strategy.id,
+        order_type=OrderType.MULTI_LEG_CLOSE,
+    )
+
+
+async def propose_all_closes(
+    broker: Broker,
+    repos: Repos,
+    config: dict[str, Any],
+    *,
+    today: date | None = None,
+    strategy: StrategyDefinition | None = None,
+) -> list[MultiLegProposal]:
+    """Walk SPREAD_OPEN positions for this strategy; propose closes."""
+    if strategy is None:
+        return []
+    account_id = config.get("account", {}).get("id", "primary")
+    active = await repos.positions.list_active(account_id, strategy_id=strategy.id)
+    out: list[MultiLegProposal] = []
+    for pos in active:
+        if pos.state != PositionState.SPREAD_OPEN:
+            continue
+        proposal = await propose_close_for_symbol(
+            broker, repos, pos.symbol, config, today=today, strategy=strategy,
+        )
+        if proposal is not None:
+            out.append(proposal)
+    log_checkpoint(
+        "spread_propose_closes",
+        status="ok",
+        strategy=strategy.id,
+        n_proposals=len(out),
+    )
+    return out

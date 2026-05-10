@@ -52,7 +52,11 @@ from intelligence.news import make_news_source
 from intelligence.news_check import news_check as run_news_check
 from strategies import roll_orchestrator
 from strategies.roll_advisor import RollAction, RollContext
-from strategies.spreads import MultiLegProposal, propose_all as propose_all_spreads
+from strategies.spreads import (
+    MultiLegProposal,
+    propose_all as propose_all_spreads,
+    propose_all_closes as propose_all_spread_closes,
+)
 from strategies.wheel import propose_all
 
 
@@ -261,9 +265,14 @@ async def _propose_and_route(
                 broker, repos, config, strategy_universe, ivr, strategy=strategy,
             )
         elif strategy.type == "vertical_spread":
-            proposals = await propose_all_spreads(
+            # Closes first — free up capital before considering new entries.
+            close_proposals = await propose_all_spread_closes(
+                broker, repos, config, strategy=strategy,
+            )
+            open_proposals = await propose_all_spreads(
                 broker, repos, config, strategy_universe, strategy=strategy,
             )
+            proposals = close_proposals + open_proposals
         else:
             log_checkpoint(
                 "bot_strategy_unknown_type",

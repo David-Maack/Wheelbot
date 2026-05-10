@@ -229,8 +229,45 @@ class Reconciler:
     ) -> None:
         summary.fills_processed += 1
         symbol = local.symbol
-        position = await self._repos.positions.get_by_symbol(self._account_id, symbol)
+        # Multi-leg orders are scoped per-strategy because the same underlying
+        # can run a wheel CSP and a put_spread on independent positions.
+        position = await self._repos.positions.get_by_symbol(
+            self._account_id, symbol, strategy_id=local.strategy_id
+        )
         fill_price = broker_view.fill_price if broker_view.fill_price is not None else (local.limit_price or 0.0)
+
+        if local.order_type == OrderType.MULTI_LEG_OPEN:
+            cycle_id = await self._open_cycle_for_spread(local, fill_price, summary)
+            await self._set_position_state(
+                position,
+                symbol,
+                PositionState.SPREAD_OPEN,
+                f"fill:{local.client_order_id}",
+                cycle_id=cycle_id or (position.current_cycle_id if position else None),
+                strategy_id=local.strategy_id,
+            )
+            if cycle_id is not None and local.id is not None:
+                await self._repos.orders.update(local.id, cycle_id=cycle_id)
+            return
+
+        if local.order_type == OrderType.MULTI_LEG_CLOSE:
+            await self._set_position_state(
+                position,
+                symbol,
+                PositionState.SPREAD_CLOSED,
+                f"close:{local.client_order_id}",
+                strategy_id=local.strategy_id,
+            )
+            if position and position.current_cycle_id is not None:
+                # Tag the close order with the cycle so PnL captures both legs.
+                if local.id is not None and local.cycle_id is None:
+                    await self._repos.orders.update(local.id, cycle_id=position.current_cycle_id)
+                await self._close_cycle(
+                    position.current_cycle_id,
+                    CycleOutcome.SPREAD_CLOSED_PROFIT,
+                    summary,
+                )
+            return
 
         if local.order_type == OrderType.SELL_TO_OPEN:
             # CSP_PENDING → CSP_OPEN, or CC_PENDING → CC_OPEN.
@@ -278,10 +315,45 @@ class Reconciler:
         cycle = WheelCycle(
             account_id=self._account_id,
             symbol=order.symbol,
+            strategy_id=order.strategy_id,
             started_at=_utcnow(),
             initial_csp_strike=order.strike,
             initial_csp_premium=fill_price * 100 * order.quantity,
             initial_capital_at_risk=(order.strike or 0) * 100 * order.quantity,
+            n_orders=1,
+        )
+        cycle_id = await self._repos.cycles.insert(cycle)
+        summary.cycles_opened += 1
+        return cycle_id
+
+    async def _open_cycle_for_spread(
+        self,
+        order: Order,
+        fill_price: float,
+        summary: ReconcileSummary,
+    ) -> int | None:
+        """Open a wheel_cycles row for a multi-leg spread.
+
+        The legs live in `order.raw_request['legs']`; we need them to recover
+        the package width for capital-at-risk. Falls back to fill_price-based
+        accounting if legs are missing (defensive — should always be present).
+        """
+        if order.order_type != OrderType.MULTI_LEG_OPEN:
+            return None
+        legs = (order.raw_request or {}).get("legs") or []
+        # Determine width = (max strike) - (min strike) across legs of the same option_type.
+        strikes = [leg.get("strike") for leg in legs if leg.get("strike") is not None]
+        width = (max(strikes) - min(strikes)) if len(strikes) >= 2 else 0.0
+        net_credit_per_share = fill_price  # signed; positive = credit received
+        capital_at_risk = max((width - net_credit_per_share) * 100 * order.quantity, 0.0)
+        cycle = WheelCycle(
+            account_id=self._account_id,
+            symbol=order.symbol,
+            strategy_id=order.strategy_id,
+            started_at=_utcnow(),
+            initial_csp_strike=None,
+            initial_csp_premium=net_credit_per_share * 100 * order.quantity,
+            initial_capital_at_risk=capital_at_risk,
             n_orders=1,
         )
         cycle_id = await self._repos.cycles.insert(cycle)
@@ -356,8 +428,58 @@ class Reconciler:
             # _on_fill drives it.
             return
 
+        if local.state == PositionState.SPREAD_OPEN:
+            # Broker shows nothing for this symbol → both legs OTM at expiry,
+            # full credit retained. Anything else is asymmetric (one leg ITM,
+            # one OTM, or partial assignment) and needs a human eye.
+            if broker is None:
+                await self._on_spread_expiration(local, summary)
+                return
+            # Broker still showing positions on this underlying — could be the
+            # spread legs themselves (ok, no action) or shares from assignment
+            # of the short put (max-loss path). Conservatively flag any state
+            # we can't classify as benign. Stock holdings here are NOT benign:
+            # they mean the short put assigned but the long put hasn't been
+            # exercised yet — that's defined-risk-realized territory and a
+            # human should confirm the close-out path.
+            if broker.shares != 0 or broker.state == PositionState.SHARES_HELD:
+                await self._flag_manual_intervention(
+                    local.symbol,
+                    f"spread {local.symbol} shows shares={broker.shares} at broker — "
+                    "likely assignment on short leg; review max-loss handling",
+                    summary,
+                )
+            return
+
+        if local.state == PositionState.SPREAD_PENDING:
+            # No state-shape transition; _on_fill drives PENDING → OPEN.
+            return
+
         # Anything else: no implied transition from position-shape alone.
         return
+
+    async def _on_spread_expiration(
+        self, local: Position, summary: ReconcileSummary
+    ) -> None:
+        """Both legs OTM at expiry → full credit retained, max profit."""
+        summary.expirations_processed += 1
+        if local.current_cycle_id:
+            await self._close_cycle(
+                local.current_cycle_id, CycleOutcome.SPREAD_EXPIRED_PROFIT, summary
+            )
+        if local.id is not None:
+            await self._repos.positions.update(
+                local.id,
+                state=PositionState.IDLE.value,
+                shares=0,
+                cost_basis=None,
+                current_cycle_id=None,
+                state_change_reason="spread_expired_max_profit",
+                state_changed_at=_utcnow().isoformat(),
+            )
+            await self._log_state(
+                local.id, local.state, PositionState.IDLE, "spread_expired_max_profit"
+            )
 
     async def _on_assignment(self, local: Position, summary: ReconcileSummary) -> None:
         summary.assignments_processed += 1
@@ -548,20 +670,22 @@ class Reconciler:
         reason: str,
         *,
         cycle_id: int | None = None,
+        strategy_id: str | None = None,
     ) -> None:
         now = _utcnow()
         if position is None:
-            inserted_id = await self._repos.positions.insert(
-                Position(
-                    account_id=self._account_id,
-                    symbol=symbol,
-                    state=new_state,
-                    shares=0,
-                    current_cycle_id=cycle_id,
-                    state_changed_at=now,
-                    state_change_reason=reason,
-                )
+            insert_kwargs: dict[str, Any] = dict(
+                account_id=self._account_id,
+                symbol=symbol,
+                state=new_state,
+                shares=0,
+                current_cycle_id=cycle_id,
+                state_changed_at=now,
+                state_change_reason=reason,
             )
+            if strategy_id is not None:
+                insert_kwargs["strategy_id"] = strategy_id
+            inserted_id = await self._repos.positions.insert(Position(**insert_kwargs))
             await self._log_state(inserted_id, None, new_state, reason)
             return
         if position.id is None:
@@ -684,11 +808,17 @@ class Reconciler:
             qty = row["quantity"] or 0
             price = row["fill_price"] or 0
             ot = row["order_type"]
+            if ot in (OrderType.MULTI_LEG_OPEN.value, OrderType.MULTI_LEG_CLOSE.value):
+                # fill_price is signed net per share (positive = credit). The
+                # qty here is the package quantity; each package is 100 shares
+                # per leg ratio. Cash flow = price * qty * 100.
+                pnl += price * qty * 100
+                continue
             # SELL credits; BUY debits. Options multiplier 100; stock 1.
             sign = 1 if ot in (OrderType.SELL_TO_OPEN.value, OrderType.SELL_TO_CLOSE.value) else -1
-            multiplier = 1 if ot in (OrderType.BUY_TO_OPEN.value, OrderType.SELL_TO_CLOSE.value) else 100
-            # BUY_TO_OPEN of stock and SELL_TO_CLOSE of stock are share trades; STO/BTC are option trades.
-            # Heuristic: treat SELL_TO_OPEN/BUY_TO_CLOSE as 100x (option), others as 1x.
+            # SELL_TO_OPEN/BUY_TO_CLOSE are option trades (100x); BUY_TO_OPEN/
+            # SELL_TO_CLOSE in this codebase are synthetic stock legs (1x)
+            # written by assignment / called-away.
             if ot in (OrderType.SELL_TO_OPEN.value, OrderType.BUY_TO_CLOSE.value):
                 multiplier = 100
             else:
