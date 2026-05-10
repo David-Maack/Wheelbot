@@ -419,13 +419,15 @@ async def _performance_data(deps: DashboardDeps) -> dict[str, Any]:
     """Aggregate stats + time series for the /performance view.
 
     All numbers come from wheel_cycles. The cumulative P&L list is sorted by
-    cycle close time so Chart.js can plot it as a single line.
+    cycle close time so Chart.js can plot it as a single line. The per-strategy
+    breakdown is the head-to-head view used to compare monthly_wheel vs
+    weekly_wheel vs put_spread over the multi-week test window.
     """
     account_id = deps.config.get("account", {}).get("id", "primary")
     c = await deps.repos.db.connect()
 
     async with c.execute(
-        "SELECT id, symbol, started_at, ended_at, final_pnl, "
+        "SELECT id, symbol, strategy_id, started_at, ended_at, final_pnl, "
         "       cycle_outcome, days_held "
         "FROM wheel_cycles "
         "WHERE account_id = ? AND ended_at IS NOT NULL AND final_pnl IS NOT NULL "
@@ -436,11 +438,17 @@ async def _performance_data(deps: DashboardDeps) -> dict[str, Any]:
     closed = [dict(r) for r in closed_rows]
 
     async with c.execute(
-        "SELECT COUNT(*) FROM wheel_cycles "
-        "WHERE account_id = ? AND ended_at IS NULL",
+        "SELECT strategy_id, COUNT(*) AS n FROM wheel_cycles "
+        "WHERE account_id = ? AND ended_at IS NULL "
+        "GROUP BY strategy_id",
         (account_id,),
     ) as cur:
-        open_count = (await cur.fetchone())[0]
+        open_rows = await cur.fetchall()
+    open_count_by_strategy: dict[str, int] = {}
+    for row in open_rows:
+        sid = (row["strategy_id"] or "monthly_wheel")
+        open_count_by_strategy[sid] = open_count_by_strategy.get(sid, 0) + int(row["n"])
+    open_count = sum(open_count_by_strategy.values())
 
     cumulative: list[dict[str, Any]] = []
     running = 0.0
@@ -450,6 +458,7 @@ async def _performance_data(deps: DashboardDeps) -> dict[str, Any]:
             {
                 "ended_at": row["ended_at"],
                 "symbol": row["symbol"],
+                "strategy_id": row["strategy_id"] or "monthly_wheel",
                 "pnl": float(row["final_pnl"] or 0),
                 "running": running,
                 "outcome": row["cycle_outcome"],
@@ -469,6 +478,10 @@ async def _performance_data(deps: DashboardDeps) -> dict[str, Any]:
         key = r["cycle_outcome"] or "UNKNOWN"
         outcomes[key] = outcomes.get(key, 0) + 1
 
+    per_strategy = _per_strategy_breakdown(
+        deps, closed, open_count_by_strategy
+    )
+
     return {
         "stats": {
             "total_realized_pnl_usd": total_pnl,
@@ -481,7 +494,77 @@ async def _performance_data(deps: DashboardDeps) -> dict[str, Any]:
         },
         "cumulative": cumulative,
         "outcomes": outcomes,
+        "per_strategy": per_strategy,
     }
+
+
+def _per_strategy_breakdown(
+    deps: DashboardDeps,
+    closed: list[dict[str, Any]],
+    open_count_by_strategy: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Group closed cycles by strategy_id; preserve config order so the
+    cards render monthly_wheel | weekly_wheel | put_spread left-to-right."""
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for row in closed:
+        sid = row["strategy_id"] or "monthly_wheel"
+        by_id.setdefault(sid, []).append(row)
+
+    config_strategies = _known_strategies(deps)
+    config_ids = [s["id"] for s in config_strategies]
+    display_name_by_id = {s["id"]: s["display_name"] for s in config_strategies}
+
+    # Order: config-listed first (preserved), then any orphan ids found in DB.
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+    for sid in config_ids:
+        ordered_ids.append(sid)
+        seen.add(sid)
+    for sid in list(by_id.keys()) + list(open_count_by_strategy.keys()):
+        if sid not in seen:
+            ordered_ids.append(sid)
+            seen.add(sid)
+
+    out: list[dict[str, Any]] = []
+    for sid in ordered_ids:
+        rows = by_id.get(sid, [])
+        wins = sum(1 for r in rows if (r["final_pnl"] or 0) > 0)
+        losses = sum(1 for r in rows if (r["final_pnl"] or 0) < 0)
+        total = sum(float(r["final_pnl"] or 0) for r in rows)
+        win_rate = (wins / len(rows) * 100.0) if rows else None
+        days = [int(r["days_held"]) for r in rows if r["days_held"] is not None]
+        avg_days = (sum(days) / len(days)) if days else None
+
+        # Per-strategy cumulative series (sorted ascending by ended_at, like
+        # the global one) — the chart overlays these as separate lines.
+        rows_sorted = sorted(rows, key=lambda r: r["ended_at"] or "")
+        running = 0.0
+        cumulative: list[dict[str, Any]] = []
+        for r in rows_sorted:
+            running += float(r["final_pnl"] or 0)
+            cumulative.append(
+                {
+                    "ended_at": r["ended_at"],
+                    "symbol": r["symbol"],
+                    "pnl": float(r["final_pnl"] or 0),
+                    "running": running,
+                }
+            )
+        out.append(
+            {
+                "id": sid,
+                "display_name": display_name_by_id.get(sid, sid),
+                "total_pnl": total,
+                "wins": wins,
+                "losses": losses,
+                "n_closed": len(rows),
+                "win_rate_pct": win_rate,
+                "open_cycles": int(open_count_by_strategy.get(sid, 0)),
+                "avg_days_held": avg_days,
+                "cumulative": cumulative,
+            }
+        )
+    return out
 
 
 # --- Production factory -------------------------------------------------------

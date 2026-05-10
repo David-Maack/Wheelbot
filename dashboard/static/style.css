@@ -125,3 +125,35 @@ tr.row-warn td { background: #fffaeb; }
 @media (max-width: 800px) {
   .two-col { grid-template-columns: 1fr; }
 }
+
+.strategy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+}
+.strategy-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.6rem 0.9rem;
+}
+.strategy-card-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3rem;
+}
+.strategy-id {
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+.strategy-id-suffix {
+  color: var(--fg-muted);
+  font-size: 0.78rem;
+  font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+}
+.strategy-card dl.kv dd {
+  font-weight: 600;
+}

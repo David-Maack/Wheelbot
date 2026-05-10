@@ -39,6 +39,42 @@
   </div>
 </section>
 
+{% if data.per_strategy %}
+<section class="panel">
+  <h2>By strategy</h2>
+  <div class="strategy-grid">
+    {% for s in data.per_strategy %}
+    <div class="strategy-card">
+      <div class="strategy-card-header">
+        <span class="strategy-id">{{ s.display_name }}</span>
+        <span class="strategy-id-suffix">{{ s.id }}</span>
+      </div>
+      <dl class="kv">
+        <dt>Realized P&amp;L</dt>
+        <dd class="{% if s.total_pnl > 0 %}pos{% elif s.total_pnl < 0 %}neg{% endif %}">
+          {% if s.n_closed %}{{ "%+.2f"|format(s.total_pnl) }}{% else %}—{% endif %}
+        </dd>
+        <dt>W / L</dt>
+        <dd><span class="pos">{{ s.wins }}</span> / <span class="neg">{{ s.losses }}</span></dd>
+        <dt>Win rate</dt>
+        <dd>
+          {% if s.win_rate_pct is not none %}{{ "%.1f"|format(s.win_rate_pct) }}%{% else %}—{% endif %}
+        </dd>
+        <dt>Closed cycles</dt>
+        <dd>{{ s.n_closed }}</dd>
+        <dt>Open cycles</dt>
+        <dd>{{ s.open_cycles }}</dd>
+        <dt>Avg days held</dt>
+        <dd>
+          {% if s.avg_days_held is not none %}{{ "%.1f"|format(s.avg_days_held) }}{% else %}—{% endif %}
+        </dd>
+      </dl>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
 {% if data.stats.n_closed == 0 %}
 <section class="panel">
   <p class="empty">No closed cycles yet — charts will populate as the bot completes its first wheel.
@@ -81,24 +117,45 @@
     const cycleColors = cyclePnl.map(v => v >= 0 ? "#128a30" : "#b22222");
     const cycleLabels = PERF.cumulative.map(p => p.symbol + " " + fmtDate(p.ended_at));
 
+    // Cumulative chart: total line + per-strategy lines so monthly_wheel,
+    // weekly_wheel, and put_spread are visible side-by-side.
+    const palette = ["#128a30", "#1e7eb1", "#c97700", "#b22222", "#8a4ec0", "#666"];
+    const datasets = [{
+      label: "Total",
+      data: PERF.cumulative.map(p => ({ x: fmtDate(p.ended_at), y: p.running })),
+      borderColor: "#222",
+      backgroundColor: "rgba(34, 34, 34, 0.08)",
+      fill: false,
+      tension: 0.2,
+      pointRadius: 3,
+      borderWidth: 2.5,
+    }];
+    (PERF.per_strategy || []).forEach((s, i) => {
+      if (!s.cumulative || s.cumulative.length === 0) return;
+      const color = palette[i % palette.length];
+      datasets.push({
+        label: s.display_name + " (" + s.id + ")",
+        data: s.cumulative.map(p => ({ x: fmtDate(p.ended_at), y: p.running })),
+        borderColor: color,
+        backgroundColor: color + "22",
+        fill: false,
+        tension: 0.2,
+        pointRadius: 3,
+        borderWidth: 1.5,
+      });
+    });
+
     new Chart(document.getElementById("cumChart"), {
       type: "line",
-      data: {
-        labels: labels,
-        datasets: [{
-          label: "Cumulative P&L",
-          data: running,
-          borderColor: "#128a30",
-          backgroundColor: "rgba(18, 138, 48, 0.12)",
-          fill: true,
-          tension: 0.2,
-          pointRadius: 4,
-        }]
-      },
+      data: { datasets: datasets },
       options: {
         responsive: true,
-        scales: { y: { ticks: { callback: v => "$" + v.toFixed(2) } } },
-        plugins: { legend: { display: false } }
+        parsing: false,
+        scales: {
+          x: { type: "category", labels: labels },
+          y: { ticks: { callback: v => "$" + v.toFixed(2) } }
+        },
+        plugins: { legend: { position: "bottom" } }
       }
     });
 
