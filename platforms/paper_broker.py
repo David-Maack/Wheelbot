@@ -28,7 +28,9 @@ from core.models import (
     OptionContract,
     OptionType,
     Order,
+    OrderLeg,
     OrderStatus,
+    OrderType,
     Position,
     PositionState,
     Quote,
@@ -161,6 +163,73 @@ class PaperBroker(Broker):
             self._orders[broker_id] = stored
             return stored.model_copy(deep=True)
 
+    async def place_multi_leg_order(
+        self,
+        *,
+        underlying: str,
+        legs: list[OrderLeg],
+        quantity: int,
+        limit_price: float | None,
+        client_order_id: str | None = None,
+        strategy_id: str | None = None,
+        account_id: str = "primary",
+    ) -> Order:
+        """In-memory simulation of an atomic multi-leg fill.
+
+        Test helper `fill_multi_leg(broker_order_id, fill_price=...)` walks
+        the package's legs and applies each one as a fill.
+        """
+        self._raise_if_unavailable()
+        if not legs:
+            raise OrderRejected("multi-leg order requires at least one leg")
+        if quantity <= 0:
+            raise OrderRejected(f"quantity must be positive, got {quantity}")
+
+        async with self._lock:
+            # Idempotency: same client_order_id collides with the prior package.
+            if client_order_id:
+                for existing in self._orders.values():
+                    if existing.client_order_id == client_order_id:
+                        return existing.model_copy(deep=True)
+
+            # Inferred order_type: if every leg is *_TO_OPEN it's an OPEN
+            # package; if every leg is *_TO_CLOSE it's a CLOSE package; mixed
+            # is allowed (e.g. roll) and gets MULTI_LEG_OPEN as the default.
+            all_close = all(
+                leg.action in (OrderType.SELL_TO_CLOSE, OrderType.BUY_TO_CLOSE)
+                for leg in legs
+            )
+            order_type = OrderType.MULTI_LEG_CLOSE if all_close else OrderType.MULTI_LEG_OPEN
+
+            broker_id = f"paper-mleg-{uuid.uuid4().hex[:12]}"
+            now = _utcnow()
+            stored = Order(
+                account_id=account_id,
+                symbol=underlying,
+                strategy_id=strategy_id,
+                order_type=order_type,
+                contract_symbol=None,
+                strike=None,
+                expiration=None,
+                option_type=None,
+                quantity=quantity,
+                limit_price=limit_price,
+                fill_price=None,
+                status=OrderStatus.PENDING,
+                placed_at=now,
+                broker_order_id=broker_id,
+                client_order_id=client_order_id,
+                raw_request={
+                    "underlying": underlying,
+                    "legs": [leg.model_dump(mode="json") for leg in legs],
+                    "quantity": quantity,
+                    "limit_price": limit_price,
+                },
+                raw_response={"broker_order_id": broker_id, "status": "PENDING"},
+            )
+            self._orders[broker_id] = stored
+            return stored.model_copy(deep=True)
+
     async def cancel_order(self, broker_order_id: str) -> None:
         self._raise_if_unavailable()
         async with self._lock:
@@ -206,6 +275,72 @@ class PaperBroker(Broker):
                 update={
                     "status": OrderStatus.FILLED,
                     "fill_price": price,
+                    "filled_at": _utcnow(),
+                }
+            )
+            self._orders[broker_order_id] = filled
+            return filled.model_copy(deep=True)
+
+    async def fill_multi_leg(
+        self, broker_order_id: str, fill_price: float | None = None
+    ) -> Order:
+        """Atomically fill all legs of a multi-leg package.
+
+        `fill_price` is the NET package price (signed; positive = credit
+        received, negative = debit paid). Cash impact is
+        `fill_price * 100 * order.quantity`. Each leg is registered or
+        un-registered in `_open_options` based on its action so subsequent
+        reconciler runs see the new short/long positions.
+        """
+        async with self._lock:
+            order = self._orders[broker_order_id]
+            if order.order_type not in (
+                OrderType.MULTI_LEG_OPEN,
+                OrderType.MULTI_LEG_CLOSE,
+            ):
+                raise ValueError(
+                    f"order {broker_order_id} is not a multi-leg package "
+                    f"(order_type={order.order_type})"
+                )
+            if order.status not in (OrderStatus.PENDING, OrderStatus.PARTIAL):
+                raise ValueError(
+                    f"order {broker_order_id} not fillable, status={order.status}"
+                )
+
+            net_price = fill_price if fill_price is not None else (order.limit_price or 0.0)
+            self._cash += net_price * 100 * order.quantity
+
+            raw = order.raw_request or {}
+            for leg_dict in raw.get("legs", []):
+                leg = OrderLeg.model_validate(leg_dict)
+                leg_contracts = leg.ratio_qty * order.quantity
+                synthetic = Order(
+                    account_id=order.account_id,
+                    symbol=leg.underlying,
+                    strategy_id=order.strategy_id,
+                    order_type=OrderType(leg.action),
+                    contract_symbol=leg.contract_symbol,
+                    strike=leg.strike,
+                    expiration=leg.expiration,
+                    option_type=leg.option_type,
+                    quantity=leg_contracts,
+                    limit_price=None,
+                    fill_price=None,
+                    status=OrderStatus.FILLED,
+                    placed_at=order.placed_at,
+                    filled_at=_utcnow(),
+                    broker_order_id=f"{broker_order_id}-leg-{leg.contract_symbol}",
+                    client_order_id=None,
+                )
+                if leg.action in (OrderType.SELL_TO_OPEN, OrderType.BUY_TO_OPEN):
+                    self._open_options[leg.contract_symbol] = synthetic
+                elif leg.action in (OrderType.SELL_TO_CLOSE, OrderType.BUY_TO_CLOSE):
+                    self._open_options.pop(leg.contract_symbol, None)
+
+            filled = order.model_copy(
+                update={
+                    "status": OrderStatus.FILLED,
+                    "fill_price": net_price,
                     "filled_at": _utcnow(),
                 }
             )

@@ -27,6 +27,7 @@ from core.models import (
     OptionContract,
     OptionType,
     Order,
+    OrderLeg,
     Position,
     Quote,
 )
@@ -100,3 +101,45 @@ class Broker(ABC):
     @abstractmethod
     async def get_orders_since(self, since: datetime) -> list[Order]:
         """All orders placed or updated at/after `since`. Reconciler input."""
+
+    async def place_multi_leg_order(
+        self,
+        *,
+        underlying: str,
+        legs: list[OrderLeg],
+        quantity: int,
+        limit_price: float | None,
+        client_order_id: str | None = None,
+        strategy_id: str | None = None,
+        account_id: str = "primary",
+    ) -> Order:
+        """Submit a multi-leg options package atomically.
+
+        Used for verticals (2 legs), iron condors (4 legs), strangles (2 legs).
+        The broker fills all legs together or none — that's the whole point
+        vs leg-by-leg execution.
+
+        Args:
+            underlying: ticker symbol (e.g. "F"); stored on the resulting Order.
+            legs: per-leg contract + action + ratio_qty.
+            quantity: package quantity (e.g. 3 means 3 verticals = 6 contracts
+                across 2 legs at ratio_qty=1 each).
+            limit_price: NET price for the package. Positive = credit (we
+                receive), negative = debit (we pay), None = market order.
+            client_order_id: caller-supplied idempotency key.
+            strategy_id: which strategy submitted this; written onto the Order.
+            account_id: account this order belongs to.
+
+        Returns an Order with order_type=MULTI_LEG_OPEN/MULTI_LEG_CLOSE
+        (inferred from the legs' actions) and the legs preserved in
+        raw_request/raw_response. The reconciler treats package fill as a
+        single state-change event.
+
+        Raises OrderRejected on broker validation failures.
+        Raises BrokerUnavailable on transport failures.
+        Raises NotImplementedError if the broker doesn't support multi-leg
+        (default Broker base class behavior — concrete adapters override).
+        """
+        raise NotImplementedError(
+            f"{self.name} broker does not support multi-leg orders"
+        )

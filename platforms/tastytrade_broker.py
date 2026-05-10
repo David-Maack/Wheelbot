@@ -35,6 +35,7 @@ from core.models import (
     OptionContract,
     OptionType,
     Order,
+    OrderLeg,
     OrderStatus,
     OrderType as WheelOrderType,
     Position,
@@ -348,6 +349,112 @@ class TastytradeBroker(Broker):
                 "raw_request": new_order.model_dump(mode="json"),
                 "raw_response": placed.model_dump(mode="json"),
             }
+        )
+
+    async def place_multi_leg_order(
+        self,
+        *,
+        underlying: str,
+        legs: list[OrderLeg],
+        quantity: int,
+        limit_price: float | None,
+        client_order_id: str | None = None,
+        strategy_id: str | None = None,
+        account_id: str = "primary",
+    ) -> Order:
+        """Submit a multi-leg package via Tastytrade NewOrder with multiple Legs.
+
+        NewOrder.price is always a positive Decimal; direction is conveyed by
+        `price_effect` (Credit when we receive net, Debit when we pay net).
+        Each leg's quantity = `ratio_qty * package quantity`.
+        """
+        from tastytrade.order import (
+            InstrumentType,
+            Leg,
+            NewOrder,
+            OrderTimeInForce,
+            PriceEffect,
+        )
+        from tastytrade.order import OrderType as TtOrderType
+        from tastytrade.utils import TastytradeError
+
+        if not legs:
+            raise OrderRejected("multi-leg order requires at least one leg")
+        if quantity <= 0:
+            raise OrderRejected(f"quantity must be positive, got {quantity}")
+
+        session, account = await self._ensure_session()
+
+        tt_legs = [
+            Leg(
+                instrument_type=InstrumentType.EQUITY_OPTION,
+                symbol=_occ_dense(leg.contract_symbol),
+                action=_wheel_action_to_tt(WheelOrderType(leg.action)),
+                quantity=Decimal(leg.ratio_qty * quantity),
+            )
+            for leg in legs
+        ]
+
+        if limit_price is None:
+            order_type = TtOrderType.MARKET
+            price_arg: Decimal | None = None
+            price_effect: Any | None = None
+        else:
+            order_type = TtOrderType.LIMIT
+            price_arg = Decimal(str(abs(limit_price)))
+            price_effect = PriceEffect.CREDIT if limit_price >= 0 else PriceEffect.DEBIT
+
+        new_order = NewOrder(
+            time_in_force=OrderTimeInForce.DAY,
+            order_type=order_type,
+            price=price_arg,
+            price_effect=price_effect,
+            legs=tt_legs,
+            external_identifier=client_order_id,
+        )
+
+        try:
+            placed = await account.place_order(session, new_order, dry_run=False)
+        except TastytradeError as exc:
+            raise OrderRejected(f"tastytrade rejected multi-leg order: {exc}") from exc
+        except Exception as exc:
+            raise BrokerUnavailable(
+                f"tastytrade place_order (mleg) failed: {exc}"
+            ) from exc
+
+        po = placed.order
+        all_close = all(
+            leg.action in (WheelOrderType.SELL_TO_CLOSE, WheelOrderType.BUY_TO_CLOSE)
+            for leg in legs
+        )
+        wheel_order_type = (
+            WheelOrderType.MULTI_LEG_CLOSE if all_close else WheelOrderType.MULTI_LEG_OPEN
+        )
+        return Order(
+            account_id=account_id,
+            symbol=underlying,
+            strategy_id=strategy_id,
+            broker_order_id=str(po.id),
+            client_order_id=client_order_id,
+            order_type=wheel_order_type,
+            contract_symbol=None,
+            strike=None,
+            expiration=None,
+            option_type=None,
+            quantity=quantity,
+            limit_price=limit_price,
+            fill_price=None,
+            status=_map_status(str(po.status)),
+            placed_at=_strip_tz(po.received_at) or _utcnow(),
+            filled_at=_strip_tz(po.terminal_at) if str(po.status) == "Filled" else None,
+            raw_request={
+                "underlying": underlying,
+                "legs": [leg.model_dump(mode="json") for leg in legs],
+                "quantity": quantity,
+                "limit_price": limit_price,
+                "tastytrade_request": new_order.model_dump(mode="json"),
+            },
+            raw_response=placed.model_dump(mode="json"),
         )
 
     async def cancel_order(self, broker_order_id: str) -> None:

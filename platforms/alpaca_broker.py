@@ -27,6 +27,7 @@ from core.models import (
     OptionContract,
     OptionType,
     Order,
+    OrderLeg,
     OrderStatus,
     OrderType as WheelOrderType,
     Position,
@@ -314,6 +315,106 @@ class AlpacaBroker(Broker):
             }
         )
 
+    async def place_multi_leg_order(
+        self,
+        *,
+        underlying: str,
+        legs: list[OrderLeg],
+        quantity: int,
+        limit_price: float | None,
+        client_order_id: str | None = None,
+        strategy_id: str | None = None,
+        account_id: str = "primary",
+    ) -> Order:
+        """Submit an atomic multi-leg options package via Alpaca MLEG.
+
+        Net package price semantics: Alpaca's `limit_price` for an MLEG order
+        is the NET debit paid (positive = debit, you pay; negative = credit,
+        you receive). Our convention is the opposite for clarity (positive =
+        credit), so we negate when sending to Alpaca.
+        """
+        from alpaca.common.exceptions import APIError
+        from alpaca.trading.enums import (
+            OrderClass,
+            OrderSide,
+            PositionIntent,
+            TimeInForce,
+        )
+        from alpaca.trading.requests import (
+            LimitOrderRequest,
+            MarketOrderRequest,
+            OptionLegRequest,
+        )
+
+        if not legs:
+            raise OrderRejected("multi-leg order requires at least one leg")
+        if quantity <= 0:
+            raise OrderRejected(f"quantity must be positive, got {quantity}")
+
+        alpaca_legs = [
+            OptionLegRequest(
+                symbol=leg.contract_symbol,
+                ratio_qty=leg.ratio_qty,
+                side=self._side(WheelOrderType(leg.action)),
+                position_intent=self._position_intent(WheelOrderType(leg.action)),
+            )
+            for leg in legs
+        ]
+
+        common: dict[str, Any] = {
+            "qty": quantity,
+            "order_class": OrderClass.MLEG,
+            "legs": alpaca_legs,
+            "time_in_force": TimeInForce.DAY,
+            "client_order_id": client_order_id,
+        }
+        if limit_price is not None:
+            req = LimitOrderRequest(limit_price=-limit_price, **common)
+        else:
+            req = MarketOrderRequest(**common)
+
+        try:
+            placed = await asyncio.to_thread(self._trading.submit_order, req)
+        except APIError as exc:
+            raise OrderRejected(f"alpaca rejected multi-leg order: {exc}") from exc
+        except Exception as exc:
+            raise BrokerUnavailable(f"alpaca submit_order (mleg) failed: {exc}") from exc
+
+        all_close = all(
+            leg.action in (WheelOrderType.SELL_TO_CLOSE, WheelOrderType.BUY_TO_CLOSE)
+            for leg in legs
+        )
+        order_type = (
+            WheelOrderType.MULTI_LEG_CLOSE if all_close else WheelOrderType.MULTI_LEG_OPEN
+        )
+
+        return Order(
+            account_id=account_id,
+            symbol=underlying,
+            strategy_id=strategy_id,
+            broker_order_id=str(placed.id),
+            client_order_id=client_order_id,
+            order_type=order_type,
+            contract_symbol=None,
+            strike=None,
+            expiration=None,
+            option_type=None,
+            quantity=quantity,
+            limit_price=limit_price,
+            fill_price=float(placed.filled_avg_price) if placed.filled_avg_price else None,
+            status=_map_status(placed.status),
+            placed_at=_strip_tz(placed.submitted_at) or _utcnow(),
+            filled_at=_strip_tz(placed.filled_at),
+            raw_request={
+                "underlying": underlying,
+                "legs": [leg.model_dump(mode="json") for leg in legs],
+                "quantity": quantity,
+                "limit_price": limit_price,
+                "alpaca_request": req.model_dump(mode="json"),
+            },
+            raw_response=placed.model_dump(mode="json"),
+        )
+
     async def cancel_order(self, broker_order_id: str) -> None:
         from alpaca.common.exceptions import APIError
 
@@ -347,6 +448,20 @@ class AlpacaBroker(Broker):
         if order_type in (WheelOrderType.SELL_TO_OPEN, WheelOrderType.SELL_TO_CLOSE):
             return OrderSide.SELL
         return OrderSide.BUY
+
+    @staticmethod
+    def _position_intent(order_type: WheelOrderType) -> Any:
+        from alpaca.trading.enums import PositionIntent
+
+        if order_type == WheelOrderType.SELL_TO_OPEN:
+            return PositionIntent.SELL_TO_OPEN
+        if order_type == WheelOrderType.SELL_TO_CLOSE:
+            return PositionIntent.SELL_TO_CLOSE
+        if order_type == WheelOrderType.BUY_TO_OPEN:
+            return PositionIntent.BUY_TO_OPEN
+        if order_type == WheelOrderType.BUY_TO_CLOSE:
+            return PositionIntent.BUY_TO_CLOSE
+        raise ValueError(f"position_intent: unsupported order_type {order_type}")
 
     def _to_order(self, raw: Any) -> Order:
         """Best-effort mapping; the local DB carries raw_response for the audit trail."""

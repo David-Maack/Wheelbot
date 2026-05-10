@@ -36,6 +36,11 @@ class OrderType(StrEnum):
     BUY_TO_CLOSE = "BUY_TO_CLOSE"
     BUY_TO_OPEN = "BUY_TO_OPEN"
     SELL_TO_CLOSE = "SELL_TO_CLOSE"
+    # Multi-leg packages — verticals, condors, strangles. The Order.quantity
+    # is the package quantity (e.g. 3 verticals); each leg has its own
+    # ratio_qty applied as a multiplier. Per-leg detail lives in raw_request.
+    MULTI_LEG_OPEN = "MULTI_LEG_OPEN"
+    MULTI_LEG_CLOSE = "MULTI_LEG_CLOSE"
 
 
 class OptionType(StrEnum):
@@ -229,6 +234,23 @@ class ChainSnapshot(_Base):
     decision_id: int | None = None
     cycle_id: int | None = None
     notes: str | None = None
+
+
+class OrderLeg(_Base):
+    """One leg of a multi-leg options order.
+
+    Used by Broker.place_multi_leg_order. The leg specifies which contract
+    to trade and which side; the parent order's `quantity` multiplies each
+    leg's `ratio_qty` to determine how many contracts of that leg to fill.
+    """
+
+    contract_symbol: str           # OCC option symbol (e.g. F250620P00010000)
+    underlying: str                # underlying ticker
+    option_type: OptionType
+    strike: float
+    expiration: date
+    action: OrderType              # SELL_TO_OPEN / BUY_TO_OPEN / SELL_TO_CLOSE / BUY_TO_CLOSE
+    ratio_qty: int = 1             # multiplier on the parent order's quantity
 
 
 class OptionContract(_Base):
