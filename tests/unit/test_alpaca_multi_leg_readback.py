@@ -154,3 +154,25 @@ def test_to_order_mleg_pending_no_fill_price(broker):
     assert order.status == OrderStatus.PENDING
     assert order.fill_price is None
     assert order.filled_at is None
+
+
+def test_is_leg_child_skips_orders_without_our_client_order_id(broker):
+    """Defensive filter in get_orders_since: legs (and manual broker orders)
+    are skipped because they don't carry our `wb-` client_order_id prefix."""
+    from platforms.alpaca_broker import _is_leg_child
+
+    # Our orders carry wb-... — keep them.
+    ours = SimpleNamespace(client_order_id="wb-abc123", order_class="simple")
+    assert _is_leg_child(ours) is False
+
+    # MLEG parent we placed — keep it.
+    parent = SimpleNamespace(client_order_id="wb-deadbeef", order_class="mleg")
+    assert _is_leg_child(parent) is False
+
+    # Leg child — no client_order_id we recognize.
+    leg = SimpleNamespace(client_order_id=None, order_class="simple")
+    assert _is_leg_child(leg) is True
+
+    # Manual order placed by a human at Alpaca UI — skip (not ours).
+    manual = SimpleNamespace(client_order_id="some-other-id", order_class="simple")
+    assert _is_leg_child(manual) is True

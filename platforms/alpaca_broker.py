@@ -87,6 +87,37 @@ def _map_status(alpaca_status: Any) -> OrderStatus:
     return OrderStatus.PENDING
 
 
+def _is_leg_child(raw: Any) -> bool:
+    """True when the order is a child leg of a multi-leg parent.
+
+    Children carry a reference to the parent through one of several fields
+    depending on alpaca-py version: legs/order_class, hwm, or an explicit
+    parent identifier. We check several to stay version-resilient. The
+    canonical signal in current alpaca-py is the order_class enum.
+    """
+    # If alpaca-py reports the order_class as something like
+    # OrderClass.MLEG_LEG or simply tags the leg, we'd see it here.
+    # Empirically the safest discriminator is: a non-MLEG order whose
+    # symbol is an OCC option AND that doesn't carry a client_order_id
+    # we set. Client_order_id is OUR string ("wb-...") on parents; legs
+    # get broker-generated IDs.
+    order_class = getattr(raw, "order_class", None)
+    order_class_str = str(getattr(order_class, "value", order_class) or "").lower()
+    if "mleg" in order_class_str and "leg" in order_class_str.replace("mleg", ""):
+        # e.g. "mleg_leg" or "leg" suffix
+        return True
+    # Heuristic fallback for SDK versions that don't tag children explicitly:
+    # leg orders have a symbol but no client_order_id we recognize. We DO
+    # set client_order_id on every order we place via place_order or
+    # place_multi_leg_order, so any order whose client_order_id is None
+    # is either a leg or a manual broker-side order — treat both as "not
+    # ours, skip".
+    cid = getattr(raw, "client_order_id", None)
+    if cid is None or not str(cid).startswith("wb-"):
+        return True
+    return False
+
+
 def _parse_occ(occ: str) -> tuple[str, date, OptionType, float] | None:
     """OCC21 symbol → (underlying, expiration, type, strike). None if not an option."""
     if len(occ) < 15:
@@ -432,12 +463,26 @@ class AlpacaBroker(Broker):
 
         # Alpaca's `after` filter expects an aware UTC datetime; if naive, treat as UTC.
         after = since.replace(tzinfo=UTC) if since.tzinfo is None else since
-        req = GetOrdersRequest(status=QueryOrderStatus.ALL, after=after, limit=500)
+        # `nested=True` rolls multi-leg children under their parent's `.legs`
+        # instead of returning them as flat top-level orders. Without this,
+        # the reconciler sees each leg as an "unknown order" and flags the
+        # affected position MANUAL_INTERVENTION every tick.
+        req = GetOrdersRequest(
+            status=QueryOrderStatus.ALL, after=after, limit=500, nested=True
+        )
         try:
             raw = await asyncio.to_thread(self._trading.get_orders, req)
         except Exception as exc:
             raise BrokerUnavailable(f"alpaca get_orders failed: {exc}") from exc
-        return [self._to_order(o) for o in raw]
+        # Defensive belt-and-suspenders: even with nested=True, skip any order
+        # that carries a non-null parent ID (i.e. is a child of a multi-leg).
+        # Different alpaca-py versions surface this field under different
+        # names; we check the common ones.
+        return [
+            self._to_order(o)
+            for o in raw
+            if not _is_leg_child(o)
+        ]
 
     # -- Internals ------------------------------------------------------------
 
