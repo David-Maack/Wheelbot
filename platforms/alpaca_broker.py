@@ -463,12 +463,85 @@ class AlpacaBroker(Broker):
             return PositionIntent.BUY_TO_CLOSE
         raise ValueError(f"position_intent: unsupported order_type {order_type}")
 
+    def _to_order_multi_leg(self, raw: Any, legs: list[Any]) -> Order:
+        """Map an Alpaca MLEG parent order back into our single Order row.
+
+        Convention matches `place_multi_leg_order`: order_type is inferred
+        from leg position_intents (all CLOSE → MULTI_LEG_CLOSE; any OPEN →
+        MULTI_LEG_OPEN), underlying is parsed from the first leg's OCC
+        symbol. fill_price is the parent's filled_avg_price which Alpaca
+        reports as the *signed* net price per package — positive = credit
+        we received, negative = debit we paid. (Alpaca's display sign for
+        MLEG is the inverse of our submit-time convention, which we already
+        negated in place_multi_leg_order.)
+        """
+        first_leg_symbol = getattr(legs[0], "symbol", None) or ""
+        parsed_first = _parse_occ(first_leg_symbol)
+        underlying = parsed_first[0] if parsed_first else first_leg_symbol
+
+        # Infer OPEN vs CLOSE from leg position_intents. Alpaca's
+        # PositionIntent.value is a kebab-style string like "sell_to_close".
+        all_close = True
+        for leg in legs:
+            intent = str(getattr(leg, "position_intent", "") or "").lower()
+            if "close" not in intent:
+                all_close = False
+                break
+        order_type = (
+            WheelOrderType.MULTI_LEG_CLOSE if all_close else WheelOrderType.MULTI_LEG_OPEN
+        )
+
+        # Alpaca's filled_avg_price for an MLEG package is the net debit
+        # paid (positive). Our convention is positive=credit; flip the sign
+        # on the way back in so the cycle PnL math (which adds fill_price
+        # × qty × 100) gives the right number.
+        raw_fill = (
+            float(raw.filled_avg_price) if raw.filled_avg_price is not None else None
+        )
+        fill_price = -raw_fill if raw_fill is not None else None
+        raw_limit = (
+            float(raw.limit_price) if raw.limit_price is not None else None
+        )
+        limit_price = -raw_limit if raw_limit is not None else None
+
+        return Order(
+            account_id=self._account_id,
+            symbol=underlying,
+            broker_order_id=str(raw.id),
+            client_order_id=raw.client_order_id,
+            order_type=order_type,
+            contract_symbol=None,
+            strike=None,
+            expiration=None,
+            option_type=None,
+            quantity=int(float(raw.qty or 0)),
+            limit_price=limit_price,
+            fill_price=fill_price,
+            status=_map_status(raw.status),
+            placed_at=_strip_tz(raw.submitted_at) or _utcnow(),
+            filled_at=_strip_tz(raw.filled_at),
+            raw_request=None,
+            raw_response=raw.model_dump(mode="json") if hasattr(raw, "model_dump") else None,
+        )
+
     def _to_order(self, raw: Any) -> Order:
-        """Best-effort mapping; the local DB carries raw_response for the audit trail."""
-        from alpaca.trading.enums import AssetClass
+        """Best-effort mapping; the local DB carries raw_response for the audit trail.
+
+        Multi-leg packages (OrderClass.MLEG) come back from Alpaca with
+        `symbol=None` on the parent order — the symbols live on `raw.legs`.
+        We detect that case and synthesize a single Order row tagged with the
+        underlying from the first leg, matching how place_multi_leg_order
+        writes them on the way out.
+        """
+        from alpaca.trading.enums import AssetClass, OrderClass
+
+        order_class = getattr(raw, "order_class", None)
+        legs = getattr(raw, "legs", None) or []
+        if order_class == OrderClass.MLEG and legs:
+            return self._to_order_multi_leg(raw, legs)
 
         is_option = getattr(raw, "asset_class", None) == AssetClass.US_OPTION
-        parsed = _parse_occ(raw.symbol) if is_option else None
+        parsed = _parse_occ(raw.symbol) if is_option and raw.symbol else None
         side_str = str(raw.side).split(".")[-1].lower() if raw.side else ""
         # We can't always recover SELL_TO_OPEN vs SELL_TO_CLOSE from Alpaca's payload
         # alone — position_intent helps when set; otherwise the reconciler infers from
