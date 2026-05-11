@@ -163,12 +163,18 @@ strategies:
   - id: put_spread
     display_name: "Bull Put Spread"
     type: vertical_spread
-    enabled: false   # Comes online in sub-sprint 3 (multi-leg orders)
+    enabled: true
     max_concurrent: 4
     params:
       dte_min: 30
       dte_max: 45
       short_delta_min: 0.20
       short_delta_max: 0.30
-      spread_width_dollars: 1.0   # short - long strike difference
+      # $5 width sized for the mega-cap universe ($150–$700 underlyings).
+      # A $1 width yields near-zero credit at 25Δ on these strikes.
+      spread_width_dollars: 5.0
+      # Cap per-package max-loss exposure so quantity stays small while we
+      # learn how the strategy behaves on this universe.
+      max_capital_per_spread_usd: 500
       profit_close_pct: 50
+      time_close_dte: 7
