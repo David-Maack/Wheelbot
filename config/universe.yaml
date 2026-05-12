@@ -92,23 +92,11 @@ tickers:
     overrides:
       max_position_pct_of_account: 20
 
-  - symbol: AMD
-    name: "Advanced Micro Devices"
-    tier: 1
-    strategies: [weekly_wheel]
-    notes: "Mega-cap semis, very liquid weeklies."
-
   - symbol: MARA
     name: "Marathon Digital"
     tier: 2
     strategies: [weekly_wheel]
     notes: "BTC-correlated, high IV."
-
-  - symbol: COIN
-    name: "Coinbase Global"
-    tier: 2
-    strategies: [weekly_wheel]
-    notes: "Crypto-correlated, weeklies trade tight."
 
   - symbol: AAL
     name: "American Airlines"
@@ -163,6 +151,18 @@ tickers:
     tier: 1
     strategies: [put_spread]
     notes: "Tech-heavy ETF with deep options chain."
+
+  - symbol: AMD
+    name: "Advanced Micro Devices"
+    tier: 1
+    strategies: [put_spread]
+    notes: "Mega-cap semi (~$400). Too rich for CSP cash; defined-risk spread works."
+
+  - symbol: COIN
+    name: "Coinbase Global"
+    tier: 2
+    strategies: [put_spread]
+    notes: "~$300 crypto-correlated. Too rich for weekly CSP; spreads cap exposure."
 
 # Banned list — explicitly never trade these even if screener suggests
 banned:
