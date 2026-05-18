@@ -164,6 +164,60 @@ tickers:
     strategies: [put_spread]
     notes: "~$300 crypto-correlated. Too rich for weekly CSP; spreads cap exposure."
 
+  # ============================================================
+  # bear_call_spread — 30-45 DTE bear call credit spreads, defined risk
+  # Selected for non-ripping tape + liquid option chains.
+  # Disjoint from put_spread universe so strategies don't double up
+  # on the same ticker (would create accidental short strangle exposure).
+  # ============================================================
+  - symbol: IWM
+    name: "iShares Russell 2000 ETF"
+    tier: 1
+    strategies: [bear_call_spread]
+    notes: "Small caps — chronically weaker than SPY, ETF diversification."
+
+  - symbol: DIA
+    name: "SPDR Dow Jones Industrial Average ETF"
+    tier: 1
+    strategies: [bear_call_spread]
+    notes: "DJIA ETF; slower mover than QQQ. Defined-risk friendly."
+
+  - symbol: BA
+    name: "Boeing"
+    tier: 1
+    strategies: [bear_call_spread]
+    notes: "Mega-cap with persistent weakness; liquid weeklies + earnings IV."
+
+  - symbol: DIS
+    name: "Walt Disney"
+    tier: 1
+    strategies: [bear_call_spread]
+    notes: "Sideways tape for years; mega-cap, liquid options."
+
+  - symbol: MU
+    name: "Micron Technology"
+    tier: 1
+    strategies: [bear_call_spread]
+    notes: "Semi cycle, IV-rich; not in put_spread universe."
+
+  - symbol: NFLX
+    name: "Netflix"
+    tier: 1
+    strategies: [bear_call_spread]
+    notes: "High IV mega-cap; deep options chain."
+
+  - symbol: XLE
+    name: "Energy Select Sector SPDR ETF"
+    tier: 1
+    strategies: [bear_call_spread]
+    notes: "Energy ETF — separate macro factor from tech/financials."
+
+  - symbol: WBA
+    name: "Walgreens Boots Alliance"
+    tier: 2
+    strategies: [bear_call_spread]
+    notes: "Retail/pharma weakness, liquid weeklies. Tier 2 = LLM screener required."
+
 # Banned list — explicitly never trade these even if screener suggests
 banned:
   - GME

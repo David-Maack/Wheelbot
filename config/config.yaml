@@ -166,6 +166,7 @@ strategies:
     enabled: true
     max_concurrent: 4
     params:
+      direction: bull_put
       dte_min: 30
       dte_max: 45
       short_delta_min: 0.20
@@ -175,6 +176,25 @@ strategies:
       spread_width_dollars: 5.0
       # Cap per-package max-loss exposure so quantity stays small while we
       # learn how the strategy behaves on this universe.
+      max_capital_per_spread_usd: 500
+      profit_close_pct: 50
+      time_close_dte: 7
+
+  - id: bear_call_spread
+    display_name: "Bear Call Spread"
+    type: vertical_spread
+    # Ships disabled. Flip via a separate commit once smoke-tested live
+    # (same cadence we used for put_spread in Sprint 9).
+    enabled: false
+    max_concurrent: 4
+    params:
+      direction: bear_call
+      dte_min: 30
+      dte_max: 45
+      short_delta_min: 0.20
+      short_delta_max: 0.30
+      # $5 width — same sizing as put_spread for cross-strategy comparability.
+      spread_width_dollars: 5.0
       max_capital_per_spread_usd: 500
       profit_close_pct: 50
       time_close_dte: 7
