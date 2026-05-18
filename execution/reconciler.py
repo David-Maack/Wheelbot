@@ -58,6 +58,7 @@ def _utcnow() -> datetime:
 @dataclass(slots=True)
 class ReconcileSummary:
     fills_processed: int = 0
+    cancellations_processed: int = 0
     expirations_processed: int = 0
     assignments_processed: int = 0
     called_aways_processed: int = 0
@@ -215,11 +216,16 @@ class Reconciler:
             if updates:
                 await self._repos.orders.update(local.id, **updates)
 
-            # Handle the fill transition.
+            # Handle terminal status transitions.
             local_was_pending = local.status in (OrderStatus.PENDING, OrderStatus.PARTIAL)
             now_filled = broker_view.status == OrderStatus.FILLED
+            now_cancelled = broker_view.status in (
+                OrderStatus.CANCELLED, OrderStatus.REJECTED,
+            )
             if local_was_pending and now_filled:
                 await self._on_fill(local, broker_view, summary)
+            elif local_was_pending and now_cancelled:
+                await self._on_cancel(local, broker_view, summary)
 
     async def _on_fill(
         self,
@@ -303,6 +309,67 @@ class Reconciler:
                     CycleOutcome.CSP_CLOSED_PROFIT,
                     summary,
                 )
+
+    async def _on_cancel(
+        self,
+        local: Order,
+        broker_view: Order,
+        summary: ReconcileSummary,
+    ) -> None:
+        """Restore position state when an order terminates without filling.
+
+        Scope: multi-leg orders only. Single-leg wheel cancellations are not
+        yet handled — the same gap likely exists but isn't actively hurting
+        production today.
+
+        Defensive: only restores state if the position is currently at
+        SPREAD_PENDING. Positions in MANUAL_INTERVENTION, BROKER_DOWN, or
+        any other state are left alone — the cancellation is just one of
+        several things that could have happened to that position, and the
+        reconciler must not clobber a flag set by another rule.
+        """
+        if local.order_type not in (
+            OrderType.MULTI_LEG_OPEN, OrderType.MULTI_LEG_CLOSE,
+        ):
+            return
+
+        symbol = local.symbol
+        position = await self._repos.positions.get_by_symbol(
+            self._account_id, symbol, strategy_id=local.strategy_id
+        )
+        if position is None or position.state != PositionState.SPREAD_PENDING:
+            return
+
+        if local.order_type == OrderType.MULTI_LEG_OPEN:
+            # No fill, no cycle was opened — drop straight back to IDLE.
+            await self._set_position_state(
+                position,
+                symbol,
+                PositionState.IDLE,
+                f"cancel_open:{local.client_order_id}",
+                cycle_id=None,
+                strategy_id=local.strategy_id,
+            )
+        else:  # MULTI_LEG_CLOSE
+            # We still hold the legs from the original OPEN fill. Restore the
+            # active state so the close orchestrator can try again next tick.
+            await self._set_position_state(
+                position,
+                symbol,
+                PositionState.SPREAD_OPEN,
+                f"cancel_close:{local.client_order_id}",
+                cycle_id=position.current_cycle_id,
+                strategy_id=local.strategy_id,
+            )
+        summary.cancellations_processed += 1
+        log_checkpoint(
+            "reconciler_on_cancel",
+            status="ok",
+            symbol=symbol,
+            strategy=local.strategy_id,
+            order_type=local.order_type.value if hasattr(local.order_type, "value") else str(local.order_type),
+            broker_status=broker_view.status.value if hasattr(broker_view.status, "value") else str(broker_view.status),
+        )
 
     async def _open_cycle_if_csp(
         self,

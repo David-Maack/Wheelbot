@@ -228,6 +228,134 @@ async def test_reconciler_multi_leg_close_fill_closes_cycle(db_repos):
     assert cycle.final_pnl == pytest.approx(20.0)
 
 
+# -- reconciler: order cancellation restores position state ----------------
+
+
+@pytest.mark.asyncio
+async def test_reconciler_cancelled_open_drops_position_back_to_idle(db_repos):
+    """MULTI_LEG_OPEN cancelled at broker → SPREAD_PENDING must return to IDLE.
+
+    Regression for the live-bot GOOGL situation: open attempt cancelled,
+    position was stuck SPREAD_PENDING indefinitely, blocking new entries.
+    """
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    result = await router.place_multi_leg(
+        _spread_proposal(qty=1), sleep=_noop_sleep, today=date(2025, 6, 1),
+    )
+    assert result.placed is not None
+    # Cancel at the broker without filling.
+    await broker.cancel_order(result.placed.broker_order_id)
+
+    reconciler = Reconciler(broker, db_repos, _config())
+    summary = await reconciler.reconcile_once()
+    assert summary.cancellations_processed == 1
+    assert summary.fills_processed == 0
+
+    pos = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="put_spread"
+    )
+    assert pos is not None
+    assert pos.state == PositionState.IDLE
+    assert pos.current_cycle_id is None
+
+
+@pytest.mark.asyncio
+async def test_reconciler_cancelled_close_restores_spread_open(db_repos):
+    """MULTI_LEG_CLOSE cancelled at broker → return to SPREAD_OPEN (still hold legs).
+
+    Regression for the live-bot NVDA situation: close attempt cancelled,
+    position stuck SPREAD_PENDING blocked the close orchestrator from
+    retrying — bot couldn't manage the spread for 4 days.
+    """
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+
+    # 1. Open + fill.
+    open_result = await router.place_multi_leg(
+        _spread_proposal(qty=1), sleep=_noop_sleep, today=date(2025, 6, 1),
+    )
+    await broker.fill_multi_leg(open_result.placed.broker_order_id, fill_price=0.30)
+    reconciler = Reconciler(broker, db_repos, _config())
+    await reconciler.reconcile_once()
+
+    pos_before = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="put_spread"
+    )
+    assert pos_before.state == PositionState.SPREAD_OPEN
+    cycle_id_before = pos_before.current_cycle_id
+    assert cycle_id_before is not None
+
+    # 2. Place a close that won't fill, then cancel it.
+    close_legs = [
+        OrderLeg(
+            contract_symbol=leg.contract_symbol,
+            underlying=leg.underlying,
+            option_type=leg.option_type,
+            strike=leg.strike,
+            expiration=leg.expiration,
+            action=(
+                OrderType.BUY_TO_CLOSE
+                if leg.action == OrderType.SELL_TO_OPEN
+                else OrderType.SELL_TO_CLOSE
+            ),
+        )
+        for leg in _spread_legs()
+    ]
+    close_proposal = MultiLegProposal(
+        symbol="F",
+        legs=close_legs,
+        net_credit_per_spread=-0.10,
+        max_loss_per_spread=0.0,
+        width_dollars=0.0,
+        quantity=1,
+        rationale="close test",
+        strategy_id="put_spread",
+        order_type=OrderType.MULTI_LEG_CLOSE,
+    )
+    close_result = await router.place_multi_leg(
+        close_proposal, sleep=_noop_sleep, today=date(2025, 6, 5),
+    )
+    assert close_result.placed is not None
+    await broker.cancel_order(close_result.placed.broker_order_id)
+
+    # 3. Reconcile → SPREAD_PENDING should restore to SPREAD_OPEN, cycle intact.
+    summary = await reconciler.reconcile_once()
+    assert summary.cancellations_processed == 1
+    pos_after = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="put_spread"
+    )
+    assert pos_after.state == PositionState.SPREAD_OPEN
+    assert pos_after.current_cycle_id == cycle_id_before  # cycle preserved
+
+
+@pytest.mark.asyncio
+async def test_reconciler_cancel_skips_when_position_not_in_spread_pending(db_repos):
+    """If the position has been moved to MANUAL_INTERVENTION or any other
+    state by another rule, a stale cancellation must not clobber it."""
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    result = await router.place_multi_leg(
+        _spread_proposal(qty=1), sleep=_noop_sleep, today=date(2025, 6, 1),
+    )
+    # Manually move the position out of SPREAD_PENDING before reconcile.
+    conn = await db_repos.db.connect()
+    await conn.execute(
+        "UPDATE positions SET state = 'MANUAL_INTERVENTION' WHERE symbol = 'F'"
+    )
+    await conn.commit()
+
+    await broker.cancel_order(result.placed.broker_order_id)
+    reconciler = Reconciler(broker, db_repos, _config())
+    summary = await reconciler.reconcile_once()
+    assert summary.cancellations_processed == 0  # guard fired
+
+    pos = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="put_spread"
+    )
+    assert pos.state == PositionState.MANUAL_INTERVENTION  # untouched
+
+
 # -- reconciler: spread expiration (broker shows nothing) ------------------
 
 
