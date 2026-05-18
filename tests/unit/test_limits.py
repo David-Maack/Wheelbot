@@ -231,3 +231,161 @@ async def test_happy_path_all_pass_or_skip(db_repos, monkeypatch):
     gate = RiskGate(broker, db_repos, _config(), _universe())
     res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
     assert res.passed
+
+
+# -- Regime-gate dispatch on multi-leg direction ----------------------------
+
+
+def _multi_leg_proposal(*, direction: str, order_type: OrderType = OrderType.MULTI_LEG_OPEN):
+    """Minimal MultiLegProposal for regime-gate dispatch tests."""
+    from core.models import OrderLeg
+    from strategies.spreads import MultiLegProposal
+
+    today = date(2025, 6, 1)
+    if direction == "bear_call":
+        legs = [
+            OrderLeg(
+                contract_symbol="F250706C00010000",
+                underlying="F",
+                option_type=OptionType.CALL,
+                strike=10.0,
+                expiration=today + timedelta(days=35),
+                action=OrderType.SELL_TO_OPEN
+                if order_type == OrderType.MULTI_LEG_OPEN
+                else OrderType.BUY_TO_CLOSE,
+            ),
+            OrderLeg(
+                contract_symbol="F250706C00011000",
+                underlying="F",
+                option_type=OptionType.CALL,
+                strike=11.0,
+                expiration=today + timedelta(days=35),
+                action=OrderType.BUY_TO_OPEN
+                if order_type == OrderType.MULTI_LEG_OPEN
+                else OrderType.SELL_TO_CLOSE,
+            ),
+        ]
+    else:
+        legs = [
+            OrderLeg(
+                contract_symbol="F250706P00010000",
+                underlying="F",
+                option_type=OptionType.PUT,
+                strike=10.0,
+                expiration=today + timedelta(days=35),
+                action=OrderType.SELL_TO_OPEN
+                if order_type == OrderType.MULTI_LEG_OPEN
+                else OrderType.BUY_TO_CLOSE,
+            ),
+            OrderLeg(
+                contract_symbol="F250706P00009000",
+                underlying="F",
+                option_type=OptionType.PUT,
+                strike=9.0,
+                expiration=today + timedelta(days=35),
+                action=OrderType.BUY_TO_OPEN
+                if order_type == OrderType.MULTI_LEG_OPEN
+                else OrderType.SELL_TO_CLOSE,
+            ),
+        ]
+    return MultiLegProposal(
+        symbol="F",
+        legs=legs,
+        net_credit_per_spread=0.30,
+        max_loss_per_spread=70.0,
+        width_dollars=1.0,
+        quantity=1,
+        rationale="test",
+        strategy_id="put_spread" if direction == "bull_put" else "bear_call_spread",
+        order_type=order_type,
+        direction=direction,
+    )
+
+
+async def _seed_regime(db_repos, **flags: int) -> None:
+    cols = ", ".join(["snapshot_date", *flags.keys()])
+    placeholders = ", ".join(["?"] * (1 + len(flags)))
+    conn = await db_repos.db.connect()
+    await conn.execute(
+        f"INSERT INTO regime_snapshots ({cols}) VALUES ({placeholders})",
+        ("2025-06-01", *flags.values()),
+    )
+    await conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_regime_gate_uses_bear_calls_allowed_for_bear_call_proposal(
+    db_repos, monkeypatch
+):
+    """bear_call OPEN with bear_calls_allowed=0 fails the regime gate."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=0)
+
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(
+        _multi_leg_proposal(direction="bear_call"),
+        today=date(2025, 6, 1),
+        raise_on_fail=False,
+    )
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["regime"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_regime_gate_uses_csps_allowed_for_bull_put_proposal(
+    db_repos, monkeypatch
+):
+    """bull_put OPEN with csps_allowed=0 fails — bear_calls_allowed=1 must not unblock it."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_regime(db_repos, csps_allowed=0, bear_calls_allowed=1)
+
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(
+        _multi_leg_proposal(direction="bull_put"),
+        today=date(2025, 6, 1),
+        raise_on_fail=False,
+    )
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["regime"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_regime_gate_passes_bear_call_when_bear_calls_allowed(
+    db_repos, monkeypatch
+):
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_regime(db_repos, csps_allowed=0, bear_calls_allowed=1)
+
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(
+        _multi_leg_proposal(direction="bear_call"),
+        today=date(2025, 6, 1),
+        raise_on_fail=False,
+    )
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["regime"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_regime_gate_skips_close_proposals(db_repos, monkeypatch):
+    """Closes always bypass the regime gate so we never get stuck holding a position."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_regime(db_repos, csps_allowed=0, bear_calls_allowed=0)
+
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    for direction in ("bull_put", "bear_call"):
+        res = await gate.evaluate(
+            _multi_leg_proposal(direction=direction, order_type=OrderType.MULTI_LEG_CLOSE),
+            today=date(2025, 6, 1),
+            raise_on_fail=False,
+        )
+        statuses = {r.rule: r.status for r in res.results}
+        assert statuses["regime"] == "skip", f"close for {direction} should bypass regime"

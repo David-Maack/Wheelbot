@@ -1,11 +1,18 @@
-"""Vertical credit-spread orchestrator (sub-sprint 3).
+"""Vertical credit-spread orchestrator.
 
 Mirrors strategies/wheel.py shape but produces MultiLegProposal — a defined-
 risk package the router submits via broker.place_multi_leg_order.
 
-Currently implemented: bull put credit spread (short higher-strike put +
-long lower-strike put). Iron condors / call spreads slot into the same
-shape later.
+Two directions supported:
+  - `bull_put` (sprint 9): short higher-strike put + long lower-strike put.
+    Profits when underlying stays flat or rises. Regime gate: csps_allowed.
+  - `bear_call` (sprint 10): short lower-strike call + long higher-strike call.
+    Profits when underlying stays flat or falls. Regime gate: bear_calls_allowed.
+
+Direction is read from `strategy.params["direction"]` (default `bull_put`
+for backwards compatibility with the existing put_spread config). Both
+share the close orchestrator, sizing logic, and reconciliation path —
+they only differ in selector and risk-gate flag.
 
 Out of scope here (lives in risk/limits.py and execution/router.py):
   - Buying-power floor, concurrent-cap, earnings blackout
@@ -21,10 +28,22 @@ from typing import Any
 
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
-from core.models import ChainSnapshot, OptionContract, OrderLeg, OrderType, PositionState
+from core.models import (
+    ChainSnapshot,
+    OptionContract,
+    OptionType,
+    OrderLeg,
+    OrderType,
+    PositionState,
+)
 from core.strategies import StrategyDefinition
 from db.repo import Repos
+from strategies.call_spread_selector import select_bear_call_spread
 from strategies.spread_selector import SpreadCandidate, select_bull_put_spread
+
+# Direction labels — match the values used in config.yaml strategy.params.direction.
+DIRECTION_BULL_PUT = "bull_put"
+DIRECTION_BEAR_CALL = "bear_call"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +59,7 @@ class MultiLegProposal:
     legs: list[OrderLeg]
     net_credit_per_spread: float    # NET credit per single package, in dollars per share
     max_loss_per_spread: float      # defined max loss per single package, dollars total
-    width_dollars: float            # short - long strike, in dollars
+    width_dollars: float            # |short - long| strike, in dollars (always positive)
     quantity: int
     rationale: str
     strategy_id: str = "put_spread"
@@ -48,6 +67,9 @@ class MultiLegProposal:
     order_type: OrderType = OrderType.MULTI_LEG_OPEN
     requires_screen: bool = False   # tier 2
     requires_human: bool = False    # tier 3
+    # Spread direction — drives regime-gate flag selection in risk/limits.py.
+    # Defaults to bull_put for backwards-compat with existing put_spread proposals.
+    direction: str = DIRECTION_BULL_PUT
 
 
 def _tier_flags(symbol: str, universe: dict[str, Any]) -> tuple[bool, bool]:
@@ -92,7 +114,11 @@ def _make_chain_recorder(
 
 
 def _build_legs(candidate: SpreadCandidate) -> list[OrderLeg]:
-    """Short the higher strike, long the lower strike (bull put credit spread)."""
+    """Short leg sells to open, long leg buys to open.
+
+    Direction-agnostic: the selector enforces strike relationships
+    (puts: short > long; calls: short < long).
+    """
     return [
         OrderLeg(
             contract_symbol=candidate.short.occ_symbol,
@@ -169,9 +195,24 @@ async def propose_for_symbol(
         strategy_id=strategy_id,
     )
 
-    candidate = await select_bull_put_spread(
-        broker, symbol, strategy.params, today=today, record_chain=record
-    )
+    direction = str(strategy.params.get("direction", DIRECTION_BULL_PUT))
+    if direction == DIRECTION_BEAR_CALL:
+        candidate = await select_bear_call_spread(
+            broker, symbol, strategy.params, today=today, record_chain=record
+        )
+    elif direction == DIRECTION_BULL_PUT:
+        candidate = await select_bull_put_spread(
+            broker, symbol, strategy.params, today=today, record_chain=record
+        )
+    else:
+        log_checkpoint(
+            "spread_unknown_direction",
+            status="fail",
+            symbol=symbol,
+            strategy=strategy_id,
+            direction=direction,
+        )
+        return None
     if candidate is None:
         return None
 
@@ -179,7 +220,7 @@ async def propose_for_symbol(
     legs = _build_legs(candidate)
     needs_screen, needs_human = _tier_flags(symbol, universe)
     rationale = (
-        f"put_spread[{strategy_id}] short={candidate.short.strike} "
+        f"{direction}[{strategy_id}] short={candidate.short.strike} "
         f"long={candidate.long.strike} width={candidate.width_dollars:.2f} "
         f"credit={candidate.net_credit_per_spread:.2f} "
         f"max_loss={candidate.max_loss_per_spread:.2f} qty={quantity}"
@@ -195,6 +236,7 @@ async def propose_for_symbol(
         strategy_id=strategy_id,
         requires_screen=needs_screen,
         requires_human=needs_human,
+        direction=direction,
     )
 
 
@@ -305,9 +347,12 @@ async def propose_close_for_symbol(
     if not legs_raw:
         return None
 
-    # Reconstruct OrderLegs in CLOSE direction.
+    # Reconstruct OrderLegs in CLOSE direction. Infer spread direction from
+    # the option_type on any leg (puts → bull_put, calls → bear_call) so the
+    # risk gate picks the right regime flag.
     close_legs: list[OrderLeg] = []
     short_leg: OrderLeg | None = None
+    direction = DIRECTION_BULL_PUT
     for leg in legs_raw:
         # Each leg dict mirrors OrderLeg.model_dump(mode="json").
         ol = OrderLeg(
@@ -322,6 +367,8 @@ async def propose_close_for_symbol(
         close_legs.append(ol)
         if str(leg["action"]) == OrderType.SELL_TO_OPEN.value:
             short_leg = ol  # remember for DTE check
+        if str(leg["option_type"]) == OptionType.CALL.value:
+            direction = DIRECTION_BEAR_CALL
 
     # Re-quote each leg to compute current debit to close.
     leg_mids: list[tuple[OrderLeg, float | None]] = []
@@ -377,7 +424,7 @@ async def propose_close_for_symbol(
     if time_trigger:
         rationale_parts.append(f"time_close dte={short_dte} ≤ {time_close_dte}")
     rationale = (
-        f"put_spread_close[{strategy.id}] " + "; ".join(rationale_parts)
+        f"{direction}_close[{strategy.id}] " + "; ".join(rationale_parts)
     )
 
     return MultiLegProposal(
@@ -390,6 +437,7 @@ async def propose_close_for_symbol(
         rationale=rationale,
         strategy_id=strategy.id,
         order_type=OrderType.MULTI_LEG_CLOSE,
+        direction=direction,
     )
 
 

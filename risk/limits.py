@@ -14,9 +14,12 @@ Rules implemented (1-7 of §8):
                               even though cc_selector enforces it: belt + suspenders.
 6. Liquidity gates         — re-check OI/volume/spread at submit time (chain may
                               have moved between selection and submission).
-7. Regime gate             — if regime.enabled and last regime row has
-                              csps_allowed=False, refuse new CSPs. Fail-open
-                              when no row exists yet (Sprint 7 populates the table).
+7. Regime gate             — if regime.enabled, refuse new entries when the
+                              direction-appropriate flag is false:
+                                CSPs / bull put spreads → csps_allowed
+                                bear call spreads        → bear_calls_allowed
+                              Closes (MULTI_LEG_CLOSE) bypass this rule.
+                              Fail-open when no row exists yet.
 
 Rules 8-10 (kill switch / consecutive losses / stop file) live in
 `execution/kill_switch.py` — they halt the *runner*, not individual orders.
@@ -279,21 +282,40 @@ class RiskGate:
         proposal: MultiLegProposal,
         params: dict[str, Any],
     ) -> None:
-        """Bull put credit spreads sell premium with bullish bias — same gate as CSPs."""
+        """Dispatch the regime gate by spread direction.
+
+        - bull_put: gated by csps_allowed (same gate as CSPs — bullish premium).
+        - bear_call: gated by bear_calls_allowed (bearish premium, opposite gate).
+
+        Closes always pass — reducing exposure should not be blocked by an
+        unfavorable regime, only opens.
+        """
+        if proposal.order_type == OrderType.MULTI_LEG_CLOSE:
+            result.add("regime", "skip", "closes bypass the regime gate")
+            return
         if not self._config.get("regime", {}).get("enabled", False):
             result.add("regime", "skip", "regime gating disabled in config")
             return
+
+        # Which column to read depends on direction.
+        if proposal.direction == "bear_call":
+            flag_column = "bear_calls_allowed"
+            fail_detail = "current regime snapshot disallows new bearish-premium trades"
+        else:
+            flag_column = "csps_allowed"
+            fail_detail = "current regime snapshot disallows new bullish-premium trades"
+
         c = await self._repos.db.connect()
         async with c.execute(
-            "SELECT csps_allowed FROM regime_snapshots ORDER BY snapshot_date DESC LIMIT 1"
+            f"SELECT {flag_column} FROM regime_snapshots ORDER BY snapshot_date DESC LIMIT 1"
         ) as cur:
             row = await cur.fetchone()
         if row is None:
             result.add("regime", "skip", "no regime snapshots yet")
             return
-        csps_allowed = bool(row["csps_allowed"]) if row["csps_allowed"] is not None else True
-        if not csps_allowed:
-            result.add("regime", "fail", "current regime snapshot disallows new bullish-premium trades")
+        flag = bool(row[flag_column]) if row[flag_column] is not None else True
+        if not flag:
+            result.add("regime", "fail", fail_detail)
         else:
             result.add("regime", "pass")
 
