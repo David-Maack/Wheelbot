@@ -8,13 +8,20 @@ Fields populated:
   vix_close, vix_change_pct
   choppiness                  — 14-day Choppiness Index on SPY
   regime ∈ {BULL_TREND, NEUTRAL, BEAR_TREND, HIGH_VOL}
-  csps_allowed                — False when the §8 #7 gate should block
+  csps_allowed                — False when the §8 #7 gate should block (bullish-premium)
+  bear_calls_allowed          — False when bear_call_spread should be blocked
 
-Decision rule for `csps_allowed`:
+Decision rule for `csps_allowed` (bullish-premium gate — CSPs and bull put spreads):
   False  if  vix_close > vix_max
          OR  vix_change_pct >= pause_on_vix_spike_pct
          OR  regime == BEAR_TREND  (per spec — if SPY < 200d SMA, paused)
   True otherwise.
+
+Decision rule for `bear_calls_allowed` (bearish-premium gate — bear call spreads):
+  False  if  vix_close > vix_max
+         OR  vix_change_pct >= pause_on_vix_spike_pct
+         OR  regime == BULL_TREND  (mirror of CSP gate — SPY ripping = blowthrough risk)
+  True otherwise.  NEUTRAL and BEAR_TREND both allow bear-call entry.
 
 Choppiness Index 14d formula (Bollinger):
     100 * log10( SUM(TR, 14) / (max(High, 14) - min(Low, 14)) ) / log10(14)
@@ -46,15 +53,22 @@ class RegimeInputs:
     choppiness: float
 
 
-def classify_regime(inputs: RegimeInputs, *, vix_max: float, vix_spike_pct: float) -> tuple[Regime, bool]:
-    """Pure-function classification — used by run_regime() and tested directly."""
+def classify_regime(
+    inputs: RegimeInputs, *, vix_max: float, vix_spike_pct: float
+) -> tuple[Regime, bool, bool]:
+    """Pure-function classification — used by run_regime() and tested directly.
+
+    Returns (regime, csps_allowed, bear_calls_allowed). HIGH_VOL blocks both
+    sides because gamma risk is symmetric. BULL_TREND and NEUTRAL allow CSPs;
+    BEAR_TREND and NEUTRAL allow bear calls.
+    """
     if inputs.vix_close > vix_max or inputs.vix_change_pct >= vix_spike_pct:
-        return Regime.HIGH_VOL, False
+        return Regime.HIGH_VOL, False, False
     if inputs.spy_close < inputs.spy_sma_200:
-        return Regime.BEAR_TREND, False
+        return Regime.BEAR_TREND, False, True
     if inputs.choppiness >= 61.8:  # standard "consolidating" threshold
-        return Regime.NEUTRAL, True
-    return Regime.BULL_TREND, True
+        return Regime.NEUTRAL, True, True
+    return Regime.BULL_TREND, True, False
 
 
 def _fetch_yfinance_inputs() -> RegimeInputs | None:
@@ -123,7 +137,7 @@ async def run_regime(repos: Repos, config: dict[str, Any]) -> RegimeSnapshot | N
         section = config.get("regime", {}) or {}
         vix_max = float(section.get("vix_max", 35))
         vix_spike = float(section.get("pause_on_vix_spike_pct", 30))
-        regime, csps_allowed = classify_regime(
+        regime, csps_allowed, bear_calls_allowed = classify_regime(
             inputs, vix_max=vix_max, vix_spike_pct=vix_spike
         )
         snapshot = RegimeSnapshot(
@@ -136,11 +150,13 @@ async def run_regime(repos: Repos, config: dict[str, Any]) -> RegimeSnapshot | N
             choppiness=inputs.choppiness,
             regime=regime,
             csps_allowed=csps_allowed,
+            bear_calls_allowed=bear_calls_allowed,
             notes=None,
         )
         await _upsert(repos, snapshot)
         ctx["regime"] = regime.value
         ctx["csps_allowed"] = csps_allowed
+        ctx["bear_calls_allowed"] = bear_calls_allowed
         return snapshot
 
 
@@ -149,8 +165,8 @@ async def _upsert(repos: Repos, snapshot: RegimeSnapshot) -> None:
     await c.execute(
         "INSERT INTO regime_snapshots "
         "(snapshot_date, spy_close, spy_sma_200, spy_above_sma, vix_close, "
-        " vix_change_pct, choppiness, regime, csps_allowed, notes) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        " vix_change_pct, choppiness, regime, csps_allowed, bear_calls_allowed, notes) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(snapshot_date) DO UPDATE SET "
         " spy_close = excluded.spy_close, "
         " spy_sma_200 = excluded.spy_sma_200, "
@@ -159,7 +175,8 @@ async def _upsert(repos: Repos, snapshot: RegimeSnapshot) -> None:
         " vix_change_pct = excluded.vix_change_pct, "
         " choppiness = excluded.choppiness, "
         " regime = excluded.regime, "
-        " csps_allowed = excluded.csps_allowed",
+        " csps_allowed = excluded.csps_allowed, "
+        " bear_calls_allowed = excluded.bear_calls_allowed",
         (
             snapshot.snapshot_date.isoformat(),
             snapshot.spy_close,
@@ -170,6 +187,7 @@ async def _upsert(repos: Repos, snapshot: RegimeSnapshot) -> None:
             snapshot.choppiness,
             snapshot.regime.value if hasattr(snapshot.regime, "value") else snapshot.regime,
             int(snapshot.csps_allowed) if snapshot.csps_allowed is not None else None,
+            int(snapshot.bear_calls_allowed) if snapshot.bear_calls_allowed is not None else None,
             snapshot.notes,
         ),
     )

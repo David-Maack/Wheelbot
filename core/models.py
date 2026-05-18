@@ -193,6 +193,7 @@ class RegimeSnapshot(_Base):
     choppiness: float | None = None
     regime: Regime | None = None
     csps_allowed: bool | None = None
+    bear_calls_allowed: bool | None = None
     notes: str | None = None
 
 
