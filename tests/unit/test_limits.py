@@ -216,6 +216,35 @@ async def test_regime_blocks_csp_when_csps_disallowed(db_repos, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_regime_bypasses_buy_to_close_even_when_csps_disallowed(db_repos, monkeypatch):
+    """Profit-close of a CSP must not be blocked by an unfavorable regime —
+    we never want to be unable to exit a position because SPY fell."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    conn = await db_repos.db.connect()
+    await conn.execute(
+        "INSERT INTO regime_snapshots (snapshot_date, csps_allowed) VALUES (?, ?)",
+        ("2025-06-01", 0),
+    )
+    await conn.commit()
+
+    broker = PaperBroker(cash=20_000)
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(broker, db_repos, cfg, _universe())
+
+    close_proposal = Proposal(
+        symbol="F",
+        contract=_put_contract(),
+        order_type=OrderType.BUY_TO_CLOSE,
+        quantity=1,
+        rationale="profit close",
+    )
+    res = await gate.evaluate(close_proposal, today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["regime"] == "skip"
+
+
+@pytest.mark.asyncio
 async def test_evaluate_raises_on_first_failure_by_default(db_repos, monkeypatch):
     monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
     broker = PaperBroker(cash=1_000)  # too tight → BP failure

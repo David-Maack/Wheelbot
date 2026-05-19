@@ -58,6 +58,7 @@ from strategies.spreads import (
     propose_all_closes as propose_all_spread_closes,
 )
 from strategies.wheel import propose_all
+from strategies.wheel_close import propose_all_closes as propose_all_wheel_closes
 
 
 def _utcnow() -> datetime:
@@ -261,9 +262,14 @@ async def _propose_and_route(
             )
             continue
         if strategy.type == "wheel":
-            proposals = await propose_all(
+            # Profit-closes first — free up capital before considering new entries.
+            close_proposals = await propose_all_wheel_closes(
+                broker, repos, config, strategy=strategy,
+            )
+            open_proposals = await propose_all(
                 broker, repos, config, strategy_universe, ivr, strategy=strategy,
             )
+            proposals = close_proposals + open_proposals
         elif strategy.type == "vertical_spread":
             # Closes first — free up capital before considering new entries.
             close_proposals = await propose_all_spread_closes(

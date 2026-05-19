@@ -379,6 +379,11 @@ class RiskGate:
         if not self._config.get("regime", {}).get("enabled", False):
             result.add("regime", "skip", "regime gating disabled in config")
             return
+        # Closes always pass — reducing exposure should never be blocked by an
+        # unfavorable regime. Parallel to the multi-leg fix in 35e73db.
+        if proposal.order_type == OrderType.BUY_TO_CLOSE:
+            result.add("regime", "skip", "closes bypass the regime gate")
+            return
         # CCs are about closing existing exposure — regime gate applies only to
         # new CSPs (spec §8 rule 7).
         if proposal.contract.option_type != OptionType.PUT:
