@@ -183,9 +183,7 @@ strategies:
   - id: bear_call_spread
     display_name: "Bear Call Spread"
     type: vertical_spread
-    # Ships disabled. Flip via a separate commit once smoke-tested live
-    # (same cadence we used for put_spread in Sprint 9).
-    enabled: false
+    enabled: true
     max_concurrent: 4
     params:
       direction: bear_call
