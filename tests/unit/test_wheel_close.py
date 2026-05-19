@@ -1,0 +1,334 @@
+"""Wheel profit-close orchestrator — CSP and CC threshold logic + roll handling."""
+
+from __future__ import annotations
+
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
+
+import pytest
+
+from core.models import (
+    Order,
+    OrderStatus,
+    OrderType,
+    OptionType,
+    Position,
+    PositionState,
+    Quote,
+    WheelCycle,
+)
+from core.strategies import StrategyDefinition
+from platforms.paper_broker import PaperBroker
+from strategies.wheel_close import (
+    propose_all_closes,
+    propose_close_for_position,
+)
+
+
+# -- helpers ----------------------------------------------------------------
+
+
+def _strategy(**params_overrides: Any) -> StrategyDefinition:
+    base_params: dict[str, Any] = {
+        "csp_profit_close_pct": 50,
+        "cc_profit_close_pct": 50,
+    }
+    base_params.update(params_overrides)
+    return StrategyDefinition(
+        id="monthly_wheel",
+        display_name="Monthly Wheel",
+        type="wheel",
+        enabled=True,
+        max_concurrent=4,
+        params=base_params,
+    )
+
+
+async def _seed_open_csp(
+    db_repos, *, fill_price: float, symbol: str = "F", contract: str = "F250706P00010000"
+) -> tuple[Position, int]:
+    """Persist a CSP_OPEN position with a FILLED SELL_TO_OPEN order on a cycle."""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(
+            account_id="test",
+            symbol=symbol,
+            strategy_id="monthly_wheel",
+            started_at=now,
+            initial_csp_strike=10.0,
+            initial_csp_premium=fill_price,
+            initial_capital_at_risk=1000.0,
+        )
+    )
+    await db_repos.orders.insert(
+        Order(
+            account_id="test",
+            symbol=symbol,
+            strategy_id="monthly_wheel",
+            cycle_id=cycle_id,
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol=contract,
+            strike=10.0,
+            expiration=date(2025, 6, 1) + timedelta(days=35),
+            option_type=OptionType.PUT,
+            quantity=1,
+            limit_price=fill_price,
+            fill_price=fill_price,
+            status=OrderStatus.FILLED,
+            placed_at=now,
+            filled_at=now,
+        )
+    )
+    position = Position(
+        account_id="test",
+        symbol=symbol,
+        strategy_id="monthly_wheel",
+        state=PositionState.CSP_OPEN,
+        shares=0,
+        current_cycle_id=cycle_id,
+        state_changed_at=now,
+    )
+    pos_id = await db_repos.positions.insert(position)
+    position = position.model_copy(update={"id": pos_id})
+    return position, cycle_id
+
+
+async def _seed_open_cc(
+    db_repos, *, fill_price: float, symbol: str = "F", contract: str = "F250706C00012000"
+) -> Position:
+    """Persist a CC_OPEN position with a FILLED SELL_TO_OPEN call order."""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(
+            account_id="test",
+            symbol=symbol,
+            strategy_id="monthly_wheel",
+            started_at=now,
+            initial_csp_strike=10.0,
+            initial_csp_premium=0.40,
+            initial_capital_at_risk=1000.0,
+        )
+    )
+    await db_repos.orders.insert(
+        Order(
+            account_id="test",
+            symbol=symbol,
+            strategy_id="monthly_wheel",
+            cycle_id=cycle_id,
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol=contract,
+            strike=12.0,
+            expiration=date(2025, 6, 1) + timedelta(days=35),
+            option_type=OptionType.CALL,
+            quantity=1,
+            limit_price=fill_price,
+            fill_price=fill_price,
+            status=OrderStatus.FILLED,
+            placed_at=now,
+            filled_at=now,
+        )
+    )
+    position = Position(
+        account_id="test",
+        symbol=symbol,
+        strategy_id="monthly_wheel",
+        state=PositionState.CC_OPEN,
+        shares=100,
+        cost_basis=9.60,
+        current_cycle_id=cycle_id,
+        state_changed_at=now,
+    )
+    pos_id = await db_repos.positions.insert(position)
+    return position.model_copy(update={"id": pos_id})
+
+
+# -- CSP profit-close --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_csp_close_fires_when_mid_drops_below_threshold(db_repos):
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Mid 0.45 → 55% profit → under target 0.50 = (1 - 0.50) × 1.00.
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.44, ask=0.46))
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, strategy=_strategy(),
+    )
+    assert proposal is not None
+    assert proposal.order_type == OrderType.BUY_TO_CLOSE
+    assert proposal.contract.option_type == OptionType.PUT
+    assert proposal.quantity == 1
+    assert "wheel_profit_close" in proposal.rationale
+
+
+@pytest.mark.asyncio
+async def test_csp_close_skips_when_mid_above_threshold(db_repos):
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Mid 0.60 → still 40% profit → above target 0.50 threshold.
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.59, ask=0.61))
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, strategy=_strategy(),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_csp_close_skips_when_no_quote_available(db_repos):
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()  # no quote seeded
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, strategy=_strategy(),
+    )
+    assert proposal is None
+
+
+# -- CC profit-close ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cc_close_fires_when_mid_drops_below_threshold(db_repos):
+    position = await _seed_open_cc(db_repos, fill_price=0.80)
+    broker = PaperBroker()
+    # Mid 0.35 → 56% profit → under target 0.40 = (1 - 0.50) × 0.80.
+    broker.seed_quote(Quote(symbol="F250706C00012000", bid=0.34, ask=0.36))
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, strategy=_strategy(),
+    )
+    assert proposal is not None
+    assert proposal.order_type == OrderType.BUY_TO_CLOSE
+    assert proposal.contract.option_type == OptionType.CALL
+    assert "wheel_profit_close" in proposal.rationale
+
+
+# -- Threshold lookup --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_csp_uses_csp_profit_close_pct_over_legacy(db_repos):
+    """csp_profit_close_pct: 70 must override legacy profit_close_pct: 50."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Mid 0.45 → 55% profit. At 50% threshold this would fire; at 70% it shouldn't.
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.44, ask=0.46))
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        strategy=_strategy(profit_close_pct=50, csp_profit_close_pct=70),
+    )
+    assert proposal is None  # 70% threshold not met yet
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_legacy_profit_close_pct(db_repos):
+    """When only the legacy profit_close_pct is set, both CSP and CC honor it."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.44, ask=0.46))
+
+    strategy_legacy = StrategyDefinition(
+        id="monthly_wheel",
+        display_name="Monthly Wheel",
+        type="wheel",
+        enabled=True,
+        max_concurrent=4,
+        params={"profit_close_pct": 50},  # legacy only
+    )
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, strategy=strategy_legacy,
+    )
+    assert proposal is not None  # 55% profit clears legacy 50% threshold
+
+
+# -- Rolled position uses latest short premium --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_uses_latest_short_premium_for_rolled_cycle(db_repos):
+    """A rolled cycle has multiple SELL_TO_OPEN orders; the threshold compares
+    against the LATEST short's premium, not the cycle's initial premium."""
+    position, cycle_id = await _seed_open_csp(db_repos, fill_price=1.00)
+    # Insert a second, later SELL_TO_OPEN on the same cycle (the roll) at $0.40.
+    now = datetime.now(UTC).replace(tzinfo=None)
+    later = now + timedelta(hours=1)
+    await db_repos.orders.insert(
+        Order(
+            account_id="test",
+            symbol="F",
+            strategy_id="monthly_wheel",
+            cycle_id=cycle_id,
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol="F250713P00009500",  # rolled to a different strike
+            strike=9.5,
+            expiration=date(2025, 6, 1) + timedelta(days=42),
+            option_type=OptionType.PUT,
+            quantity=1,
+            limit_price=0.40,
+            fill_price=0.40,
+            status=OrderStatus.FILLED,
+            placed_at=later,
+            filled_at=later,
+        )
+    )
+    broker = PaperBroker()
+    # Quote the LATEST contract at 0.18 → 55% profit on $0.40 = under target $0.20.
+    # If the orchestrator naively used the ORIGINAL 1.00 premium, the target
+    # would be 0.50 and the trigger would NOT fire at 0.18 — but the latest is
+    # the right reference, so it must fire.
+    broker.seed_quote(Quote(symbol="F250713P00009500", bid=0.17, ask=0.19))
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, strategy=_strategy(),
+    )
+    assert proposal is not None
+    # Confirms we're using the rolled contract, not the original.
+    assert proposal.contract.occ_symbol == "F250713P00009500"
+
+
+# -- Walker ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_propose_all_closes_walks_active_wheel_positions(db_repos):
+    """Two CSP_OPEN positions: one at threshold, one not. Walker proposes once."""
+    pos_a, _ = await _seed_open_csp(
+        db_repos, fill_price=1.00, symbol="F", contract="F250706P00010000",
+    )
+    pos_b, _ = await _seed_open_csp(
+        db_repos, fill_price=0.50, symbol="G", contract="G250706P00010000",
+    )
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.44, ask=0.46))  # 55% — fires
+    broker.seed_quote(Quote(symbol="G250706P00010000", bid=0.40, ask=0.42))  # 18% — skip
+
+    config = {"account": {"id": "test"}}
+    proposals = await propose_all_closes(
+        broker, db_repos, config, strategy=_strategy(),
+    )
+    assert len(proposals) == 1
+    assert proposals[0].symbol == "F"
+
+
+@pytest.mark.asyncio
+async def test_propose_all_closes_skips_non_open_states(db_repos):
+    """SPREAD_OPEN, MANUAL_INTERVENTION, IDLE etc. must not be considered."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    # Move it out of CSP_OPEN.
+    conn = await db_repos.db.connect()
+    await conn.execute(
+        "UPDATE positions SET state = 'MANUAL_INTERVENTION' WHERE id = ?",
+        (position.id,),
+    )
+    await conn.commit()
+
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.10, ask=0.12))  # deep profit
+
+    proposals = await propose_all_closes(
+        broker, db_repos, {"account": {"id": "test"}}, strategy=_strategy(),
+    )
+    assert proposals == []

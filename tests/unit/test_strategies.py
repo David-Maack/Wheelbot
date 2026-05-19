@@ -133,8 +133,6 @@ def test_real_config_registers_bear_call_spread():
     bcs = by_id["bear_call_spread"]
     assert bcs.type == "vertical_spread"
     assert bcs.params.get("direction") == "bear_call"
-    # Ships disabled — flipped via a separate commit once smoke-tested live.
-    assert bcs.enabled is False
     # Both spread strategies share the same sizing for cross-strategy comparability.
     assert bcs.params.get("spread_width_dollars") == 5.0
     assert bcs.params.get("max_capital_per_spread_usd") == 500
