@@ -178,7 +178,12 @@ strategies:
       # learn how the strategy behaves on this universe.
       max_capital_per_spread_usd: 500
       profit_close_pct: 50
-      time_close_dte: 7
+      # Sprint 12 sub-sprint 1: DTE 7 → 21. The "21-DTE rule" is the
+      # most-replicated finding in retail options research — gamma
+      # acceleration in the final 21 days overwhelms remaining theta and
+      # produces the bulk of max-loss outcomes. tastytrade 200K+ trade
+      # analysis + Option Alpha independent backtest agree.
+      time_close_dte: 21
 
   - id: bear_call_spread
     display_name: "Bear Call Spread"
@@ -195,4 +200,5 @@ strategies:
       spread_width_dollars: 5.0
       max_capital_per_spread_usd: 500
       profit_close_pct: 50
-      time_close_dte: 7
+      # See put_spread above. Same rule applies to bear-call spreads.
+      time_close_dte: 21
