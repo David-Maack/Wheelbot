@@ -166,6 +166,50 @@ async def test_selector_returns_none_when_no_long_above_short():
 
 
 @pytest.mark.asyncio
+async def test_selector_rejects_when_ivr_below_min():
+    """Sprint 12 sub-sprint 5: IVR < ivr_min should block entry."""
+    class _StubIvr:
+        async def iv_rank(self, symbol):
+            return 22.0  # below the 30 threshold
+
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F", bid=10.0, ask=10.04))
+    broker.seed_chain(
+        "F",
+        [
+            _call(10.0, bid=0.39, ask=0.41, delta=0.25),
+            _call(11.0, bid=0.10, ask=0.12, delta=0.10),
+        ],
+    )
+    candidate = await select_bear_call_spread(
+        broker, "F", _params(ivr_min=30), today=date(2025, 6, 1), ivr=_StubIvr(),
+    )
+    assert candidate is None
+
+
+@pytest.mark.asyncio
+async def test_selector_passes_when_ivr_unavailable():
+    """No iv_history yet → iv_rank returns None → skip the filter (paper-bringup safety)."""
+    class _StubIvr:
+        async def iv_rank(self, symbol):
+            return None
+
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F", bid=10.0, ask=10.04))
+    broker.seed_chain(
+        "F",
+        [
+            _call(10.0, bid=0.39, ask=0.41, delta=0.25),
+            _call(11.0, bid=0.10, ask=0.12, delta=0.10),
+        ],
+    )
+    candidate = await select_bear_call_spread(
+        broker, "F", _params(ivr_min=30), today=date(2025, 6, 1), ivr=_StubIvr(),
+    )
+    assert candidate is not None  # filter skipped, trade allowed
+
+
+@pytest.mark.asyncio
 async def test_selector_prefers_higher_yield_short_when_multiple_candidates():
     """Two valid short candidates in the delta band — pick the higher yielder."""
     broker = PaperBroker()

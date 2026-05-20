@@ -37,6 +37,7 @@ from core.models import (
     PositionState,
 )
 from core.strategies import StrategyDefinition
+from data.ivr import IVRProvider
 from db.repo import Repos
 from strategies.call_spread_selector import select_bear_call_spread
 from strategies.spread_selector import SpreadCandidate, select_bull_put_spread
@@ -167,6 +168,7 @@ async def propose_for_symbol(
     *,
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
+    ivr: IVRProvider | None = None,
 ) -> MultiLegProposal | None:
     today = today or date.today()
     account_id = config.get("account", {}).get("id", "primary")
@@ -198,11 +200,11 @@ async def propose_for_symbol(
     direction = str(strategy.params.get("direction", DIRECTION_BULL_PUT))
     if direction == DIRECTION_BEAR_CALL:
         candidate = await select_bear_call_spread(
-            broker, symbol, strategy.params, today=today, record_chain=record
+            broker, symbol, strategy.params, today=today, record_chain=record, ivr=ivr,
         )
     elif direction == DIRECTION_BULL_PUT:
         candidate = await select_bull_put_spread(
-            broker, symbol, strategy.params, today=today, record_chain=record
+            broker, symbol, strategy.params, today=today, record_chain=record, ivr=ivr,
         )
     else:
         log_checkpoint(
@@ -248,12 +250,13 @@ async def propose_all(
     *,
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
+    ivr: IVRProvider | None = None,
 ) -> list[MultiLegProposal]:
     out: list[MultiLegProposal] = []
     for entry in universe["tickers"]:
         proposal = await propose_for_symbol(
             broker, repos, entry.symbol, config, universe,
-            today=today, strategy=strategy,
+            today=today, strategy=strategy, ivr=ivr,
         )
         if proposal is not None:
             out.append(proposal)

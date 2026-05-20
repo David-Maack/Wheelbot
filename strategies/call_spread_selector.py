@@ -40,6 +40,7 @@ from data.chain import (
     annualized_yield,
     fetch_filtered_chain,
 )
+from data.ivr import IVRProvider
 from strategies.spread_selector import SpreadCandidate
 
 ChainRecorder = Callable[[str, str, list[OptionContract]], Awaitable[None]]
@@ -92,9 +93,25 @@ async def select_bear_call_spread(
     *,
     today: date | None = None,
     record_chain: ChainRecorder | None = None,
+    ivr: IVRProvider | None = None,
 ) -> SpreadCandidate | None:
     """Return the best bear-call spread, or None if nothing passes."""
     today = today or date.today()
+
+    # IVR soft filter (Sprint 12 sub-sprint 5). Same shape as bull-put.
+    if ivr is not None:
+        rank = await ivr.iv_rank(symbol)
+        ivr_min = float(params.get("ivr_min", 0))
+        if rank is not None and rank < ivr_min:
+            log_checkpoint(
+                "call_spread_skip_ivr",
+                status="ok",
+                symbol=symbol,
+                ivr=rank,
+                ivr_min=ivr_min,
+            )
+            return None
+
     filters = ChainFilters(
         dte_min=int(params.get("dte_min", 30)),
         dte_max=int(params.get("dte_max", 45)),

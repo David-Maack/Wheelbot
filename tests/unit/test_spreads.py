@@ -154,6 +154,54 @@ async def test_selector_falls_back_to_nearest_strike_when_exact_width_missing():
 
 
 @pytest.mark.asyncio
+async def test_selector_rejects_when_ivr_below_min():
+    """Sprint 12 sub-sprint 5: IVR < ivr_min should block entry."""
+    class _StubIvr:
+        async def iv_rank(self, symbol):
+            return 22.0  # below the 30 threshold
+
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F", bid=10.0, ask=10.04))
+    broker.seed_chain(
+        "F",
+        [
+            _put(10.0, bid=0.39, ask=0.41, delta=-0.25),
+            _put(9.0, bid=0.10, ask=0.12, delta=-0.10),
+        ],
+    )
+    candidate = await select_bull_put_spread(
+        broker, "F",
+        _strategy(ivr_min=30).params,
+        today=date(2025, 6, 1), ivr=_StubIvr(),
+    )
+    assert candidate is None
+
+
+@pytest.mark.asyncio
+async def test_selector_passes_when_ivr_unavailable():
+    """No iv_history yet → iv_rank returns None → skip the filter."""
+    class _StubIvr:
+        async def iv_rank(self, symbol):
+            return None
+
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F", bid=10.0, ask=10.04))
+    broker.seed_chain(
+        "F",
+        [
+            _put(10.0, bid=0.39, ask=0.41, delta=-0.25),
+            _put(9.0, bid=0.10, ask=0.12, delta=-0.10),
+        ],
+    )
+    candidate = await select_bull_put_spread(
+        broker, "F",
+        _strategy(ivr_min=30).params,
+        today=date(2025, 6, 1), ivr=_StubIvr(),
+    )
+    assert candidate is not None
+
+
+@pytest.mark.asyncio
 async def test_selector_returns_none_when_no_short_passes():
     broker = PaperBroker()
     broker.seed_quote(Quote(symbol="F", bid=10.0, ask=10.04))

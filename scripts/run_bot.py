@@ -276,7 +276,8 @@ async def _propose_and_route(
                 broker, repos, config, strategy=strategy,
             )
             open_proposals = await propose_all_spreads(
-                broker, repos, config, strategy_universe, strategy=strategy,
+                broker, repos, config, strategy_universe,
+                strategy=strategy, ivr=ivr,
             )
             proposals = close_proposals + open_proposals
         else:
