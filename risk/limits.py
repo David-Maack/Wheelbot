@@ -8,7 +8,9 @@ Rules implemented (1-7 of §8):
 
 1. Buying-power floor      — keep ≥ buying_power_floor_pct free after this order.
 2. Per-position cap        — notional of this position ≤ max_position_pct_of_account.
-3. Concurrent positions    — count of non-IDLE positions ≤ max_concurrent_positions.
+3. Concurrent positions    — count of non-IDLE positions per strategy ≤ strategy.max_concurrent.
+3b. Concurrent total       — count across ALL strategies ≤ account.max_concurrent_total
+                              (small-account safety; skipped if config setting absent).
 4. Earnings blackout       — fail-open when no data (yfinance is patchy).
 5. CC strike floor         — short-call strike ≥ cost basis. Re-checked here
                               even though cc_selector enforces it: belt + suspenders.
@@ -119,12 +121,14 @@ class RiskGate:
             await self._rule_buying_power(result, proposal, account, params)
             await self._rule_position_cap(result, proposal, account, params)
             await self._rule_concurrent_cap(result, proposal, params)
+            await self._rule_concurrent_total(result, proposal)
             await self._rule_earnings_multi_leg(result, proposal, params, today)
             await self._rule_regime_multi_leg(result, proposal, params)
         else:
             await self._rule_buying_power(result, proposal, account, params)
             await self._rule_position_cap(result, proposal, account, params)
             await self._rule_concurrent_cap(result, proposal, params)
+            await self._rule_concurrent_total(result, proposal)
             await self._rule_earnings(result, proposal, params, today)
             self._rule_cc_strike_floor(result, proposal)
             self._rule_liquidity(result, proposal, params)
@@ -209,6 +213,47 @@ class RiskGate:
             )
         else:
             result.add("concurrent_positions_cap", "pass")
+
+    # --- Rule 3b — global cap across all strategies ----------------------------
+    async def _rule_concurrent_total(
+        self,
+        result: RiskCheckResult,
+        proposal: Proposal | MultiLegProposal,
+    ) -> None:
+        """Sprint 12 sub-sprint 4: global concurrent-position cap.
+
+        Counts ALL non-IDLE positions across every strategy, not just the
+        proposal's strategy. Required for small-account safety where the
+        per-strategy cap × N strategies can produce dangerous total exposure
+        (e.g. 4 × 4 = 16 = $5,600 max simultaneous loss on $5-wide spreads,
+        catastrophic on a $2-5k bankroll).
+
+        Skips when account.max_concurrent_total is not set in config
+        (backwards-compat — production configs should always set it).
+        """
+        account_section = self._config.get("account", {}) or {}
+        cap_raw = account_section.get("max_concurrent_total")
+        if cap_raw is None:
+            result.add("concurrent_total_cap", "skip", "account.max_concurrent_total not set")
+            return
+        cap = int(cap_raw)
+        account_id = account_section.get("id", "primary")
+        active = await self._repos.positions.list_active(account_id)  # no strategy filter
+        symbol = proposal.symbol.upper()
+        # If the same symbol is already active (possibly under another strategy),
+        # this proposal doesn't add a "new" slot. Closes on existing positions
+        # likewise don't increase the count.
+        new_slot = not any(p.symbol.upper() == symbol for p in active)
+        projected = len(active) + (1 if new_slot else 0)
+        if projected > cap:
+            result.add(
+                "concurrent_total_cap",
+                "fail",
+                f"projected total {projected} > cap {cap} "
+                f"(active across all strategies={len(active)})",
+            )
+        else:
+            result.add("concurrent_total_cap", "pass")
 
     # --- Rule 4 ----------------------------------------------------------------
     async def _rule_earnings(

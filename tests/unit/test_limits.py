@@ -418,3 +418,86 @@ async def test_regime_gate_skips_close_proposals(db_repos, monkeypatch):
         )
         statuses = {r.rule: r.status for r in res.results}
         assert statuses["regime"] == "skip", f"close for {direction} should bypass regime"
+
+
+# -- Global concurrent-total cap (Sprint 12 sub-sprint 4) -------------------
+
+
+async def _seed_active_position(
+    db_repos, *, symbol: str, strategy_id: str, state: str = "CSP_OPEN"
+) -> None:
+    """Persist a non-IDLE position so list_active counts it."""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await db_repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol=symbol,
+            strategy_id=strategy_id,
+            state=PositionState(state),
+            shares=0,
+            state_changed_at=now,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_total_skips_when_setting_absent(db_repos, monkeypatch):
+    """Backwards-compat: configs without account.max_concurrent_total skip the rule."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    cfg = _config()  # no max_concurrent_total in account section
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["concurrent_total_cap"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_total_passes_below_global_cap(db_repos, monkeypatch):
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    # Seed 2 active positions across two different strategies. Cap is 4.
+    await _seed_active_position(db_repos, symbol="AAA", strategy_id="monthly_wheel")
+    await _seed_active_position(db_repos, symbol="BBB", strategy_id="put_spread", state="SPREAD_OPEN")
+
+    cfg = _config()
+    cfg["account"]["max_concurrent_total"] = 4
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["concurrent_total_cap"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_total_blocks_new_entry_at_cap_across_strategies(db_repos, monkeypatch):
+    """Cap is 4. 4 different symbols already active (any strategies). New entry rejected
+    even if the per-strategy cap would still allow it."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_active_position(db_repos, symbol="AAA", strategy_id="monthly_wheel")
+    await _seed_active_position(db_repos, symbol="BBB", strategy_id="weekly_wheel")
+    await _seed_active_position(db_repos, symbol="CCC", strategy_id="put_spread", state="SPREAD_OPEN")
+    await _seed_active_position(db_repos, symbol="DDD", strategy_id="bear_call_spread", state="SPREAD_OPEN")
+
+    cfg = _config()
+    cfg["account"]["max_concurrent_total"] = 4
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    # Proposal is on F (a different symbol from the 4 active). Adds a new slot.
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["concurrent_total_cap"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_total_allows_proposal_on_existing_symbol_at_cap(db_repos, monkeypatch):
+    """At cap, but the proposal is on a symbol we already hold → no new slot, passes."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    # 4 active including F (the proposal symbol from _proposal()).
+    await _seed_active_position(db_repos, symbol="F", strategy_id="monthly_wheel")
+    await _seed_active_position(db_repos, symbol="BBB", strategy_id="weekly_wheel")
+    await _seed_active_position(db_repos, symbol="CCC", strategy_id="put_spread", state="SPREAD_OPEN")
+    await _seed_active_position(db_repos, symbol="DDD", strategy_id="bear_call_spread", state="SPREAD_OPEN")
+
+    cfg = _config()
+    cfg["account"]["max_concurrent_total"] = 4
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["concurrent_total_cap"] == "pass"
