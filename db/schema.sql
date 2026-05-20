@@ -200,3 +200,13 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_symbol_date ON chain_snapshots(symbol, captured_at);
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_cycle ON chain_snapshots(cycle_id);
+
+-- Runtime state for strategies (Sprint 13). Tracks auto-disable from the
+-- drawdown circuit breaker. Disabled_until=NULL means active; future date
+-- means paused-until; past date auto-clears on next check.
+CREATE TABLE IF NOT EXISTS strategy_runtime_state (
+    strategy_id      TEXT PRIMARY KEY,
+    disabled_at      DATETIME,
+    disabled_until   DATETIME,
+    disabled_reason  TEXT
+);

@@ -57,6 +57,7 @@ from strategies.spreads import (
     propose_all as propose_all_spreads,
     propose_all_closes as propose_all_spread_closes,
 )
+from risk import auto_disable
 from strategies.wheel import propose_all
 from strategies.wheel_close import propose_all_closes as propose_all_wheel_closes
 
@@ -253,6 +254,19 @@ async def _propose_and_route(
     for strategy in strategies:
         if not strategy.enabled:
             continue
+        # Sprint 13 sub-sprint 1: skip strategies the drawdown circuit breaker
+        # has soft-disabled. Skipping happens BEFORE check_and_apply so a
+        # newly-disabled strategy doesn't propose anything on the same tick it
+        # was paused.
+        disabled, reason = await auto_disable.is_currently_disabled(repos, strategy.id)
+        if disabled:
+            log_checkpoint(
+                "bot_strategy_runtime_disabled",
+                status="skip",
+                strategy=strategy.id,
+                reason=reason,
+            )
+            continue
         strategy_universe = universe_for_strategy(strategy, universe)
         if not strategy_universe["tickers"]:
             log_checkpoint(
@@ -321,6 +335,19 @@ async def _propose_and_route(
         total_proposals += len(proposals)
         total_placed += placed
         total_blocked += blocked
+
+        # Evaluate the drawdown circuit breaker after this strategy's iteration
+        # completes. Any cycles closed during this tick are now in the rolling
+        # window, so a blow-out trade trips the breaker on the very next tick.
+        try:
+            await auto_disable.check_and_apply(repos, strategy, config)
+        except Exception as exc:  # defensive — never let monitoring break trading
+            log_checkpoint(
+                "auto_disable_check_failed",
+                status="fail",
+                strategy=strategy.id,
+                error=str(exc),
+            )
     log_checkpoint(
         "bot_propose_route_summary",
         status="ok",

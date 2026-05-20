@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -516,6 +516,89 @@ class ChainSnapshotsRepo(_Repo):
         return ChainSnapshot(**row) if row else None
 
 
+class StrategyRuntimeStateRepo(_Repo):
+    """Per-strategy runtime state — auto-disable from drawdown circuit breaker.
+
+    Disabled when `disabled_until` is set and in the future. `is_disabled()`
+    auto-clears stale entries (past disabled_until) and returns the cleaned-up
+    truth, so callers never see "disabled forever after timeout" state.
+    """
+
+    table = "strategy_runtime_state"
+
+    async def get(self, strategy_id: str) -> dict | None:
+        return await self._fetch_one(
+            "SELECT * FROM strategy_runtime_state WHERE strategy_id = ?",
+            (strategy_id,),
+        )
+
+    async def disable(
+        self,
+        strategy_id: str,
+        *,
+        until: datetime,
+        reason: str,
+        now: datetime | None = None,
+    ) -> None:
+        now = now or datetime.now(UTC).replace(tzinfo=None)
+        c = await self.db.connect()
+        await c.execute(
+            "INSERT INTO strategy_runtime_state "
+            "(strategy_id, disabled_at, disabled_until, disabled_reason) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(strategy_id) DO UPDATE SET "
+            "  disabled_at = excluded.disabled_at, "
+            "  disabled_until = excluded.disabled_until, "
+            "  disabled_reason = excluded.disabled_reason",
+            (strategy_id, now.isoformat(), until.isoformat(), reason),
+        )
+        await c.commit()
+
+    async def enable(self, strategy_id: str) -> None:
+        """Manual re-enable. Clears the disable record entirely."""
+        c = await self.db.connect()
+        await c.execute(
+            "DELETE FROM strategy_runtime_state WHERE strategy_id = ?",
+            (strategy_id,),
+        )
+        await c.commit()
+
+    async def is_disabled(
+        self,
+        strategy_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[bool, str | None]:
+        """Returns (is_disabled, reason). Auto-clears stale disable records."""
+        now = now or datetime.now(UTC).replace(tzinfo=None)
+        row = await self.get(strategy_id)
+        if row is None or row.get("disabled_until") is None:
+            return False, None
+        until = datetime.fromisoformat(row["disabled_until"])
+        if until <= now:
+            await self.enable(strategy_id)  # auto-clear
+            return False, None
+        return True, row.get("disabled_reason")
+
+    async def list_disabled(
+        self, *, now: datetime | None = None,
+    ) -> list[dict]:
+        """All currently-disabled strategies (auto-clears stale rows)."""
+        now = now or datetime.now(UTC).replace(tzinfo=None)
+        rows = await self._fetch_all("SELECT * FROM strategy_runtime_state")
+        out: list[dict] = []
+        for r in rows:
+            until_raw = r.get("disabled_until")
+            if until_raw is None:
+                continue
+            until = datetime.fromisoformat(until_raw)
+            if until <= now:
+                await self.enable(r["strategy_id"])
+                continue
+            out.append(r)
+        return out
+
+
 class Repos:
     """Convenience bundle so callers can pass a single object."""
 
@@ -531,3 +614,4 @@ class Repos:
         self.iv_history = IvHistoryRepo(db)
         self.daily_state = DailyStateRepo(db)
         self.chain_snapshots = ChainSnapshotsRepo(db)
+        self.strategy_runtime = StrategyRuntimeStateRepo(db)
