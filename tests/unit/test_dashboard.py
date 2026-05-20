@@ -93,6 +93,153 @@ async def test_positions_partial_returns_polling_div(app_client):
     assert "hx-get=" in resp.text
 
 
+# -- Multi-leg position rows: DTE + unrealized from MULTI_LEG_OPEN ----------
+
+
+async def _seed_spread_position(
+    deps,
+    broker,
+    *,
+    symbol: str,
+    strategy_id: str,
+    short_strike: float,
+    long_strike: float,
+    option_type: str,  # "PUT" for bull_put, "CALL" for bear_call
+    fill_price: float,
+    expiration: date,
+    short_mid: float,
+    long_mid: float,
+):
+    """Create a SPREAD_OPEN position with a FILLED MULTI_LEG_OPEN parent order.
+
+    Mirrors what the reconciler does after a multi-leg fill: cycle row,
+    position in SPREAD_OPEN, parent order with `raw_request["legs"]`.
+    """
+    from core.models import OrderType as OT
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await deps.repos.cycles.insert(
+        WheelCycle(
+            account_id="test",
+            symbol=symbol,
+            strategy_id=strategy_id,
+            started_at=now,
+            initial_csp_premium=fill_price,
+            initial_capital_at_risk=350.0,
+        )
+    )
+    short_occ = f"{symbol}{expiration.strftime('%y%m%d')}{option_type[0]}{int(short_strike * 1000):08d}"
+    long_occ = f"{symbol}{expiration.strftime('%y%m%d')}{option_type[0]}{int(long_strike * 1000):08d}"
+    legs_raw = [
+        {
+            "contract_symbol": short_occ,
+            "underlying": symbol,
+            "option_type": option_type,
+            "strike": short_strike,
+            "expiration": expiration.isoformat(),
+            "action": "SELL_TO_OPEN",
+            "ratio_qty": 1,
+        },
+        {
+            "contract_symbol": long_occ,
+            "underlying": symbol,
+            "option_type": option_type,
+            "strike": long_strike,
+            "expiration": expiration.isoformat(),
+            "action": "BUY_TO_OPEN",
+            "ratio_qty": 1,
+        },
+    ]
+    await deps.repos.orders.insert(
+        Order(
+            account_id="test",
+            symbol=symbol,
+            strategy_id=strategy_id,
+            cycle_id=cycle_id,
+            order_type=OT.MULTI_LEG_OPEN,
+            quantity=1,
+            limit_price=fill_price,
+            fill_price=fill_price,
+            status=OrderStatus.FILLED,
+            placed_at=now,
+            filled_at=now,
+            raw_request={"legs": legs_raw},
+        )
+    )
+    await deps.repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol=symbol,
+            strategy_id=strategy_id,
+            state=PositionState.SPREAD_OPEN,
+            shares=0,
+            current_cycle_id=cycle_id,
+            state_changed_at=now,
+        )
+    )
+    # Seed quotes for both legs.
+    from core.models import Quote
+    broker.seed_quote(Quote(symbol=short_occ, bid=short_mid - 0.01, ask=short_mid + 0.01))
+    broker.seed_quote(Quote(symbol=long_occ, bid=long_mid - 0.01, ask=long_mid + 0.01))
+
+
+@pytest.mark.asyncio
+async def test_positions_row_populates_dte_and_unrealized_for_put_spread(app_client):
+    """SPREAD_OPEN put_spread must show DTE + unrealized on the dashboard.
+
+    Regression: before this fix, _latest_open_option_for_cycle only queried
+    SELL_TO_OPEN, so multi-leg positions returned None → dashboard showed —.
+    """
+    from dashboard.app import _positions_rows, _QuoteCache
+    _client, deps, broker = app_client
+    expiration = datetime.now(UTC).date() + timedelta(days=30)
+    await _seed_spread_position(
+        deps, broker,
+        symbol="F", strategy_id="put_spread",
+        short_strike=10.0, long_strike=9.0, option_type="PUT",
+        fill_price=0.30,
+        expiration=expiration,
+        short_mid=0.18, long_mid=0.06,  # debit-to-close = 0.18 - 0.06 = 0.12
+    )
+
+    cache = _QuoteCache(ttl_seconds=60)
+    rows = await _positions_rows(deps, cache)
+    spread_rows = [r for r in rows if r["strategy_id"] == "put_spread"]
+    assert len(spread_rows) == 1
+    row = spread_rows[0]
+    assert row["dte"] == 30
+    # original credit 0.30, current debit 0.12 → unrealized = (0.30 - 0.12) × 100 × 1 = 18
+    assert row["unrealized"] == pytest.approx(18.0)
+
+
+@pytest.mark.asyncio
+async def test_positions_row_populates_dte_and_unrealized_for_bear_call_spread(app_client):
+    """SPREAD_OPEN bear_call_spread also gets DTE + unrealized.
+
+    Same code path as put_spread because both are MULTI_LEG_OPEN — this test
+    locks in that the direction doesn't break the unrealized math.
+    """
+    from dashboard.app import _positions_rows, _QuoteCache
+    _client, deps, broker = app_client
+    expiration = datetime.now(UTC).date() + timedelta(days=30)
+    await _seed_spread_position(
+        deps, broker,
+        symbol="IWM", strategy_id="bear_call_spread",
+        short_strike=284.0, long_strike=289.0, option_type="CALL",
+        fill_price=1.26,
+        expiration=expiration,
+        short_mid=0.80, long_mid=0.25,  # debit-to-close = 0.80 - 0.25 = 0.55
+    )
+
+    cache = _QuoteCache(ttl_seconds=60)
+    rows = await _positions_rows(deps, cache)
+    spread_rows = [r for r in rows if r["strategy_id"] == "bear_call_spread"]
+    assert len(spread_rows) == 1
+    row = spread_rows[0]
+    assert row["dte"] == 30
+    # original credit 1.26, current debit 0.55 → unrealized = (1.26 - 0.55) × 100 × 1 = 71
+    assert row["unrealized"] == pytest.approx(71.0)
+
+
 @pytest.mark.asyncio
 async def test_cycles_view_filters_by_symbol(app_client):
     client, deps, _broker = app_client

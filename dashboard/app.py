@@ -322,18 +322,26 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
             if cycle:
                 # Find an open option order for this position to compute DTE / unrealized.
                 latest_open_option = await _latest_open_option_for_cycle(deps, cycle.id)
-                if latest_open_option and latest_open_option.expiration:
-                    dte = (latest_open_option.expiration - today.date()).days
-                if latest_open_option and latest_open_option.contract_symbol:
-                    mid = await cache.get(deps.broker, latest_open_option.contract_symbol)
-                    if mid is not None and latest_open_option.fill_price is not None:
-                        # short option: we collected fill_price; current cost-to-close is mid.
-                        # premium per share × 100 × qty.
-                        unrealized = (
-                            (latest_open_option.fill_price - mid)
-                            * 100
-                            * latest_open_option.quantity
+                if latest_open_option:
+                    if latest_open_option.order_type == OrderType.MULTI_LEG_OPEN:
+                        # Multi-leg path: short-leg expiration drives DTE; debit-to-close
+                        # nets BOTH legs to compute unrealized vs the original credit.
+                        dte, unrealized = await _multi_leg_dte_and_unrealized(
+                            deps.broker, latest_open_option, cache, today.date(),
                         )
+                    else:
+                        if latest_open_option.expiration:
+                            dte = (latest_open_option.expiration - today.date()).days
+                        if latest_open_option.contract_symbol:
+                            mid = await cache.get(deps.broker, latest_open_option.contract_symbol)
+                            if mid is not None and latest_open_option.fill_price is not None:
+                                # short option: we collected fill_price; current cost-to-close is mid.
+                                # premium per share × 100 × qty.
+                                unrealized = (
+                                    (latest_open_option.fill_price - mid)
+                                    * 100
+                                    * latest_open_option.quantity
+                                )
         out.append(
             {
                 "symbol": p.symbol,
@@ -349,7 +357,66 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
     return out
 
 
+async def _multi_leg_dte_and_unrealized(
+    broker: Broker,
+    order: Order,
+    cache: _QuoteCache,
+    today: date,
+) -> tuple[int | None, float | None]:
+    """For a MULTI_LEG_OPEN parent order, compute (DTE, unrealized P&L).
+
+    DTE comes from the short leg's expiration (the leg with assignment risk).
+    Unrealized = (original_credit_per_share − current_debit_per_share) × 100 × qty.
+    """
+    if not order.raw_request:
+        return None, None
+    legs = order.raw_request.get("legs") or []
+    if not legs:
+        return None, None
+
+    short_leg: dict[str, Any] | None = None
+    debit_to_close: float = 0.0
+    have_all_quotes = True
+    for leg in legs:
+        action = str(leg.get("action", ""))
+        contract = leg.get("contract_symbol")
+        if not contract:
+            have_all_quotes = False
+            continue
+        mid = await cache.get(broker, contract)
+        if mid is None:
+            have_all_quotes = False
+            continue
+        # Closing means BUY back what we sold and SELL what we bought.
+        if action in ("SELL_TO_OPEN", "OrderType.SELL_TO_OPEN"):
+            debit_to_close += mid
+            short_leg = leg
+        else:
+            debit_to_close -= mid
+
+    dte: int | None = None
+    if short_leg is not None:
+        expiry_raw = short_leg.get("expiration")
+        if isinstance(expiry_raw, str):
+            expiry = date.fromisoformat(expiry_raw)
+        else:
+            expiry = expiry_raw
+        if expiry is not None:
+            dte = (expiry - today).days
+
+    unrealized: float | None = None
+    if have_all_quotes and order.fill_price is not None and order.quantity:
+        unrealized = (order.fill_price - debit_to_close) * 100 * order.quantity
+    return dte, unrealized
+
+
 async def _latest_open_option_for_cycle(deps: DashboardDeps, cycle_id: int | None) -> Order | None:
+    """Return the latest FILLED/PARTIAL open-side order for this cycle.
+
+    Covers both single-leg wheel positions (SELL_TO_OPEN) and multi-leg spread
+    positions (MULTI_LEG_OPEN). Returns the most recent — rolled wheel cycles
+    have multiple SELL_TO_OPEN orders, and the active short is the latest.
+    """
     if cycle_id is None:
         return None
     c = await deps.repos.db.connect()
@@ -361,7 +428,7 @@ async def _latest_open_option_for_cycle(deps: DashboardDeps, cycle_id: int | Non
         (
             cycle_id,
             OrderType.SELL_TO_OPEN.value,
-            OrderType.SELL_TO_OPEN.value,
+            OrderType.MULTI_LEG_OPEN.value,
             OrderStatus.FILLED.value,
             OrderStatus.PARTIAL.value,
         ),
