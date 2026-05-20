@@ -203,7 +203,12 @@ strategies:
       # $5 width — same sizing as put_spread for cross-strategy comparability.
       spread_width_dollars: 5.0
       max_capital_per_spread_usd: 500
-      profit_close_pct: 50
+      # Sprint 12 sub-sprint 3: bear-call profit target tightened to 35%
+      # (vs bull-put 50%). Asymmetric — equity indices have structural
+      # upward drift and IV skew makes calls pay less credit at equivalent
+      # delta. Faster exit reduces time exposed to melt-up scenarios.
+      # No published A/B study; logic-based off the asymmetry data.
+      profit_close_pct: 35
       # See put_spread above. Same rule applies to bear-call spreads.
       time_close_dte: 21
       # Tighter stop than bull puts (2× → 1.5×). Bear-call asymmetric
