@@ -184,6 +184,10 @@ strategies:
       # produces the bulk of max-loss outcomes. tastytrade 200K+ trade
       # analysis + Option Alpha independent backtest agree.
       time_close_dte: 21
+      # Sprint 12 sub-sprint 2: stop-loss at 2× credit received. Caps the
+      # tail at ~60% of max loss on a $5-wide spread. Critical on small
+      # accounts where a single max-loss spread is 7-17% of the bankroll.
+      stop_loss_mult: 2.0
 
   - id: bear_call_spread
     display_name: "Bear Call Spread"
@@ -202,3 +206,7 @@ strategies:
       profit_close_pct: 50
       # See put_spread above. Same rule applies to bear-call spreads.
       time_close_dte: 21
+      # Tighter stop than bull puts (2× → 1.5×). Bear-call asymmetric
+      # melt-up risk: when equity indices break upward they do so violently,
+      # so waiting for 2× often means realized loss is close to max.
+      stop_loss_mult: 1.5

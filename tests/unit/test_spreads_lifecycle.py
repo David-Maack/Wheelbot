@@ -442,6 +442,145 @@ async def test_close_orchestrator_triggers_on_dte(db_repos):
 
 
 @pytest.mark.asyncio
+async def test_close_orchestrator_stop_loss_triggers_at_2x_credit_bull_put(db_repos):
+    """Bull put stop-loss: close when debit-to-close ≥ 2× original credit.
+
+    Sprint 12 sub-sprint 2 — the change that would have capped TSLA's
+    drawdown at ~2× credit instead of letting it ride toward max loss.
+    """
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    # Open at 0.30 net credit per spread.
+    open_result = await router.place_multi_leg(
+        _spread_proposal(qty=1), sleep=_noop_sleep, today=date(2025, 6, 1),
+    )
+    await broker.fill_multi_leg(open_result.placed.broker_order_id, fill_price=0.30)
+    reconciler = Reconciler(broker, db_repos, _config())
+    await reconciler.reconcile_once()
+
+    # Quote each leg such that net debit-to-close = 0.62 (>= 2× 0.30 = 0.60).
+    # Profit close target is 0.15 (we'd need debit ≤ 0.15) — not triggered.
+    # Time close at DTE 7 — not triggered (we're far from expiration).
+    # Stop-loss should fire.
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.71, ask=0.73))
+    broker.seed_quote(Quote(symbol="F250706P00009000", bid=0.10, ask=0.12))
+
+    proposal = await propose_close_for_symbol(
+        broker, db_repos, "F", _config(),
+        today=date(2025, 6, 10),
+        strategy=_strategy(stop_loss_mult=2.0),
+    )
+    assert proposal is not None
+    assert proposal.order_type == OrderType.MULTI_LEG_CLOSE
+    assert "stop_loss" in proposal.rationale
+    # Debit = 0.72 short - 0.11 long = 0.61. Closing credit (signed) = -0.61.
+    assert proposal.net_credit_per_spread == pytest.approx(-0.61)
+
+
+@pytest.mark.asyncio
+async def test_close_orchestrator_stop_loss_triggers_at_1_5x_credit_bear_call(db_repos):
+    """Bear call uses a tighter 1.5× multiplier than bull puts (asymmetric melt-up risk).
+
+    Same lifecycle path as put_spread — direction-agnostic close machinery.
+    """
+    # Build call legs for a bear_call_spread.
+    from datetime import timedelta as td
+    today = date(2025, 6, 1)
+    bear_call_legs = [
+        OrderLeg(
+            contract_symbol="F250706C00010000",
+            underlying="F",
+            option_type=OptionType.CALL,
+            strike=10.0,
+            expiration=today + td(days=35),
+            action=OrderType.SELL_TO_OPEN,
+        ),
+        OrderLeg(
+            contract_symbol="F250706C00011000",
+            underlying="F",
+            option_type=OptionType.CALL,
+            strike=11.0,
+            expiration=today + td(days=35),
+            action=OrderType.BUY_TO_OPEN,
+        ),
+    ]
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    open_proposal = MultiLegProposal(
+        symbol="F",
+        legs=bear_call_legs,
+        net_credit_per_spread=0.40,
+        max_loss_per_spread=60.0,
+        width_dollars=1.0,
+        quantity=1,
+        rationale="bear_call test",
+        strategy_id="bear_call_spread",
+        direction="bear_call",
+    )
+    open_result = await router.place_multi_leg(open_proposal, sleep=_noop_sleep, today=today)
+    await broker.fill_multi_leg(open_result.placed.broker_order_id, fill_price=0.40)
+    reconciler = Reconciler(broker, db_repos, _config())
+    await reconciler.reconcile_once()
+
+    # Net debit-to-close = 0.62 ≥ 1.5 × 0.40 = 0.60 → stop fires.
+    # At 2.0× threshold (0.80) it would NOT fire, confirming the asymmetric multiplier.
+    broker.seed_quote(Quote(symbol="F250706C00010000", bid=0.71, ask=0.73))
+    broker.seed_quote(Quote(symbol="F250706C00011000", bid=0.10, ask=0.12))
+
+    bear_call_strategy = StrategyDefinition(
+        id="bear_call_spread",
+        display_name="Bear Call Spread",
+        type="vertical_spread",
+        enabled=True,
+        max_concurrent=4,
+        params={
+            "direction": "bear_call",
+            "dte_min": 30, "dte_max": 45,
+            "short_delta_min": 0.20, "short_delta_max": 0.30,
+            "spread_width_dollars": 1.0,
+            "profit_close_pct": 35,
+            "time_close_dte": 21,
+            "stop_loss_mult": 1.5,
+        },
+    )
+    proposal = await propose_close_for_symbol(
+        broker, db_repos, "F", _config(),
+        today=date(2025, 6, 10),
+        strategy=bear_call_strategy,
+    )
+    assert proposal is not None
+    assert proposal.order_type == OrderType.MULTI_LEG_CLOSE
+    assert proposal.direction == "bear_call"
+    assert "stop_loss" in proposal.rationale
+
+
+@pytest.mark.asyncio
+async def test_close_orchestrator_stop_loss_does_not_trigger_below_threshold(db_repos):
+    """If the debit-to-close is below stop_loss_mult × credit, no stop trigger."""
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    open_result = await router.place_multi_leg(
+        _spread_proposal(qty=1), sleep=_noop_sleep, today=date(2025, 6, 1),
+    )
+    await broker.fill_multi_leg(open_result.placed.broker_order_id, fill_price=0.30)
+    reconciler = Reconciler(broker, db_repos, _config())
+    await reconciler.reconcile_once()
+
+    # Net debit-to-close = 0.50. At 2× credit threshold (0.60), this is below
+    # the stop. Above the profit target of 0.15 too. Outside time window.
+    # → no trigger at all.
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.59, ask=0.61))
+    broker.seed_quote(Quote(symbol="F250706P00009000", bid=0.09, ask=0.11))
+
+    proposal = await propose_close_for_symbol(
+        broker, db_repos, "F", _config(),
+        today=date(2025, 6, 10),
+        strategy=_strategy(stop_loss_mult=2.0),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
 async def test_close_orchestrator_skips_when_no_trigger(db_repos):
     broker = PaperBroker(cash=20_000)
     router = OrderRouter(broker, db_repos, _config(), _universe())

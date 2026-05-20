@@ -406,9 +406,21 @@ async def propose_close_for_symbol(
     if short_leg is not None:
         short_dte = (short_leg.expiration - today).days
 
+    # Stop-loss: close when debit-to-close hits stop_loss_mult × original credit.
+    # Research-backed asymmetric defaults: bull_put 2.0, bear_call 1.5
+    # (set per strategy in config.yaml). 2.0 is the safe fallback for any
+    # spread strategy that didn't set the param.
+    stop_loss_mult = float(strategy.params.get("stop_loss_mult", 2.0))
+    stop_threshold_debit = stop_loss_mult * original_credit_per_share
+
     profit_trigger = debit_to_close <= target_max_debit and original_credit_per_share > 0
     time_trigger = short_dte is not None and short_dte <= time_close_dte
-    if not (profit_trigger or time_trigger):
+    stop_trigger = (
+        original_credit_per_share > 0
+        and stop_loss_mult > 0
+        and debit_to_close >= stop_threshold_debit
+    )
+    if not (profit_trigger or time_trigger or stop_trigger):
         return None
 
     quantity = open_order.quantity or 1
@@ -420,6 +432,11 @@ async def propose_close_for_symbol(
         rationale_parts.append(
             f"profit_close at debit={debit_to_close:.2f} ≤ target {target_max_debit:.2f} "
             f"(orig credit={original_credit_per_share:.2f}, pct={profit_close_pct})"
+        )
+    if stop_trigger:
+        rationale_parts.append(
+            f"stop_loss at debit={debit_to_close:.2f} ≥ threshold {stop_threshold_debit:.2f} "
+            f"(orig credit={original_credit_per_share:.2f}, mult={stop_loss_mult:.1f}×)"
         )
     if time_trigger:
         rationale_parts.append(f"time_close dte={short_dte} ≤ {time_close_dte}")
