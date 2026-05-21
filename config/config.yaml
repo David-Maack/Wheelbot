@@ -89,14 +89,16 @@ intelligence:
   # Daily LLM-spend cap. The Anthropic client refuses calls that would push
   # today's total above this. Screener and news_check fail-open (skip + log)
   # when exceeded; the router still places orders.
-  daily_budget_usd: 1.00
+  # Bumped to $2.00 to leave room for: 1 screener run (~$0.40 actual / ~$0.40
+  # worst-case at 4096 tokens) + a day of news_checks (~$0.10) + retry
+  # buffer. Was $1.00 in Phase 1 paper bring-up.
+  daily_budget_usd: 2.00
 
   # Per-call output token budgets — also used as the worst-case max for the
-  # pre-call budget check.
-  # screener_max_tokens 2048 was too tight for our 32-ticker universe — Opus
-  # truncated mid-JSON and the parser dropped the response. Bumped to 8192
-  # which covers ~80-100 tickers worth of {symbol, score, rationale} entries.
-  screener_max_tokens: 8192
+  # pre-call budget check, which is why these aren't set to the model's hard
+  # max. screener at 4096 covers ~50 ticker entries (we have 32), keeps
+  # worst-case cost ~$0.38 under the $1.00 / day cap with room for news+retries.
+  screener_max_tokens: 4096
   news_check_max_tokens: 256
   roll_advisor_max_tokens: 384
 
