@@ -692,6 +692,14 @@ class Reconciler:
         reason: str,
         summary: ReconcileSummary,
     ) -> None:
+        # Dedup BEFORE notify — if the position is already in
+        # MANUAL_INTERVENTION, the reconciler may still see the same
+        # unknown order on every tick until the cursor advances past it.
+        # Without this guard, Discord gets re-pinged each tick for the
+        # same underlying event.
+        existing = await self._repos.positions.get_by_symbol(self._account_id, symbol)
+        if existing is not None and existing.state == PositionState.MANUAL_INTERVENTION:
+            return
         summary.manual_interventions += 1
         await notify(
             "position.manual_intervention",
@@ -699,7 +707,6 @@ class Reconciler:
             symbol=symbol,
             reason=reason,
         )
-        existing = await self._repos.positions.get_by_symbol(self._account_id, symbol)
         now = _utcnow()
         if existing is None:
             inserted_id = await self._repos.positions.insert(
@@ -714,8 +721,6 @@ class Reconciler:
             )
             await self._log_state(inserted_id, None, PositionState.MANUAL_INTERVENTION, reason)
             return
-        if existing.state == PositionState.MANUAL_INTERVENTION:
-            return  # already flagged
         if existing.id is not None:
             await self._repos.positions.update_state(
                 existing.id,

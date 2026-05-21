@@ -121,6 +121,30 @@ async def test_manual_intervention_is_sticky_across_reconciles(db_repos):
 
 
 @pytest.mark.asyncio
+async def test_manual_intervention_does_not_renotify_when_already_flagged(db_repos, monkeypatch):
+    """Repeat MANUAL_INTERVENTION on an already-flagged position must NOT
+    send a duplicate Discord notification. The dedup check fires before
+    the notify call, so the operator only gets pinged once per event."""
+    notify_calls: list[tuple] = []
+    async def _stub_notify(event_type, title, **payload):
+        notify_calls.append((event_type, title, payload))
+    monkeypatch.setattr("execution.reconciler.notify", _stub_notify)
+
+    broker = PaperBroker(cash=20_000)
+    broker._stock["GHOST"] = (100, 5.0)
+
+    rec = Reconciler(broker, db_repos, _config())
+    # First reconcile: flag + notify.
+    await rec.reconcile_once()
+    assert len(notify_calls) == 1
+
+    # Second reconcile: broker still shows the same mismatch; position is
+    # already MANUAL_INTERVENTION. The dedup must fire — no second ping.
+    await rec.reconcile_once()
+    assert len(notify_calls) == 1, "duplicate Discord notify on repeat MANUAL_INTERVENTION"
+
+
+@pytest.mark.asyncio
 async def test_only_affected_position_is_flagged(db_repos):
     """A mismatch on one symbol must not corrupt other healthy positions."""
     broker = PaperBroker(cash=20_000)
