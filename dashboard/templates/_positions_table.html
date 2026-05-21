@@ -2,7 +2,7 @@
 {% if rows %}
 <table class="grid">
   <thead>
-    <tr><th>Symbol</th><th>Strategy</th><th>State</th><th>Days in state</th><th>Shares</th><th>Cost basis</th><th>DTE</th><th>Unrealized</th></tr>
+    <tr><th>Symbol</th><th>Strategy</th><th>State</th><th>Days in state</th><th>Shares</th><th>Cost basis</th><th>DTE</th><th>Unrealized</th><th>P&amp;L %</th></tr>
   </thead>
   <tbody>
     {% for r in rows %}
@@ -16,6 +16,9 @@
       <td>{% if r.dte is not none %}{{ r.dte }}{% else %}—{% endif %}</td>
       <td class="{% if r.unrealized is not none and r.unrealized < 0 %}neg{% elif r.unrealized is not none and r.unrealized > 0 %}pos{% endif %}">
         {% if r.unrealized is not none %}{{ "%+.2f"|format(r.unrealized) }}{% else %}—{% endif %}
+      </td>
+      <td class="{% if r.unrealized_pct is not none and r.unrealized_pct < 0 %}neg{% elif r.unrealized_pct is not none and r.unrealized_pct > 0 %}pos{% endif %}">
+        {% if r.unrealized_pct is not none %}{{ "%+.1f"|format(r.unrealized_pct) }}%{% else %}—{% endif %}
       </td>
     </tr>
     {% endfor %}

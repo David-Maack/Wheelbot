@@ -209,6 +209,8 @@ async def test_positions_row_populates_dte_and_unrealized_for_put_spread(app_cli
     assert row["dte"] == 30
     # original credit 0.30, current debit 0.12 → unrealized = (0.30 - 0.12) × 100 × 1 = 18
     assert row["unrealized"] == pytest.approx(18.0)
+    # P&L % = (0.30 - 0.12) / 0.30 * 100 = 60% captured
+    assert row["unrealized_pct"] == pytest.approx(60.0)
 
 
 @pytest.mark.asyncio
@@ -238,6 +240,8 @@ async def test_positions_row_populates_dte_and_unrealized_for_bear_call_spread(a
     assert row["dte"] == 30
     # original credit 1.26, current debit 0.55 → unrealized = (1.26 - 0.55) × 100 × 1 = 71
     assert row["unrealized"] == pytest.approx(71.0)
+    # P&L % = 0.71 / 1.26 * 100 ≈ 56.3% captured
+    assert row["unrealized_pct"] == pytest.approx(56.349, rel=1e-2)
 
 
 @pytest.mark.asyncio

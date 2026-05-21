@@ -317,6 +317,7 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
         days_in_state = max((today - p.state_changed_at).days, 0)
         dte: int | None = None
         unrealized: float | None = None
+        unrealized_pct: float | None = None
         if p.current_cycle_id:
             cycle = await deps.repos.cycles.get(p.current_cycle_id)
             if cycle:
@@ -326,7 +327,7 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                     if latest_open_option.order_type == OrderType.MULTI_LEG_OPEN:
                         # Multi-leg path: short-leg expiration drives DTE; debit-to-close
                         # nets BOTH legs to compute unrealized vs the original credit.
-                        dte, unrealized = await _multi_leg_dte_and_unrealized(
+                        dte, unrealized, unrealized_pct = await _multi_leg_dte_and_unrealized(
                             deps.broker, latest_open_option, cache, today.date(),
                         )
                     else:
@@ -342,6 +343,12 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                                     * 100
                                     * latest_open_option.quantity
                                 )
+                                if latest_open_option.fill_price > 0:
+                                    unrealized_pct = (
+                                        (latest_open_option.fill_price - mid)
+                                        / latest_open_option.fill_price
+                                        * 100
+                                    )
         out.append(
             {
                 "symbol": p.symbol,
@@ -352,6 +359,7 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 "cost_basis": p.cost_basis,
                 "dte": dte,
                 "unrealized": unrealized,
+                "unrealized_pct": unrealized_pct,
             }
         )
     return out
@@ -362,17 +370,19 @@ async def _multi_leg_dte_and_unrealized(
     order: Order,
     cache: _QuoteCache,
     today: date,
-) -> tuple[int | None, float | None]:
-    """For a MULTI_LEG_OPEN parent order, compute (DTE, unrealized P&L).
+) -> tuple[int | None, float | None, float | None]:
+    """For a MULTI_LEG_OPEN parent order, compute (DTE, unrealized P&L, unrealized %).
 
     DTE comes from the short leg's expiration (the leg with assignment risk).
     Unrealized = (original_credit_per_share − current_debit_per_share) × 100 × qty.
+    Unrealized % = (original − current_debit) / original × 100 — % of original
+    credit captured. Positive = profitable, negative = losing.
     """
     if not order.raw_request:
-        return None, None
+        return None, None, None
     legs = order.raw_request.get("legs") or []
     if not legs:
-        return None, None
+        return None, None, None
 
     short_leg: dict[str, Any] | None = None
     debit_to_close: float = 0.0
@@ -405,9 +415,12 @@ async def _multi_leg_dte_and_unrealized(
             dte = (expiry - today).days
 
     unrealized: float | None = None
+    unrealized_pct: float | None = None
     if have_all_quotes and order.fill_price is not None and order.quantity:
         unrealized = (order.fill_price - debit_to_close) * 100 * order.quantity
-    return dte, unrealized
+        if order.fill_price > 0:
+            unrealized_pct = (order.fill_price - debit_to_close) / order.fill_price * 100
+    return dte, unrealized, unrealized_pct
 
 
 async def _latest_open_option_for_cycle(deps: DashboardDeps, cycle_id: int | None) -> Order | None:
