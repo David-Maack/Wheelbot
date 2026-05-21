@@ -93,7 +93,10 @@ intelligence:
 
   # Per-call output token budgets — also used as the worst-case max for the
   # pre-call budget check.
-  screener_max_tokens: 2048
+  # screener_max_tokens 2048 was too tight for our 32-ticker universe — Opus
+  # truncated mid-JSON and the parser dropped the response. Bumped to 8192
+  # which covers ~80-100 tickers worth of {symbol, score, rationale} entries.
+  screener_max_tokens: 8192
   news_check_max_tokens: 256
   roll_advisor_max_tokens: 384
 
