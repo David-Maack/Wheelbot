@@ -127,6 +127,17 @@ async def _fetch_snapshot(
     return snap
 
 
+def _flatten_yf_columns(df: Any) -> Any:
+    """yfinance >= 0.2.34 returns MultiIndex columns even for single-ticker
+    downloads, so `df["Close"]` becomes a sub-DataFrame and `.mean()` returns
+    a Series instead of a scalar. Collapse to flat columns by taking the
+    field name (level 0). Mirror of the helper in risk/regime.py."""
+    cols = getattr(df, "columns", None)
+    if cols is not None and hasattr(cols, "levels"):
+        df.columns = cols.get_level_values(0)
+    return df
+
+
 def _smas_from_yfinance(symbol: str) -> tuple[float | None, float | None, float | None]:
     try:
         df = yf.download(symbol, period="3mo", interval="1d", progress=False, auto_adjust=False)
@@ -134,6 +145,7 @@ def _smas_from_yfinance(symbol: str) -> tuple[float | None, float | None, float 
         return None, None, None
     if df is None or df.empty or "Close" not in df:
         return None, None, None
+    df = _flatten_yf_columns(df)
     close = df["Close"].dropna()
     s5 = float(close.tail(5).mean()) if len(close) >= 5 else None
     s20 = float(close.tail(20).mean()) if len(close) >= 20 else None
