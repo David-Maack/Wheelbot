@@ -107,8 +107,17 @@ async def propose_close_for_position(
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
 ) -> Proposal | None:
-    """Build a BUY_TO_CLOSE proposal if the active short option is at the
-    profit threshold. Returns None when no trigger fires."""
+    """Build a BUY_TO_CLOSE proposal when any close trigger fires.
+
+    Triggers (independent — any one is sufficient):
+      1. Profit close — current mid ≤ (1 - threshold_pct/100) × original premium
+      2. Time close (Sprint 13 sub-sprint 2) — short-leg DTE ≤ `time_close_dte`.
+         Configured per strategy; omit / set to 0 to disable for this strategy.
+         The 21-DTE rule applies cleanly to monthly_wheel; weekly_wheel lives
+         entirely inside the gamma window so leaving it unset is the default.
+
+    Returns None when no trigger fires (or when quote / order data is missing).
+    """
     today = today or date.today()
     if strategy is None:
         return None
@@ -142,9 +151,21 @@ async def propose_close_for_position(
         )
         return None
 
+    # Profit trigger
     threshold_pct = _threshold_pct(strategy, position.state)
     target_max_mid = (1 - threshold_pct / 100.0) * original_premium
-    if current_mid > target_max_mid:
+    profit_trigger = current_mid <= target_max_mid
+
+    # Time trigger (Sprint 13 sub-sprint 2)
+    time_close_dte_raw = strategy.params.get("time_close_dte")
+    short_dte = (short_order.expiration - today).days
+    time_trigger = (
+        time_close_dte_raw is not None
+        and int(time_close_dte_raw) > 0
+        and short_dte <= int(time_close_dte_raw)
+    )
+
+    if not (profit_trigger or time_trigger):
         return None
 
     contract = OptionContract(
@@ -157,21 +178,33 @@ async def propose_close_for_position(
         ask=current_mid,
         mid=current_mid,
     )
+    state_val = (
+        position.state.value if hasattr(position.state, "value") else str(position.state)
+    )
+    rationale_parts: list[str] = []
+    if profit_trigger:
+        rationale_parts.append(
+            f"profit mid={current_mid:.2f} ≤ target {target_max_mid:.2f} "
+            f"(orig {original_premium:.2f}, pct={threshold_pct})"
+        )
+    if time_trigger:
+        rationale_parts.append(
+            f"time_close dte={short_dte} ≤ {int(time_close_dte_raw)}"
+        )
     rationale = (
-        f"wheel_profit_close[{strategy.id}] state={position.state.value if hasattr(position.state, 'value') else position.state} "
-        f"mid={current_mid:.2f} ≤ target {target_max_mid:.2f} "
-        f"(orig premium={original_premium:.2f}, pct={threshold_pct})"
+        f"wheel_close[{strategy.id}] state={state_val} " + "; ".join(rationale_parts)
     )
     log_checkpoint(
-        "wheel_profit_close_proposed",
+        "wheel_close_proposed",
         status="ok",
         symbol=position.symbol,
         strategy=strategy.id,
         contract=short_order.contract_symbol,
         mid=current_mid,
-        target=target_max_mid,
+        profit_trigger=profit_trigger,
+        time_trigger=time_trigger,
+        short_dte=short_dte,
         original_premium=original_premium,
-        threshold_pct=threshold_pct,
     )
     return Proposal(
         symbol=position.symbol,

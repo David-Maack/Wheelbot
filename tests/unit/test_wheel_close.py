@@ -159,7 +159,8 @@ async def test_csp_close_fires_when_mid_drops_below_threshold(db_repos):
     assert proposal.order_type == OrderType.BUY_TO_CLOSE
     assert proposal.contract.option_type == OptionType.PUT
     assert proposal.quantity == 1
-    assert "wheel_profit_close" in proposal.rationale
+    assert "wheel_close" in proposal.rationale
+    assert "profit" in proposal.rationale
 
 
 @pytest.mark.asyncio
@@ -202,7 +203,8 @@ async def test_cc_close_fires_when_mid_drops_below_threshold(db_repos):
     assert proposal is not None
     assert proposal.order_type == OrderType.BUY_TO_CLOSE
     assert proposal.contract.option_type == OptionType.CALL
-    assert "wheel_profit_close" in proposal.rationale
+    assert "wheel_close" in proposal.rationale
+    assert "profit" in proposal.rationale
 
 
 # -- Threshold lookup --------------------------------------------------------
@@ -311,6 +313,85 @@ async def test_propose_all_closes_walks_active_wheel_positions(db_repos):
     )
     assert len(proposals) == 1
     assert proposals[0].symbol == "F"
+
+
+@pytest.mark.asyncio
+async def test_csp_time_close_fires_when_dte_below_threshold(db_repos):
+    """Sprint 13 sub-sprint 2: time-close on a CSP when DTE ≤ time_close_dte."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Mid 0.80 — well above profit target ($0.50), so profit trigger does NOT fire.
+    # Time trigger should fire because DTE will be 5 (under 21).
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+
+    # Today = expiration - 5 days → DTE = 5.
+    today = date(2025, 6, 1) + timedelta(days=35 - 5)
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=today, strategy=_strategy(time_close_dte=21),
+    )
+    assert proposal is not None
+    assert proposal.order_type == OrderType.BUY_TO_CLOSE
+    assert "time_close" in proposal.rationale
+    assert "profit" not in proposal.rationale  # only time trigger fired
+
+
+@pytest.mark.asyncio
+async def test_cc_time_close_fires_when_dte_below_threshold(db_repos):
+    """Time-close also works on a CC position."""
+    position = await _seed_open_cc(db_repos, fill_price=0.80)
+    broker = PaperBroker()
+    # Mid 0.60 — above profit target ($0.40); profit doesn't fire.
+    broker.seed_quote(Quote(symbol="F250706C00012000", bid=0.59, ask=0.61))
+
+    today = date(2025, 6, 1) + timedelta(days=35 - 10)  # DTE = 10
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=today, strategy=_strategy(time_close_dte=21),
+    )
+    assert proposal is not None
+    assert "time_close" in proposal.rationale
+
+
+@pytest.mark.asyncio
+async def test_time_close_does_not_fire_when_dte_above_threshold(db_repos):
+    """DTE well above threshold + no profit trigger → no close proposal."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+
+    # Today = expiration - 30 days → DTE = 30, above threshold 21.
+    today = date(2025, 6, 1) + timedelta(days=35 - 30)
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=today, strategy=_strategy(time_close_dte=21),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_time_close_disabled_when_param_unset(db_repos):
+    """No time_close_dte in params (e.g. weekly_wheel) → time trigger never fires."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+
+    # DTE 1 — well past the standard 21-day threshold.
+    today = date(2025, 6, 1) + timedelta(days=35 - 1)
+    strategy_no_time_close = StrategyDefinition(
+        id="weekly_wheel",
+        display_name="Weekly Wheel",
+        type="wheel",
+        enabled=True,
+        max_concurrent=4,
+        params={"csp_profit_close_pct": 50},  # no time_close_dte at all
+    )
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=today, strategy=strategy_no_time_close,
+    )
+    # Profit didn't trigger (0.80 > 0.50 target) and time is unset → no proposal.
+    assert proposal is None
 
 
 @pytest.mark.asyncio
