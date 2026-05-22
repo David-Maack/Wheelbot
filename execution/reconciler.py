@@ -318,49 +318,69 @@ class Reconciler:
     ) -> None:
         """Restore position state when an order terminates without filling.
 
-        Scope: multi-leg orders only. Single-leg wheel cancellations are not
-        yet handled — the same gap likely exists but isn't actively hurting
-        production today.
+        Handles both single-leg wheel orders and multi-leg spread orders:
 
-        Defensive: only restores state if the position is currently at
-        SPREAD_PENDING. Positions in MANUAL_INTERVENTION, BROKER_DOWN, or
-        any other state are left alone — the cancellation is just one of
-        several things that could have happened to that position, and the
-        reconciler must not clobber a flag set by another rule.
+          MULTI_LEG_OPEN cancel  → SPREAD_PENDING  → IDLE
+          MULTI_LEG_CLOSE cancel → SPREAD_PENDING  → SPREAD_OPEN (still hold legs)
+          SELL_TO_OPEN (put) cancel  → CSP_PENDING → IDLE
+          SELL_TO_OPEN (call) cancel → CC_PENDING  → SHARES_HELD (still own shares)
+          BUY_TO_CLOSE cancel → no-op (router doesn't change position state on
+                                close placement for wheels, so no restore needed)
+
+        Defensive: only transitions from the matching *_PENDING state.
+        Positions in MANUAL_INTERVENTION, BROKER_DOWN, or any other state
+        are left alone — the cancellation is just one of several things that
+        could have happened to that position, and the reconciler must not
+        clobber a flag set by another rule.
         """
-        if local.order_type not in (
-            OrderType.MULTI_LEG_OPEN, OrderType.MULTI_LEG_CLOSE,
-        ):
-            return
-
         symbol = local.symbol
         position = await self._repos.positions.get_by_symbol(
             self._account_id, symbol, strategy_id=local.strategy_id
         )
-        if position is None or position.state != PositionState.SPREAD_PENDING:
+        if position is None:
             return
 
+        target_state: PositionState | None = None
+        target_cycle_id: int | None = None
+        reason_label = "cancel"
+
         if local.order_type == OrderType.MULTI_LEG_OPEN:
-            # No fill, no cycle was opened — drop straight back to IDLE.
-            await self._set_position_state(
-                position,
-                symbol,
-                PositionState.IDLE,
-                f"cancel_open:{local.client_order_id}",
-                cycle_id=None,
-                strategy_id=local.strategy_id,
-            )
-        else:  # MULTI_LEG_CLOSE
-            # We still hold the legs from the original OPEN fill. Restore the
-            # active state so the close orchestrator can try again next tick.
-            await self._set_position_state(
-                position,
-                symbol,
-                PositionState.SPREAD_OPEN,
-                f"cancel_close:{local.client_order_id}",
-                cycle_id=position.current_cycle_id,
-                strategy_id=local.strategy_id,
-            )
+            if position.state != PositionState.SPREAD_PENDING:
+                return
+            target_state = PositionState.IDLE
+            target_cycle_id = None  # cycle was never opened
+            reason_label = "cancel_open"
+        elif local.order_type == OrderType.MULTI_LEG_CLOSE:
+            if position.state != PositionState.SPREAD_PENDING:
+                return
+            target_state = PositionState.SPREAD_OPEN
+            target_cycle_id = position.current_cycle_id  # cycle still open
+            reason_label = "cancel_close"
+        elif local.order_type == OrderType.SELL_TO_OPEN:
+            # Single-leg wheel entry: CSP_PENDING → IDLE (puts) or
+            # CC_PENDING → SHARES_HELD (calls; we still own the underlying).
+            is_put = local.option_type == OptionType.PUT
+            if is_put and position.state == PositionState.CSP_PENDING:
+                target_state = PositionState.IDLE
+            elif (not is_put) and position.state == PositionState.CC_PENDING:
+                target_state = PositionState.SHARES_HELD
+            else:
+                return  # state doesn't match what we'd expect for this order
+            target_cycle_id = None  # no fill, no cycle opened
+            reason_label = "cancel_open"
+        else:
+            # BUY_TO_CLOSE and other wheel order types: router doesn't move
+            # position to a *_PENDING state on placement, so nothing to undo.
+            return
+
+        await self._set_position_state(
+            position,
+            symbol,
+            target_state,
+            f"{reason_label}:{local.client_order_id}",
+            cycle_id=target_cycle_id,
+            strategy_id=local.strategy_id,
+        )
         summary.cancellations_processed += 1
         log_checkpoint(
             "reconciler_on_cancel",
@@ -369,6 +389,7 @@ class Reconciler:
             strategy=local.strategy_id,
             order_type=local.order_type.value if hasattr(local.order_type, "value") else str(local.order_type),
             broker_status=broker_view.status.value if hasattr(broker_view.status, "value") else str(broker_view.status),
+            new_state=target_state.value,
         )
 
     async def _open_cycle_if_csp(

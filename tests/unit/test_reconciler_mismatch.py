@@ -185,3 +185,152 @@ async def test_unknown_broker_position_is_recorded_with_reason(db_repos):
     assert pos.state == PositionState.MANUAL_INTERVENTION
     reason = pos.state_change_reason or ""
     assert "broker" in reason.lower() or "MYSTERY" in reason
+
+
+# -- Single-leg wheel cancellation handling (Sprint 14) ---------------------
+
+
+@pytest.mark.asyncio
+async def test_csp_pending_returns_to_idle_on_sell_to_open_cancel(db_repos):
+    """Wheel CSP entry cancellation: CSP_PENDING → IDLE on the next reconcile.
+
+    Regression for the 2026-05-21 MARA situation: bot tried to roll into a
+    new weekly CSP after a successful profit-close; the SELL_TO_OPEN got
+    cancelled at the broker, and without _on_cancel the position stuck at
+    CSP_PENDING forever (couldn't propose new entries since the symbol was
+    already 'pending')."""
+    broker = PaperBroker(cash=20_000)
+    rogue = Order(
+        account_id="test",
+        symbol="MARA",
+        order_type=OrderType.SELL_TO_OPEN,
+        contract_symbol="MARA260529P00011000",
+        strike=11.0,
+        expiration=date(2026, 5, 29),
+        option_type=OptionType.PUT,
+        quantity=1,
+        limit_price=0.20,
+        status=OrderStatus.PENDING,
+        placed_at=_utc(),
+        client_order_id="wb-csp-test",
+    )
+    placed = await broker.place_order(rogue)
+    # Persist a local CSP_PENDING row that matches the in-flight order.
+    await db_repos.orders.insert(
+        rogue.model_copy(
+            update={"broker_order_id": placed.broker_order_id, "status": OrderStatus.PENDING},
+        )
+    )
+    await db_repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol="MARA",
+            strategy_id="weekly_wheel",
+            state=PositionState.CSP_PENDING,
+            shares=0,
+            state_changed_at=_utc(),
+        )
+    )
+
+    # Broker cancels the order before fill.
+    await broker.cancel_order(placed.broker_order_id)
+
+    rec = Reconciler(broker, db_repos, _config())
+    summary = await rec.reconcile_once()
+    assert summary.cancellations_processed == 1
+    pos = await db_repos.positions.get_by_symbol("test", "MARA")
+    assert pos.state == PositionState.IDLE
+    assert pos.current_cycle_id is None
+
+
+@pytest.mark.asyncio
+async def test_cc_pending_returns_to_shares_held_on_sell_to_open_cancel(db_repos):
+    """Wheel CC entry cancellation: CC_PENDING → SHARES_HELD (still own underlying)."""
+    broker = PaperBroker(cash=20_000)
+    rogue = Order(
+        account_id="test",
+        symbol="F",
+        order_type=OrderType.SELL_TO_OPEN,
+        contract_symbol="F260620C00012000",
+        strike=12.0,
+        expiration=date(2026, 6, 20),
+        option_type=OptionType.CALL,
+        quantity=1,
+        limit_price=0.30,
+        status=OrderStatus.PENDING,
+        placed_at=_utc(),
+        client_order_id="wb-cc-test",
+    )
+    placed = await broker.place_order(rogue)
+    await db_repos.orders.insert(
+        rogue.model_copy(
+            update={"broker_order_id": placed.broker_order_id, "status": OrderStatus.PENDING},
+        )
+    )
+    await db_repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol="F",
+            strategy_id="monthly_wheel",
+            state=PositionState.CC_PENDING,
+            shares=100,
+            cost_basis=10.0,
+            state_changed_at=_utc(),
+        )
+    )
+
+    await broker.cancel_order(placed.broker_order_id)
+
+    rec = Reconciler(broker, db_repos, _config())
+    summary = await rec.reconcile_once()
+    assert summary.cancellations_processed == 1
+    pos = await db_repos.positions.get_by_symbol("test", "F")
+    # We still own the shares; just no covered call sold against them yet.
+    assert pos.state == PositionState.SHARES_HELD
+    assert pos.shares == 100
+
+
+@pytest.mark.asyncio
+async def test_single_leg_cancel_does_not_clobber_manual_intervention(db_repos):
+    """Defensive guard: position already at MANUAL_INTERVENTION must not be
+    overwritten by a stale single-leg cancellation."""
+    broker = PaperBroker(cash=20_000)
+    rogue = Order(
+        account_id="test",
+        symbol="MARA",
+        order_type=OrderType.SELL_TO_OPEN,
+        contract_symbol="MARA260529P00011000",
+        strike=11.0,
+        expiration=date(2026, 5, 29),
+        option_type=OptionType.PUT,
+        quantity=1,
+        limit_price=0.20,
+        status=OrderStatus.PENDING,
+        placed_at=_utc(),
+        client_order_id="wb-csp-defensive",
+    )
+    placed = await broker.place_order(rogue)
+    await db_repos.orders.insert(
+        rogue.model_copy(
+            update={"broker_order_id": placed.broker_order_id, "status": OrderStatus.PENDING},
+        )
+    )
+    # Position has been flagged by another rule — MUST NOT be auto-reset.
+    await db_repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol="MARA",
+            strategy_id="weekly_wheel",
+            state=PositionState.MANUAL_INTERVENTION,
+            shares=0,
+            state_changed_at=_utc(),
+            state_change_reason="set by another rule",
+        )
+    )
+    await broker.cancel_order(placed.broker_order_id)
+
+    rec = Reconciler(broker, db_repos, _config())
+    summary = await rec.reconcile_once()
+    assert summary.cancellations_processed == 0
+    pos = await db_repos.positions.get_by_symbol("test", "MARA")
+    assert pos.state == PositionState.MANUAL_INTERVENTION  # untouched
