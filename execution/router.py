@@ -38,6 +38,11 @@ class RouterConfig:
     retry_max_attempts: int = 5
     retry_initial_backoff_seconds: float = 1.0
     retry_max_backoff_seconds: float = 60.0
+    # Cancel-and-replace any PENDING/PARTIAL order whose deterministic
+    # client_order_id matches the new proposal AND has been pending longer
+    # than this threshold. Avoids the broker-side "client_order_id must be
+    # unique" rejection cycle when market moves past the stale limit.
+    stale_pending_minutes: float = 15.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +56,7 @@ class RouteResult:
     news_decision: str | None = None  # "proceed" | "caution" | "block" | None
     news_rationale: str | None = None
     quantity_adjusted: int | None = None  # final qty if news_check forced a halve
+    skipped_duplicate_pending: bool = False  # active PENDING order, too young to replace
 
 
 def _utcnow() -> datetime:
@@ -119,6 +125,7 @@ def _router_config(config: dict[str, Any]) -> RouterConfig:
         retry_max_attempts=int(section.get("retry_max_attempts", 5)),
         retry_initial_backoff_seconds=float(section.get("retry_initial_backoff_seconds", 1.0)),
         retry_max_backoff_seconds=float(section.get("retry_max_backoff_seconds", 60.0)),
+        stale_pending_minutes=float(section.get("stale_pending_minutes", 15.0)),
     )
 
 
@@ -154,6 +161,70 @@ class OrderRouter:
         # NewsCheckResult-shaped object with .decision / .rationale. Optional —
         # tests pass a stub or None to disable.
         self._news_checker = news_checker
+
+    async def _replace_stale_pending(
+        self, client_id: str, proposal_label: str
+    ) -> tuple[str, str | None]:
+        """Pre-submission stale-order handler.
+
+        Looks up any existing local order with the deterministic
+        `client_id`. If it's still active (PENDING / PARTIAL), decides
+        whether to skip the new submission (order is fresh enough that the
+        broker may still fill the prior limit) or cancel-and-replace
+        (order has been stale longer than `stale_pending_minutes`).
+
+        Returns (action, replacement_id):
+          "proceed"  → submit normally with the original client_id
+          "skip"     → caller returns a RouteResult marked skipped_duplicate_pending
+          "replace"  → submit with the returned (unique) replacement client_id;
+                       prior order already cancelled at broker + marked CANCELLED locally.
+        """
+        existing = await self._repos.orders.get_by_client_id(client_id)
+        if existing is None or existing.status not in (
+            OrderStatus.PENDING, OrderStatus.PARTIAL,
+        ):
+            return ("proceed", None)
+        now = _utcnow()
+        age_min = (now - existing.placed_at).total_seconds() / 60.0
+        if age_min < self._cfg.stale_pending_minutes:
+            log_checkpoint(
+                "router_skip_duplicate_pending",
+                status="skip",
+                client_order_id=client_id,
+                proposal=proposal_label,
+                age_min=round(age_min, 1),
+                threshold_min=self._cfg.stale_pending_minutes,
+            )
+            return ("skip", None)
+        # Stale — cancel at broker, mark CANCELLED locally, replace with new id.
+        if existing.broker_order_id:
+            try:
+                await self._broker.cancel_order(existing.broker_order_id)
+            except Exception as exc:
+                log_checkpoint(
+                    "router_cancel_stale_fail",
+                    status="fail",
+                    client_order_id=client_id,
+                    broker_order_id=existing.broker_order_id,
+                    error=str(exc),
+                )
+                # Cancel failed — bail rather than risk a duplicate at the broker.
+                return ("skip", None)
+        if existing.id is not None:
+            status_val = OrderStatus.CANCELLED.value if hasattr(
+                OrderStatus.CANCELLED, "value"
+            ) else "CANCELLED"
+            await self._repos.orders.update(existing.id, status=status_val)
+        new_id = f"{client_id}-r{int(now.timestamp())}"
+        log_checkpoint(
+            "router_replace_stale_pending",
+            status="ok",
+            old_client_order_id=client_id,
+            new_client_order_id=new_id,
+            broker_order_id_cancelled=existing.broker_order_id,
+            age_min=round(age_min, 1),
+        )
+        return ("replace", new_id)
 
     async def place(
         self,
@@ -256,7 +327,24 @@ class OrderRouter:
                 quantity_adjusted=effective_qty if news_decision == "caution" else None,
             )
 
-        order = self._build_order(proposal, today=today)
+        # Pre-submission: handle a stale PENDING order with the same
+        # deterministic client_order_id (Sprint 14 — Option B). Either skip
+        # (still fresh) or cancel + replace with a unique id.
+        base_client_id = _client_order_id(proposal, today)
+        action, replacement_id = await self._replace_stale_pending(
+            base_client_id, f"{proposal.symbol} {proposal.order_type.value}",
+        )
+        if action == "skip":
+            return RouteResult(
+                proposal=proposal,
+                placed=None,
+                skipped_duplicate_pending=True,
+                news_decision=news_decision,
+                news_rationale=news_rationale,
+            )
+        effective_client_id = replacement_id if action == "replace" else base_client_id
+
+        order = self._build_order(proposal, today=today, client_order_id=effective_client_id)
         placed = await self._submit_with_retry(order, sleep=sleep)
 
         # DB writes. Order first; position state second.
@@ -318,7 +406,17 @@ class OrderRouter:
             )
             return RouteResult(proposal=proposal, placed=None, dry_run=True)
 
-        client_id = _multi_leg_client_order_id(proposal, today)
+        base_client_id = _multi_leg_client_order_id(proposal, today)
+        action, replacement_id = await self._replace_stale_pending(
+            base_client_id, f"{proposal.symbol} {proposal.order_type.value}",
+        )
+        if action == "skip":
+            return RouteResult(
+                proposal=proposal,
+                placed=None,
+                skipped_duplicate_pending=True,
+            )
+        client_id = replacement_id if action == "replace" else base_client_id
         limit_price = round(proposal.net_credit_per_spread, 2)
 
         last_exc: Exception | None = None
@@ -366,7 +464,13 @@ class OrderRouter:
 
     # -- Internals ------------------------------------------------------------
 
-    def _build_order(self, proposal: Proposal, *, today: date | None) -> Order:
+    def _build_order(
+        self,
+        proposal: Proposal,
+        *,
+        today: date | None,
+        client_order_id: str | None = None,
+    ) -> Order:
         contract = proposal.contract
         return Order(
             account_id=self._config.get("account", {}).get("id", "primary"),
@@ -381,7 +485,7 @@ class OrderRouter:
             limit_price=_option_limit_price(contract.bid, contract.ask),
             status=OrderStatus.PENDING,
             placed_at=_utcnow(),
-            client_order_id=_client_order_id(proposal, today),
+            client_order_id=client_order_id or _client_order_id(proposal, today),
         )
 
     async def _submit_with_retry(

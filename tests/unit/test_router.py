@@ -117,15 +117,20 @@ async def test_risk_failure_short_circuits_and_no_writes(db_repos):
 
 @pytest.mark.asyncio
 async def test_idempotent_resubmit_with_same_client_id(db_repos):
+    """Double-submit safety: second call within the stale-pending window
+    detects the same client_order_id is already PENDING locally and skips
+    the submission entirely (no broker-side dedup needed)."""
     broker = PaperBroker(cash=20_000)
     router = OrderRouter(broker, db_repos, _config(), _universe())
     first = await router.place(_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
     second = await router.place(_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
-    assert first.placed.client_order_id == second.placed.client_order_id
-    assert first.placed.broker_order_id == second.placed.broker_order_id
-    # Only one orders row.
+    assert first.placed is not None
+    assert second.placed is None
+    assert second.skipped_duplicate_pending is True
+    # Only one orders row — first call created it; second skipped before insert.
     rows = await db_repos.orders.list_recent("test")
     assert len(rows) == 1
+    assert rows[0].client_order_id == first.placed.client_order_id
 
 
 @pytest.mark.asyncio
@@ -217,3 +222,107 @@ async def test_client_order_id_is_deterministic_per_day():
     p2 = _proposal()
     assert _client_order_id(p1, date(2025, 6, 1)) == _client_order_id(p2, date(2025, 6, 1))
     assert _client_order_id(p1, date(2025, 6, 1)) != _client_order_id(p1, date(2025, 6, 2))
+
+
+# -- Stale PENDING handling (Sprint 14) -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_skipped_when_fresh(db_repos, monkeypatch):
+    """A PENDING order with the same client_order_id placed minutes ago is
+    NOT replaced — broker may still fill the original limit."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    from core.models import Order
+    broker = PaperBroker(cash=20_000)
+    cfg = _config()
+    cfg["execution"]["stale_pending_minutes"] = 15.0
+    router = OrderRouter(broker, db_repos, cfg, _universe())
+    proposal = _proposal()
+    from execution.router import _client_order_id
+    cid = _client_order_id(proposal, date(2025, 6, 1))
+    # Seed an existing PENDING order with the same client_order_id, placed 2 min ago.
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await db_repos.orders.insert(
+        Order(
+            account_id="test",
+            symbol="F",
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol="F250706P00009500",
+            strike=9.5, expiration=date(2025, 7, 6), option_type=OptionType.PUT,
+            quantity=1, limit_price=0.40,
+            status=OrderStatus.PENDING,
+            placed_at=now - timedelta(minutes=2),
+            client_order_id=cid,
+            broker_order_id="broker-existing-1",
+        )
+    )
+    result = await router.place(proposal, sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert result.placed is None
+    assert result.skipped_duplicate_pending is True
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_cancelled_and_replaced(db_repos, monkeypatch):
+    """A PENDING order older than the threshold is cancelled at the broker
+    and the new proposal goes through with a fresh client_order_id."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    from core.models import Order
+    broker = PaperBroker(cash=20_000)
+    # Pre-place the "stale" order at the broker so cancel_order finds it.
+    stale_placed = await broker.place_order(
+        Order(
+            account_id="test",
+            symbol="F",
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol="F250706P00009500",
+            strike=9.5, expiration=date(2025, 7, 6), option_type=OptionType.PUT,
+            quantity=1, limit_price=0.40,
+            status=OrderStatus.PENDING,
+            placed_at=datetime.now(UTC).replace(tzinfo=None),
+            client_order_id="some-existing-broker-id",
+        )
+    )
+    cfg = _config()
+    cfg["execution"]["stale_pending_minutes"] = 5.0
+    router = OrderRouter(broker, db_repos, cfg, _universe())
+    proposal = _proposal()
+    from execution.router import _client_order_id
+    cid = _client_order_id(proposal, date(2025, 6, 1))
+    # Persist local record with the stale-aged placed_at, referencing the broker order.
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await db_repos.orders.insert(
+        Order(
+            account_id="test",
+            symbol="F",
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol="F250706P00009500",
+            strike=9.5, expiration=date(2025, 7, 6), option_type=OptionType.PUT,
+            quantity=1, limit_price=0.40,
+            status=OrderStatus.PENDING,
+            placed_at=now - timedelta(minutes=30),  # well past 5-min threshold
+            client_order_id=cid,
+            broker_order_id=stale_placed.broker_order_id,
+        )
+    )
+
+    result = await router.place(proposal, sleep=_noop_sleep, today=date(2025, 6, 1))
+
+    # New order DID place — replacement client_order_id, not the stale one.
+    assert result.placed is not None
+    assert result.placed.client_order_id != cid
+    assert result.placed.client_order_id.startswith(f"{cid}-r")
+    # Broker shows the stale order as CANCELLED.
+    stale_after = broker._orders[stale_placed.broker_order_id]
+    assert stale_after.status == OrderStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_no_existing_pending_proceeds_normally(db_repos, monkeypatch):
+    """Regression: when nothing exists with the client_order_id, place flows
+    through unchanged."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    result = await router.place(_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert result.placed is not None
+    assert result.skipped_duplicate_pending is False

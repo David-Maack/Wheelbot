@@ -397,6 +397,8 @@ async def test_router_places_multi_leg_via_paper_broker(db_repos):
 
 @pytest.mark.asyncio
 async def test_router_multi_leg_idempotent_on_resubmit(db_repos):
+    """Double-submit safety on multi-leg: second call within the stale-pending
+    window skips submission locally instead of relying on broker dedup."""
     broker = PaperBroker(cash=20_000)
     router = OrderRouter(broker, db_repos, _router_config(), _universe())
     first = await router.place_multi_leg(
@@ -405,7 +407,9 @@ async def test_router_multi_leg_idempotent_on_resubmit(db_repos):
     second = await router.place_multi_leg(
         _spread_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1)
     )
-    assert first.placed.broker_order_id == second.placed.broker_order_id
+    assert first.placed is not None
+    assert second.placed is None
+    assert second.skipped_duplicate_pending is True
     rows = await db_repos.orders.list_recent("test")
     assert len(rows) == 1
 
