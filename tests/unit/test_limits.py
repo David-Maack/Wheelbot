@@ -571,3 +571,162 @@ async def test_concurrent_total_allows_management_when_over_cap(db_repos, monkey
     statuses = {r.rule: r.status for r in res.results}
     assert statuses["concurrent_total_cap"] == "skip"
     assert statuses["concurrent_positions_cap"] == "skip"
+
+
+# -- Tier-2 LLM screen gate (Sprint 14) -------------------------------------
+
+
+def _tier2_universe() -> dict:
+    return {
+        "tickers": [
+            UniverseEntry(symbol="F", name="Ford", tier=1, overrides={}),
+            UniverseEntry(symbol="HOOD", name="Robinhood", tier=2, overrides={}),
+        ],
+        "banned": [],
+        "banned_rules": [],
+    }
+
+
+def _hood_proposal() -> Proposal:
+    today = date(2025, 6, 1)
+    contract = OptionContract(
+        underlying="HOOD",
+        occ_symbol="HOOD250706P00070000",
+        strike=70.0,
+        expiration=today + timedelta(days=35),
+        option_type=OptionType.PUT,
+        bid=0.39, ask=0.41, delta=-0.25,
+        open_interest=1000, volume=200,
+    )
+    return Proposal(
+        symbol="HOOD",
+        contract=contract,
+        order_type=OrderType.SELL_TO_OPEN,
+        quantity=1,
+        rationale="csp test",
+        strategy_id="weekly_wheel",
+    )
+
+
+async def _seed_candidate(db_repos, *, symbol: str, score: float, run_date: str | None = None):
+    """Insert a candidates row for today (or given date)."""
+    import datetime as _dt
+    if run_date is None:
+        run_date = _dt.date.today().isoformat()
+    conn = await db_repos.db.connect()
+    await conn.execute(
+        "INSERT INTO candidates (run_date, symbol, score, rationale) "
+        "VALUES (?, ?, ?, ?)",
+        (run_date, symbol, score, "test rationale"),
+    )
+    await conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_tier2_screen_skips_when_screener_disabled(db_repos, monkeypatch):
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    cfg = _config()
+    cfg["intelligence"] = {"llm_screener_enabled": False}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
+    res = await gate.evaluate(_hood_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["tier2_screen"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_tier2_screen_bypasses_tier1(db_repos, monkeypatch):
+    """F is tier-1 — the screener gate must skip it."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    cfg = _config()
+    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["tier2_screen"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_tier2_screen_fails_when_no_candidate_row(db_repos, monkeypatch):
+    """Tier-2 entry with no LLM screener row today → fail (screener didn't run)."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    cfg = _config()
+    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
+    res = await gate.evaluate(_hood_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["tier2_screen"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_tier2_screen_passes_with_high_score(db_repos, monkeypatch):
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_candidate(db_repos, symbol="HOOD", score=72.0)
+    cfg = _config()
+    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
+    res = await gate.evaluate(_hood_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["tier2_screen"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_tier2_screen_fails_when_score_below_threshold(db_repos, monkeypatch):
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_candidate(db_repos, symbol="HOOD", score=42.0)
+    cfg = _config()
+    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
+    res = await gate.evaluate(_hood_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["tier2_screen"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_tier2_screen_skips_bear_call_direction(db_repos, monkeypatch):
+    """Bear-call direction must bypass — current screener prompt is bull-biased."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    # No candidate row, low score, etc. — none of it matters; bear-call bypasses.
+    cfg = _config()
+    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
+    bear_call_universe = {
+        "tickers": [UniverseEntry(symbol="WBA", name="Walgreens", tier=2, overrides={})],
+        "banned": [], "banned_rules": [],
+    }
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, bear_call_universe)
+    bc_proposal = _multi_leg_proposal(direction="bear_call")
+    # Override symbol to WBA for this test.
+    from strategies.spreads import MultiLegProposal
+    bc_proposal = MultiLegProposal(
+        symbol="WBA",
+        legs=bc_proposal.legs,
+        net_credit_per_spread=bc_proposal.net_credit_per_spread,
+        max_loss_per_spread=bc_proposal.max_loss_per_spread,
+        width_dollars=bc_proposal.width_dollars,
+        quantity=bc_proposal.quantity,
+        rationale=bc_proposal.rationale,
+        strategy_id="bear_call_spread",
+        direction="bear_call",
+    )
+    res = await gate.evaluate(bc_proposal, today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["tier2_screen"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_tier2_screen_skips_closes(db_repos, monkeypatch):
+    """BUY_TO_CLOSE on a tier-2 position must bypass — this is an entry gate."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    cfg = _config()
+    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
+    close_proposal = Proposal(
+        symbol="HOOD",
+        contract=_hood_proposal().contract,
+        order_type=OrderType.BUY_TO_CLOSE,
+        quantity=1,
+        rationale="close",
+        strategy_id="weekly_wheel",
+    )
+    res = await gate.evaluate(close_proposal, today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["tier2_screen"] == "skip"

@@ -124,6 +124,7 @@ class RiskGate:
             await self._rule_concurrent_total(result, proposal)
             await self._rule_earnings_multi_leg(result, proposal, params, today)
             await self._rule_regime_multi_leg(result, proposal, params)
+            await self._rule_tier2_screen(result, proposal)
         else:
             await self._rule_buying_power(result, proposal, account, params)
             await self._rule_position_cap(result, proposal, account, params)
@@ -133,6 +134,7 @@ class RiskGate:
             self._rule_cc_strike_floor(result, proposal)
             self._rule_liquidity(result, proposal, params)
             await self._rule_regime(result, proposal, params)
+            await self._rule_tier2_screen(result, proposal)
 
         log_checkpoint(
             "risk_gate",
@@ -475,3 +477,87 @@ class RiskGate:
             result.add("regime", "fail", "current regime snapshot disallows new CSPs")
         else:
             result.add("regime", "pass")
+
+    # --- Rule 8 (Sprint 14) — Tier-2 LLM screen --------------------------------
+    async def _rule_tier2_screen(
+        self,
+        result: RiskCheckResult,
+        proposal: Proposal | MultiLegProposal,
+    ) -> None:
+        """Tier-2 tickers require an LLM-screener candidate row from today
+        with a score at or above the configured threshold. Spec §6 intent:
+        tier-2 names carry catalyst / news risk that the rule-based selector
+        doesn't see; the LLM has 7 days of headlines + earnings calendar.
+
+        Skips when:
+          - LLM screener disabled in config
+          - Order is a close (this is an entry gate, not a close trigger)
+          - Bearish-direction proposals (bear_call_spread) — current screener
+            prompt is bullish-biased; using it to gate bear-calls would be
+            wrong. Separate bearish screener is a future feature.
+          - Ticker is tier-1 (the LLM doesn't add edge on mega-caps / ETFs
+            we already trust)
+          - Ticker isn't in the universe at all (shouldn't happen — but skip)
+        """
+        intel = self._config.get("intelligence", {}) or {}
+        if not bool(intel.get("llm_screener_enabled", False)):
+            result.add("tier2_screen", "skip", "screener disabled")
+            return
+
+        # Closes always pass — entry gate only.
+        if proposal.order_type in (
+            OrderType.BUY_TO_CLOSE, OrderType.SELL_TO_CLOSE,
+            OrderType.MULTI_LEG_CLOSE,
+        ):
+            result.add("tier2_screen", "skip", "close — gate is entry-only")
+            return
+
+        # Bear-call direction: current screener prompt is bullish-biased.
+        if isinstance(proposal, MultiLegProposal) and proposal.direction == "bear_call":
+            result.add(
+                "tier2_screen", "skip",
+                "bear_call direction — screener is bullish-biased",
+            )
+            return
+
+        # Look up universe entry; tier-1 bypasses the rule.
+        symbol = proposal.symbol.upper()
+        entry = None
+        for t in self._universe.get("tickers", []):
+            if t.symbol.upper() == symbol:
+                entry = t
+                break
+        if entry is None:
+            result.add("tier2_screen", "skip", f"{symbol} not in universe")
+            return
+        if entry.tier != 2:
+            result.add("tier2_screen", "skip", f"{symbol} is tier-{entry.tier}")
+            return
+
+        # Tier-2 entry — require today's candidate row with score >= threshold.
+        threshold = float(intel.get("tier2_min_score", 50.0))
+        c = await self._repos.db.connect()
+        async with c.execute(
+            "SELECT score FROM candidates "
+            "WHERE symbol = ? AND run_date = date('now') "
+            "ORDER BY score DESC LIMIT 1",
+            (symbol,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            result.add(
+                "tier2_screen", "fail",
+                f"no LLM screener row for tier-2 {symbol} today — screener may not have run",
+            )
+            return
+        score = float(row["score"]) if row["score"] is not None else 0.0
+        if score < threshold:
+            result.add(
+                "tier2_screen", "fail",
+                f"LLM score {score:.1f} < threshold {threshold:.1f} for {symbol}",
+            )
+        else:
+            result.add(
+                "tier2_screen", "pass",
+                f"LLM score {score:.1f} ≥ {threshold:.1f} for {symbol}",
+            )

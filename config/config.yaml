@@ -99,6 +99,13 @@ intelligence:
   # max. screener at 4096 covers ~50 ticker entries (we have 32), keeps
   # worst-case cost ~$0.38 under the $1.00 / day cap with room for news+retries.
   screener_max_tokens: 4096
+
+  # Sprint 14: tier-2 LLM screen gate. Tier-2 ticker entries (HOOD, PLTR,
+  # COIN, MARA, RIVN, AAL, PLUG, WBA) require a candidate row from today's
+  # screener run with score >= this threshold. Tier-1 tickers bypass.
+  # Bear-call direction also bypasses — current screener prompt is bullish
+  # biased; using it to gate bear-calls would be wrong direction.
+  tier2_min_score: 50
   news_check_max_tokens: 256
   roll_advisor_max_tokens: 384
 
