@@ -217,6 +217,9 @@ async def propose_all(
     strategy: StrategyDefinition | None = None,
 ) -> list[Proposal]:
     out: list[Proposal] = []
+    universe_symbols = {t.symbol.upper() for t in universe["tickers"]}
+
+    # 1. Universe tickers — full state dispatch (entries + management).
     for entry in universe["tickers"]:
         proposal = await propose_for_symbol(
             broker, repos, entry.symbol, config, universe, ivr,
@@ -224,6 +227,37 @@ async def propose_all(
         )
         if proposal is not None:
             out.append(proposal)
+
+    # 2. Orphan positions — symbols this strategy owns whose ticker is no
+    #    longer in the universe (typically because the operator moved the
+    #    symbol to a different strategy mid-cycle, or removed it entirely).
+    #    Manage SHARES_HELD only here so the orchestrator can sell covered
+    #    calls and complete the wheel cycle. New CSP entries (IDLE state)
+    #    stay gated by universe membership — we don't want to re-open new
+    #    exposure on a symbol the operator removed.
+    #    CSP_OPEN / CC_OPEN closes are already orphan-safe via wheel_close.py.
+    if strategy is not None:
+        account_id = config.get("account", {}).get("id", "primary")
+        active = await repos.positions.list_active(account_id, strategy_id=strategy.id)
+        for pos in active:
+            if pos.symbol.upper() in universe_symbols:
+                continue  # already handled in the loop above
+            if pos.state != PositionState.SHARES_HELD:
+                continue  # IDLE: no entries; CSP_OPEN/CC_OPEN: handled elsewhere
+            log_checkpoint(
+                "wheel_orphan_managed",
+                status="ok",
+                symbol=pos.symbol,
+                strategy=strategy.id,
+                state=str(pos.state),
+            )
+            proposal = await propose_for_symbol(
+                broker, repos, pos.symbol, config, universe, ivr,
+                today=today, strategy=strategy,
+            )
+            if proposal is not None:
+                out.append(proposal)
+
     log_checkpoint(
         "wheel_propose_all",
         status="ok",

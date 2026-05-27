@@ -7,8 +7,9 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from core.models import OptionContract, OptionType, Position, PositionState, Quote, UniverseEntry
+from core.strategies import StrategyDefinition
 from platforms.paper_broker import PaperBroker
-from strategies.wheel import propose_for_symbol
+from strategies.wheel import propose_all, propose_for_symbol
 
 
 class _FakePositionsRepo:
@@ -189,3 +190,112 @@ async def test_tier_3_marks_proposal_requires_human():
     )
     assert proposal is not None
     assert proposal.requires_human is True
+
+
+# -- Orphan position management (Sprint 14) ---------------------------------
+
+
+def _strategy_def() -> StrategyDefinition:
+    return StrategyDefinition(
+        id="weekly_wheel",
+        display_name="Weekly Wheel",
+        type="wheel",
+        enabled=True,
+        max_concurrent=4,
+        params={"csp_delta_min": 0.20, "csp_delta_max": 0.30,
+                "cc_delta_min": 0.20, "cc_delta_max": 0.30,
+                "dte_min": 7, "dte_max": 14,
+                "open_interest_min": 100, "volume_min": 50,
+                "bid_ask_spread_max_pct": 10.0},
+    )
+
+
+@pytest.mark.asyncio
+async def test_propose_all_manages_orphan_shares_held_outside_universe(db_repos):
+    """Regression for the 2026-05-22 COIN situation: position assigned under
+    weekly_wheel but the symbol is no longer in weekly_wheel's universe.
+    The orchestrator must still propose a covered call so the wheel cycle
+    can complete (called-away or CC expires → IDLE)."""
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="ORPHAN", bid=180.0, ask=180.5))
+    broker.seed_chain("ORPHAN", [
+        OptionContract(
+            underlying="ORPHAN",
+            occ_symbol="ORPHAN250706C00185000",
+            strike=185.0,
+            expiration=date(2025, 6, 1) + timedelta(days=10),
+            option_type=OptionType.CALL,
+            bid=2.50, ask=2.60, delta=0.22,
+            open_interest=500, volume=100,
+        ),
+    ])
+    # Position exists under weekly_wheel but is not in the universe.
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await db_repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol="ORPHAN",
+            strategy_id="weekly_wheel",
+            state=PositionState.SHARES_HELD,
+            shares=100,
+            cost_basis=180.0,
+            state_changed_at=now,
+        )
+    )
+    # Universe contains a different ticker — ORPHAN is NOT in it.
+    other_universe = {
+        "tickers": [UniverseEntry(symbol="F", tier=1, strategies=["weekly_wheel"])],
+        "banned": [], "banned_rules": [],
+    }
+    broker.seed_chain("F", [])  # no chain → no proposal from F
+
+    proposals = await propose_all(
+        broker, db_repos, _config(), other_universe, _NullIvr(),
+        today=date(2025, 6, 1), strategy=_strategy_def(),
+    )
+    # Should have at least one CC proposal on the orphan ORPHAN position.
+    orphan_proposals = [p for p in proposals if p.symbol == "ORPHAN"]
+    assert len(orphan_proposals) == 1
+    assert orphan_proposals[0].contract.option_type == OptionType.CALL
+
+
+@pytest.mark.asyncio
+async def test_propose_all_does_not_open_new_csp_on_orphan_idle(db_repos):
+    """Orphan position in IDLE state must NOT trigger a new CSP entry — the
+    operator removed the symbol from the universe for a reason."""
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="ORPHAN", bid=10.0, ask=10.04))
+    broker.seed_chain("ORPHAN", [
+        OptionContract(
+            underlying="ORPHAN",
+            occ_symbol="ORPHAN250706P00009500",
+            strike=9.5,
+            expiration=date(2025, 6, 1) + timedelta(days=10),
+            option_type=OptionType.PUT,
+            bid=0.30, ask=0.32, delta=-0.25,
+            open_interest=500, volume=100,
+        ),
+    ])
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await db_repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol="ORPHAN",
+            strategy_id="weekly_wheel",
+            state=PositionState.IDLE,
+            shares=0,
+            state_changed_at=now,
+        )
+    )
+    other_universe = {
+        "tickers": [UniverseEntry(symbol="F", tier=1, strategies=["weekly_wheel"])],
+        "banned": [], "banned_rules": [],
+    }
+    broker.seed_chain("F", [])
+
+    proposals = await propose_all(
+        broker, db_repos, _config(), other_universe, _NullIvr(),
+        today=date(2025, 6, 1), strategy=_strategy_def(),
+    )
+    # No new entry on the orphan IDLE position.
+    assert all(p.symbol != "ORPHAN" for p in proposals)
