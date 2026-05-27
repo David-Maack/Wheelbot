@@ -251,16 +251,23 @@ class RiskGate:
         account_id = account_section.get("id", "primary")
         active = await self._repos.positions.list_active(account_id)  # no strategy filter
         symbol = proposal.symbol.upper()
-        # If the same symbol is already active (possibly under another strategy),
-        # this proposal doesn't add a "new" slot. Closes / CCs on existing
-        # positions are management, not new exposure — skip the cap entirely
-        # so we can still wind down positions when over-cap.
-        new_slot = not any(p.symbol.upper() == symbol for p in active)
+        # A position is uniquely identified by (account, symbol, strategy_id).
+        # The cap-skip "managing existing" path applies ONLY when the proposal
+        # is for the SAME (symbol, strategy) pair already active. A proposal
+        # for a different strategy on the same symbol (e.g. put_spread on
+        # COIN when weekly_wheel already holds COIN shares) is genuinely new
+        # exposure and must be subject to the cap.
+        strategy_id = proposal.strategy_id
+        new_slot = not any(
+            p.symbol.upper() == symbol and p.strategy_id == strategy_id
+            for p in active
+        )
         if not new_slot:
             result.add(
                 "concurrent_total_cap",
                 "skip",
-                f"managing existing position on {symbol} (active total={len(active)})",
+                f"managing existing {strategy_id} position on {symbol} "
+                f"(active total={len(active)})",
             )
             return
         projected = len(active) + 1

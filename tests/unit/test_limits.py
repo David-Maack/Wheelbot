@@ -507,6 +507,49 @@ async def test_concurrent_total_allows_proposal_on_existing_symbol_at_cap(db_rep
 
 
 @pytest.mark.asyncio
+async def test_concurrent_total_blocks_new_strategy_on_same_symbol_at_cap(db_repos, monkeypatch):
+    """Regression for 2026-05-27 COIN incident: orphan-management cap-skip
+    must NOT leak through to a new position on a different strategy that
+    happens to share the symbol. Same-symbol cap-skip only applies to the
+    same (symbol, strategy) pair."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    # 4 active positions, including COIN under weekly_wheel (SHARES_HELD).
+    await _seed_active_position(db_repos, symbol="COIN", strategy_id="weekly_wheel", state="SHARES_HELD")
+    await _seed_active_position(db_repos, symbol="BBB", strategy_id="weekly_wheel")
+    await _seed_active_position(db_repos, symbol="CCC", strategy_id="put_spread", state="SPREAD_OPEN")
+    await _seed_active_position(db_repos, symbol="DDD", strategy_id="bear_call_spread", state="SPREAD_OPEN")
+
+    cfg = _config()
+    cfg["account"]["max_concurrent_total"] = 4
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+
+    # Build a MultiLegProposal on COIN under put_spread (different strategy
+    # from the existing COIN/weekly_wheel SHARES_HELD position).
+    coin_proposal = _multi_leg_proposal(direction="bull_put")
+    # _multi_leg_proposal builds with symbol="F" by default; override fields
+    # to make it a COIN proposal under put_spread.
+    from core.models import OrderLeg
+    from strategies.spreads import MultiLegProposal
+    coin_proposal = MultiLegProposal(
+        symbol="COIN",
+        legs=coin_proposal.legs,
+        net_credit_per_spread=1.50,
+        max_loss_per_spread=350.0,
+        width_dollars=5.0,
+        quantity=1,
+        rationale="put_spread on COIN",
+        strategy_id="put_spread",
+        direction="bull_put",
+    )
+
+    res = await gate.evaluate(coin_proposal, today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    # Different strategy on same symbol = NEW exposure, must NOT skip the cap.
+    # Account is at-cap (4 active) and this would add a 5th → fail.
+    assert statuses["concurrent_total_cap"] == "fail"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_total_allows_management_when_over_cap(db_repos, monkeypatch):
     """Regression for 2026-05-27 COIN situation: account is OVER cap due to
     historical positions opened before the cap was tightened. CC proposal on
