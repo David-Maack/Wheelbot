@@ -152,7 +152,8 @@ async def test_concurrent_cap_does_not_double_count_existing_symbol(db_repos, mo
     gate = RiskGate(broker, db_repos, _config(max_concurrent_positions=4), _universe())
     res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
     statuses = {r.rule: r.status for r in res.results}
-    assert statuses["concurrent_positions_cap"] == "pass"
+    # Existing position on F → managing, not adding a new slot → rule skips.
+    assert statuses["concurrent_positions_cap"] == "skip"
 
 
 @pytest.mark.asyncio
@@ -487,7 +488,9 @@ async def test_concurrent_total_blocks_new_entry_at_cap_across_strategies(db_rep
 
 @pytest.mark.asyncio
 async def test_concurrent_total_allows_proposal_on_existing_symbol_at_cap(db_repos, monkeypatch):
-    """At cap, but the proposal is on a symbol we already hold → no new slot, passes."""
+    """At cap, but the proposal is on a symbol we already hold → managing an
+    existing position, cap skipped entirely. Critical for orphan-position
+    management when the account is over-cap from historical opens."""
     monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
     # 4 active including F (the proposal symbol from _proposal()).
     await _seed_active_position(db_repos, symbol="F", strategy_id="monthly_wheel")
@@ -500,4 +503,28 @@ async def test_concurrent_total_allows_proposal_on_existing_symbol_at_cap(db_rep
     gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
     res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
     statuses = {r.rule: r.status for r in res.results}
-    assert statuses["concurrent_total_cap"] == "pass"
+    assert statuses["concurrent_total_cap"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_total_allows_management_when_over_cap(db_repos, monkeypatch):
+    """Regression for 2026-05-27 COIN situation: account is OVER cap due to
+    historical positions opened before the cap was tightened. CC proposal on
+    a SHARES_HELD position must still pass — managing existing exposure is
+    not subject to the cap."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    # 5 active positions including F (over the cap of 4).
+    await _seed_active_position(db_repos, symbol="F", strategy_id="monthly_wheel", state="SHARES_HELD")
+    await _seed_active_position(db_repos, symbol="AAA", strategy_id="monthly_wheel")
+    await _seed_active_position(db_repos, symbol="BBB", strategy_id="weekly_wheel")
+    await _seed_active_position(db_repos, symbol="CCC", strategy_id="put_spread", state="SPREAD_OPEN")
+    await _seed_active_position(db_repos, symbol="DDD", strategy_id="bear_call_spread", state="SPREAD_OPEN")
+
+    cfg = _config()
+    cfg["account"]["max_concurrent_total"] = 4
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    # Proposal on F (existing symbol) — both caps should skip, not fail.
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["concurrent_total_cap"] == "skip"
+    assert statuses["concurrent_positions_cap"] == "skip"

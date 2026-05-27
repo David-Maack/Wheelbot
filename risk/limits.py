@@ -204,7 +204,18 @@ class RiskGate:
         )
         symbol = proposal.symbol.upper()
         new_slot = not any(p.symbol.upper() == symbol for p in active)
-        projected = len(active) + (1 if new_slot else 0)
+        if not new_slot:
+            # Managing an existing position (CC on SHARES_HELD, close, roll,
+            # etc.) doesn't add new exposure — skip the cap entirely. This
+            # also handles the case where we're already over-cap from
+            # historical opens before the cap was tightened.
+            result.add(
+                "concurrent_positions_cap",
+                "skip",
+                f"managing existing position on {symbol} (strategy={strategy_id})",
+            )
+            return
+        projected = len(active) + 1
         if projected > cap:
             result.add(
                 "concurrent_positions_cap",
@@ -241,10 +252,18 @@ class RiskGate:
         active = await self._repos.positions.list_active(account_id)  # no strategy filter
         symbol = proposal.symbol.upper()
         # If the same symbol is already active (possibly under another strategy),
-        # this proposal doesn't add a "new" slot. Closes on existing positions
-        # likewise don't increase the count.
+        # this proposal doesn't add a "new" slot. Closes / CCs on existing
+        # positions are management, not new exposure — skip the cap entirely
+        # so we can still wind down positions when over-cap.
         new_slot = not any(p.symbol.upper() == symbol for p in active)
-        projected = len(active) + (1 if new_slot else 0)
+        if not new_slot:
+            result.add(
+                "concurrent_total_cap",
+                "skip",
+                f"managing existing position on {symbol} (active total={len(active)})",
+            )
+            return
+        projected = len(active) + 1
         if projected > cap:
             result.add(
                 "concurrent_total_cap",
