@@ -161,8 +161,14 @@ tickers:
   - symbol: COIN
     name: "Coinbase Global"
     tier: 2
-    strategies: [put_spread]
-    notes: "~$300 crypto-correlated. Too rich for weekly CSP; spreads cap exposure."
+    # 2026-05-23: weekly_wheel TEMPORARILY re-added so the wheel orchestrator
+    # can sell covered calls against the 100 shares we got assigned (cycle 15,
+    # cost basis $184.63). Remove `weekly_wheel` once the shares are called
+    # away or sold. Better long-term fix: ship the orphan-management feature
+    # so the orchestrator manages existing positions regardless of universe
+    # membership, then we never have to do this dance.
+    strategies: [weekly_wheel, put_spread]
+    notes: "~$300 crypto-correlated. Too rich for weekly CSP; spreads cap exposure. Currently SHARES_HELD on weekly_wheel — wheeling out via CCs."
 
   # ============================================================
   # bear_call_spread — 30-45 DTE bear call credit spreads, defined risk
