@@ -395,6 +395,82 @@ async def test_time_close_disabled_when_param_unset(db_repos):
 
 
 @pytest.mark.asyncio
+async def test_csp_stop_loss_fires_at_threshold(db_repos):
+    """Sprint 14: CSP stop-loss when current mid hits 2× original premium.
+
+    Regression for the 2026-05-27 KMI canary — premium $0.46, current $1.35
+    (2.93× of original) → with csp_stop_loss_mult=2.0, mid ≥ $0.92 fires
+    the close immediately."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=0.46)
+    broker = PaperBroker()
+    # Mid 0.95 → 2.07× original → exceeds 2.0 threshold.
+    # Not in profit (debit > target $0.23) and DTE 35 so time-close inactive.
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.94, ask=0.96))
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1),
+        strategy=_strategy(csp_stop_loss_mult=2.0),
+    )
+    assert proposal is not None
+    assert proposal.order_type == OrderType.BUY_TO_CLOSE
+    assert "stop_loss" in proposal.rationale
+    assert "profit" not in proposal.rationale
+
+
+@pytest.mark.asyncio
+async def test_csp_stop_loss_does_not_fire_below_threshold(db_repos):
+    """Mid below the 2× threshold and not in profit → no proposal."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=0.46)
+    broker = PaperBroker()
+    # Mid 0.80 → 1.74× — below 2.0 threshold, above profit target.
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1),
+        strategy=_strategy(csp_stop_loss_mult=2.0),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_cc_does_not_have_stop_loss(db_repos):
+    """CC positions are intentionally excluded from stop-loss — called-away
+    is the wheel's profitable outcome, not a loss. Even at 5× original
+    premium, the close orchestrator should not propose a stop-loss close."""
+    position = await _seed_open_cc(db_repos, fill_price=0.80)
+    broker = PaperBroker()
+    # Mid 5.00 — way over a 2× stop, but not in profit and DTE > 21 so no
+    # other trigger fires. Should return None.
+    broker.seed_quote(Quote(symbol="F250706C00012000", bid=4.95, ask=5.05))
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1),
+        strategy=_strategy(csp_stop_loss_mult=2.0),
+    )
+    # CC is being called-away territory — no stop close.
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_csp_stop_loss_disabled_when_mult_zero(db_repos):
+    """csp_stop_loss_mult=0 disables the feature for this strategy."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=0.46)
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=2.00, ask=2.02))  # 4× original
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1),
+        strategy=_strategy(csp_stop_loss_mult=0),
+    )
+    # No stop trigger; not in profit; DTE 35 so no time trigger. Returns None.
+    assert proposal is None
+
+
+@pytest.mark.asyncio
 async def test_propose_all_closes_skips_non_open_states(db_repos):
     """SPREAD_OPEN, MANUAL_INTERVENTION, IDLE etc. must not be considered."""
     position, _ = await _seed_open_csp(db_repos, fill_price=1.00)

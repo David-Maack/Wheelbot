@@ -167,6 +167,11 @@ strategies:
       # so they live entirely inside the gamma window; the rule doesn't
       # transfer cleanly.
       time_close_dte: 21
+      # Sprint 14: CSP stop-loss. Closes the short put when current mid
+      # hits 2× the original premium received. Caps a runaway loss before
+      # assignment risk dominates. CC stop-loss is intentionally not set —
+      # called-away is the wheel's profitable outcome, not a loss to exit.
+      csp_stop_loss_mult: 2.0
 
   - id: weekly_wheel
     display_name: "Weekly Wheel"
@@ -189,6 +194,8 @@ strategies:
       ivr_min: 30
       # Drawdown circuit breaker — see monthly_wheel.
       auto_disable_drawdown_usd: -300
+      # CSP stop-loss — see monthly_wheel.
+      csp_stop_loss_mult: 2.0
 
   - id: put_spread
     display_name: "Bull Put Spread"

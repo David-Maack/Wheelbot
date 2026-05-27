@@ -115,6 +115,11 @@ async def propose_close_for_position(
          Configured per strategy; omit / set to 0 to disable for this strategy.
          The 21-DTE rule applies cleanly to monthly_wheel; weekly_wheel lives
          entirely inside the gamma window so leaving it unset is the default.
+      3. Stop loss (Sprint 14, CSP-only) — current mid ≥ `csp_stop_loss_mult`
+         × original premium. Caps single-trade loss on a runaway short put
+         before the underlying drops further. Set to 0/None to disable.
+         CCs are intentionally excluded — called-away is the wheel's goal,
+         not a loss to stop out of; CC management is its own decision.
 
     Returns None when no trigger fires (or when quote / order data is missing).
     """
@@ -165,7 +170,24 @@ async def propose_close_for_position(
         and short_dte <= int(time_close_dte_raw)
     )
 
-    if not (profit_trigger or time_trigger):
+    # Stop-loss trigger (Sprint 14 — CSP only)
+    # Read order: csp_stop_loss_mult (preferred) → stop_loss_mult (shared
+    # legacy key) → default 2.0. Set to 0 to disable.
+    stop_loss_mult: float = 0.0
+    stop_threshold_mid: float = 0.0
+    stop_trigger = False
+    if position.state == PositionState.CSP_OPEN:
+        stop_loss_mult = float(
+            strategy.params.get(
+                "csp_stop_loss_mult",
+                strategy.params.get("stop_loss_mult", 2.0),
+            )
+        )
+        if stop_loss_mult > 0:
+            stop_threshold_mid = stop_loss_mult * original_premium
+            stop_trigger = current_mid >= stop_threshold_mid
+
+    if not (profit_trigger or time_trigger or stop_trigger):
         return None
 
     contract = OptionContract(
@@ -187,6 +209,11 @@ async def propose_close_for_position(
             f"profit mid={current_mid:.2f} ≤ target {target_max_mid:.2f} "
             f"(orig {original_premium:.2f}, pct={threshold_pct})"
         )
+    if stop_trigger:
+        rationale_parts.append(
+            f"stop_loss mid={current_mid:.2f} ≥ threshold {stop_threshold_mid:.2f} "
+            f"(orig {original_premium:.2f}, mult={stop_loss_mult:.1f}×)"
+        )
     if time_trigger:
         rationale_parts.append(
             f"time_close dte={short_dte} ≤ {int(time_close_dte_raw)}"
@@ -203,6 +230,7 @@ async def propose_close_for_position(
         mid=current_mid,
         profit_trigger=profit_trigger,
         time_trigger=time_trigger,
+        stop_trigger=stop_trigger,
         short_dte=short_dte,
         original_premium=original_premium,
     )
