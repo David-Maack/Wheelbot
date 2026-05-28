@@ -389,10 +389,25 @@ async def test_router_places_multi_leg_via_paper_broker(db_repos):
     assert result.placed.broker_order_id is not None
     assert result.placed.order_type == OrderType.MULTI_LEG_OPEN
     assert result.placed.quantity == 2
-    assert result.placed.limit_price == pytest.approx(0.29)
+    # Net credit 0.29 minus the default 0.05 open_slippage → 0.24 limit.
+    assert result.placed.limit_price == pytest.approx(0.24)
     pos = await db_repos.positions.get_by_symbol("test", "F", strategy_id="put_spread")
     assert pos is not None
     assert pos.state == PositionState.SPREAD_PENDING
+
+
+@pytest.mark.asyncio
+async def test_multi_leg_open_applies_slippage_to_limit(db_repos):
+    """Slippage concession is configurable and only applied to opens."""
+    broker = PaperBroker(cash=20_000)
+    cfg = _router_config()
+    cfg["execution"]["open_slippage"] = 0.10
+    router = OrderRouter(broker, db_repos, cfg, _universe())
+    result = await router.place_multi_leg(
+        _spread_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1)
+    )
+    # 0.29 net credit − 0.10 slippage → 0.19.
+    assert result.placed.limit_price == pytest.approx(0.19)
 
 
 @pytest.mark.asyncio

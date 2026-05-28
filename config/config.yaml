@@ -137,6 +137,16 @@ execution:
   retry_max_attempts: 5
   retry_initial_backoff_seconds: 1
   retry_max_backoff_seconds: 60
+  # Cancel + re-place a same-client_order_id PENDING order older than this
+  # (minutes). Prevents stale limits sitting unfilled all session.
+  stale_pending_minutes: 15
+  # Concede this much net credit ($/share) on multi-leg spread OPENS so the
+  # order is marketable. Mid-to-mid credit on a credit spread often won't
+  # cross; giving up a nickel buys reliable fills. ~3% of a $1.50 credit.
+  open_slippage: 0.05
+  # Don't open NEW positions in the final N minutes before the 16:00 ET
+  # close — no time to fill or manage. Closes/rolls are exempt.
+  entry_cutoff_minutes_before_close: 15
 
 # Strategies registry. The bot iterates these each tick and dispatches by
 # `type` to the right orchestrator. A ticker belongs to a strategy iff its

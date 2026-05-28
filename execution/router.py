@@ -27,9 +27,13 @@ from core.broker import Broker, BrokerUnavailable, OrderRejected
 from core.checkpoint import checkpoint, log_checkpoint
 from core.models import Order, OrderStatus, OrderType, Position, PositionState
 from db.repo import Repos
+from execution.market_hours import within_entry_window
 from risk.limits import RiskCheckFailed, RiskGate
 from strategies.spreads import MultiLegProposal
 from strategies.wheel import Proposal
+
+
+_OPEN_ORDER_TYPES = (OrderType.SELL_TO_OPEN, OrderType.MULTI_LEG_OPEN)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,15 @@ class RouterConfig:
     # than this threshold. Avoids the broker-side "client_order_id must be
     # unique" rejection cycle when market moves past the stale limit.
     stale_pending_minutes: float = 15.0
+    # Slippage concession on multi-leg credit-spread OPENS. We price at
+    # net_credit − open_slippage so the order is marketable enough to fill;
+    # mid-to-mid credit often won't cross. Closes are unaffected (debits
+    # cross naturally).
+    open_slippage: float = 0.05
+    # Don't OPEN new positions in the final N minutes before the 16:00 ET
+    # close. Opens placed near/after close can't fill or be managed. Closes
+    # and rolls are exempt.
+    entry_cutoff_minutes_before_close: int = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +70,7 @@ class RouteResult:
     news_rationale: str | None = None
     quantity_adjusted: int | None = None  # final qty if news_check forced a halve
     skipped_duplicate_pending: bool = False  # active PENDING order, too young to replace
+    skipped_outside_entry_window: bool = False  # open attempted too close to / after close
 
 
 def _utcnow() -> datetime:
@@ -126,6 +140,10 @@ def _router_config(config: dict[str, Any]) -> RouterConfig:
         retry_initial_backoff_seconds=float(section.get("retry_initial_backoff_seconds", 1.0)),
         retry_max_backoff_seconds=float(section.get("retry_max_backoff_seconds", 60.0)),
         stale_pending_minutes=float(section.get("stale_pending_minutes", 15.0)),
+        open_slippage=float(section.get("open_slippage", 0.05)),
+        entry_cutoff_minutes_before_close=int(
+            section.get("entry_cutoff_minutes_before_close", 15)
+        ),
     )
 
 
@@ -233,6 +251,20 @@ class OrderRouter:
         sleep: Any = asyncio.sleep,
         today: date | None = None,
     ) -> RouteResult:
+        # Entry-window gate: don't OPEN new positions near/after the close.
+        if proposal.order_type in _OPEN_ORDER_TYPES and not within_entry_window(
+            minutes_before_close=self._cfg.entry_cutoff_minutes_before_close,
+        ):
+            log_checkpoint(
+                "router_skip_entry_window",
+                status="skip",
+                symbol=proposal.symbol,
+                order_type=proposal.order_type.value,
+            )
+            return RouteResult(
+                proposal=proposal, placed=None, skipped_outside_entry_window=True,
+            )
+
         # Risk gates first. Cheap to check, expensive to fail late.
         try:
             await self._gate.evaluate(proposal, today=today)
@@ -375,6 +407,21 @@ class OrderRouter:
           - Position state goes to SPREAD_PENDING; reconciler upgrades to
             SPREAD_OPEN on observed fill.
         """
+        # Entry-window gate: spread opens are entries — don't place near close.
+        if proposal.order_type == OrderType.MULTI_LEG_OPEN and not within_entry_window(
+            minutes_before_close=self._cfg.entry_cutoff_minutes_before_close,
+        ):
+            log_checkpoint(
+                "router_skip_entry_window",
+                status="skip",
+                symbol=proposal.symbol,
+                strategy=proposal.strategy_id,
+                order_type=proposal.order_type.value,
+            )
+            return RouteResult(
+                proposal=proposal, placed=None, skipped_outside_entry_window=True,
+            )
+
         try:
             await self._gate.evaluate(proposal, today=today)
         except RiskCheckFailed as exc:
@@ -417,7 +464,14 @@ class OrderRouter:
                 skipped_duplicate_pending=True,
             )
         client_id = replacement_id if action == "replace" else base_client_id
-        limit_price = round(proposal.net_credit_per_spread, 2)
+        # Concede `open_slippage` of net credit on OPENS so the order is
+        # marketable enough to fill (mid-to-mid credit often won't cross).
+        # Closes (negative net_credit / debit) are left at their computed
+        # price — they cross naturally.
+        if proposal.order_type == OrderType.MULTI_LEG_OPEN:
+            limit_price = round(proposal.net_credit_per_spread - self._cfg.open_slippage, 2)
+        else:
+            limit_price = round(proposal.net_credit_per_spread, 2)
 
         last_exc: Exception | None = None
         backoff = self._cfg.retry_initial_backoff_seconds

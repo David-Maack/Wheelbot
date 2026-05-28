@@ -326,3 +326,42 @@ async def test_no_existing_pending_proceeds_normally(db_repos, monkeypatch):
     result = await router.place(_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
     assert result.placed is not None
     assert result.skipped_duplicate_pending is False
+
+
+# -- Entry-window gate (Sprint 14) ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_open_skipped_outside_entry_window(db_repos, monkeypatch):
+    """A CSP open attempted near/after close is skipped, not placed."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    # Force the gate CLOSED (override the conftest autouse default).
+    monkeypatch.setattr("execution.router.within_entry_window", lambda **k: False)
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    result = await router.place(_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert result.placed is None
+    assert result.skipped_outside_entry_window is True
+    # Nothing persisted.
+    rows = await db_repos.orders.list_recent("test")
+    assert len(rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_close_not_gated_by_entry_window(db_repos, monkeypatch):
+    """A BUY_TO_CLOSE must still go through even after the close cutoff —
+    exiting late is fine, only entries are gated."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    monkeypatch.setattr("execution.router.within_entry_window", lambda **k: False)
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    close_proposal = Proposal(
+        symbol="F",
+        contract=_put_contract(),
+        order_type=OrderType.BUY_TO_CLOSE,
+        quantity=1,
+        rationale="close",
+    )
+    result = await router.place(close_proposal, sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert result.placed is not None
+    assert result.skipped_outside_entry_window is False

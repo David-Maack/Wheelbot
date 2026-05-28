@@ -4,9 +4,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import pytest_asyncio
 
 from db.repo import Database, Repos
+
+
+@pytest.fixture(autouse=True)
+def _entry_window_open(monkeypatch):
+    """Default the router's entry-window gate to OPEN so order-placement tests
+    aren't dependent on the wall-clock time they happen to run at. Tests that
+    specifically exercise the gate override this with their own monkeypatch."""
+    try:
+        monkeypatch.setattr("execution.router.within_entry_window", lambda **k: True)
+    except (ImportError, AttributeError):
+        # router not imported in this test module — nothing to stub.
+        pass
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 SCHEMA = (ROOT / "db" / "schema.sql").read_text(encoding="utf-8")
