@@ -66,11 +66,14 @@ class OrderStatus(StrEnum):
 class CycleOutcome(StrEnum):
     CSP_EXPIRED = "CSP_EXPIRED"
     CSP_CLOSED_PROFIT = "CSP_CLOSED_PROFIT"
+    CSP_CLOSED_LOSS = "CSP_CLOSED_LOSS"               # bought back at a loss (stop/defensive)
     CC_EXPIRED = "CC_EXPIRED"
     CC_CLOSED_PROFIT = "CC_CLOSED_PROFIT"
+    CC_CLOSED_LOSS = "CC_CLOSED_LOSS"
     CC_CALLED_AWAY = "CC_CALLED_AWAY"
     SPREAD_EXPIRED_PROFIT = "SPREAD_EXPIRED_PROFIT"   # both legs OTM at expiry
     SPREAD_CLOSED_PROFIT = "SPREAD_CLOSED_PROFIT"     # closed at profit_close_pct
+    SPREAD_CLOSED_LOSS = "SPREAD_CLOSED_LOSS"         # closed at a loss (stop/time)
     SPREAD_MAX_LOSS = "SPREAD_MAX_LOSS"               # both legs ITM at expiry
     MANUAL_CLOSE = "MANUAL_CLOSE"
 

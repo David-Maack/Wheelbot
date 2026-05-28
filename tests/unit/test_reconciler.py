@@ -374,6 +374,117 @@ async def test_already_idle_position_stays_idle(db_repos):
 
 
 @pytest.mark.asyncio
+async def test_csp_buyback_nets_into_cycle_pnl_and_labels_loss(db_repos):
+    """Regression for the 2026-05-28 P&L-inflation bug: a CSP bought back at a
+    loss must net the buyback debit into final_pnl (not book full premium) and
+    label the outcome CSP_CLOSED_LOSS, not _PROFIT."""
+    broker = PaperBroker(cash=20_000)
+    now = _utc()
+    # Open cycle from a CSP sold for $0.46.
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(
+            account_id="test",
+            symbol="KMI",
+            strategy_id="monthly_wheel",
+            started_at=now - timedelta(days=10),
+            initial_csp_strike=33.5,
+            initial_csp_premium=0.46,
+        )
+    )
+    # The original SELL_TO_OPEN, already cycle-linked + filled.
+    await db_repos.orders.insert(
+        Order(
+            account_id="test", symbol="KMI", strategy_id="monthly_wheel",
+            cycle_id=cycle_id,
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol="KMI260618P00033500",
+            strike=33.5, expiration=date(2026, 6, 18), option_type=OptionType.PUT,
+            quantity=1, limit_price=0.46, fill_price=0.46,
+            status=OrderStatus.FILLED, placed_at=now - timedelta(days=10),
+            filled_at=now - timedelta(days=10),
+        )
+    )
+    # CSP_OPEN position on that cycle.
+    await db_repos.positions.insert(
+        Position(
+            account_id="test", symbol="KMI", strategy_id="monthly_wheel",
+            state=PositionState.CSP_OPEN, shares=0,
+            current_cycle_id=cycle_id, state_changed_at=now,
+        )
+    )
+    # Stop-loss buyback at $1.54 — placed + filled, NOT yet cycle-linked.
+    buyback = Order(
+        account_id="test", symbol="KMI", strategy_id="monthly_wheel",
+        order_type=OrderType.BUY_TO_CLOSE,
+        contract_symbol="KMI260618P00033500",
+        strike=33.5, expiration=date(2026, 6, 18), option_type=OptionType.PUT,
+        quantity=1, limit_price=1.54,
+        status=OrderStatus.PENDING, placed_at=now,
+        client_order_id="wb-kmi-stop",
+    )
+    bro = await broker.place_order(buyback)
+    await db_repos.orders.insert(buyback.model_copy(update={"broker_order_id": bro.broker_order_id}))
+    await broker.fill_order(bro.broker_order_id, fill_price=1.54)
+
+    rec = Reconciler(broker, db_repos, _config())
+    await rec.reconcile_once()
+
+    cycle = await db_repos.cycles.get(cycle_id)
+    # Premium 0.46 − buyback 1.54 = −1.08 × 100 = −108, not the +46 the bug showed.
+    assert cycle.final_pnl == pytest.approx(-108.0)
+    assert cycle.cycle_outcome == CycleOutcome.CSP_CLOSED_LOSS.value
+
+
+@pytest.mark.asyncio
+async def test_csp_profit_close_nets_buyback_and_keeps_profit_label(db_repos):
+    """Profit-close: sold $1.00, bought back $0.40 → +$60, labeled PROFIT."""
+    broker = PaperBroker(cash=20_000)
+    now = _utc()
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(
+            account_id="test", symbol="F", strategy_id="monthly_wheel",
+            started_at=now - timedelta(days=10),
+            initial_csp_strike=10.0, initial_csp_premium=1.00,
+        )
+    )
+    await db_repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", strategy_id="monthly_wheel",
+            cycle_id=cycle_id, order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol="F250706P00010000",
+            strike=10.0, expiration=date(2026, 6, 18), option_type=OptionType.PUT,
+            quantity=1, limit_price=1.00, fill_price=1.00,
+            status=OrderStatus.FILLED, placed_at=now - timedelta(days=10),
+            filled_at=now - timedelta(days=10),
+        )
+    )
+    await db_repos.positions.insert(
+        Position(
+            account_id="test", symbol="F", strategy_id="monthly_wheel",
+            state=PositionState.CSP_OPEN, shares=0,
+            current_cycle_id=cycle_id, state_changed_at=now,
+        )
+    )
+    buyback = Order(
+        account_id="test", symbol="F", strategy_id="monthly_wheel",
+        order_type=OrderType.BUY_TO_CLOSE, contract_symbol="F250706P00010000",
+        strike=10.0, expiration=date(2026, 6, 18), option_type=OptionType.PUT,
+        quantity=1, limit_price=0.40,
+        status=OrderStatus.PENDING, placed_at=now, client_order_id="wb-f-pc",
+    )
+    bro = await broker.place_order(buyback)
+    await db_repos.orders.insert(buyback.model_copy(update={"broker_order_id": bro.broker_order_id}))
+    await broker.fill_order(bro.broker_order_id, fill_price=0.40)
+
+    rec = Reconciler(broker, db_repos, _config())
+    await rec.reconcile_once()
+
+    cycle = await db_repos.cycles.get(cycle_id)
+    assert cycle.final_pnl == pytest.approx(60.0)
+    assert cycle.cycle_outcome == CycleOutcome.CSP_CLOSED_PROFIT.value
+
+
+@pytest.mark.asyncio
 async def test_cc_fill_links_order_to_existing_cycle(db_repos):
     """Bug A regression: when a covered call (SELL_TO_OPEN call) fills on a
     SHARES_HELD position, the order must be tagged with the position's

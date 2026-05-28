@@ -55,6 +55,18 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+# When a cycle is closed with a "profit" outcome by the caller but the realized
+# P&L is actually negative (e.g. a stop-loss / defensive buyback hardcoded to
+# CSP_CLOSED_PROFIT), relabel to the matching loss outcome so the dashboard's
+# Outcomes breakdown is honest. The win/loss tally keys off final_pnl sign, so
+# it's already correct once P&L is right — this just fixes the label.
+_PROFIT_TO_LOSS_OUTCOME = {
+    CycleOutcome.CSP_CLOSED_PROFIT: CycleOutcome.CSP_CLOSED_LOSS,
+    CycleOutcome.CC_CLOSED_PROFIT: CycleOutcome.CC_CLOSED_LOSS,
+    CycleOutcome.SPREAD_CLOSED_PROFIT: CycleOutcome.SPREAD_CLOSED_LOSS,
+}
+
+
 @dataclass(slots=True)
 class ReconcileSummary:
     fills_processed: int = 0
@@ -316,6 +328,20 @@ class Reconciler:
             # the put, no assignment); CC close → SHARES_HELD.
             is_put = local.option_type == OptionType.PUT
             new_state = PositionState.IDLE if is_put else PositionState.SHARES_HELD
+            # Tag the buyback with the cycle BEFORE _close_cycle computes P&L.
+            # Without this, _compute_cycle_pnl (which filters on cycle_id) never
+            # sees the buyback debit and books the FULL premium as profit —
+            # overstating every profit-close / time-close / stop-loss exit and
+            # mislabeling losses as wins.
+            if (
+                position is not None
+                and position.current_cycle_id is not None
+                and local.id is not None
+                and local.cycle_id is None
+            ):
+                await self._repos.orders.update(
+                    local.id, cycle_id=position.current_cycle_id
+                )
             await self._set_position_state(
                 position,
                 symbol,
@@ -840,6 +866,10 @@ class Reconciler:
         if cycle is None or cycle.ended_at is not None:
             return
         pnl = await self._compute_cycle_pnl(cycle_id)
+        # Honest labeling: a "*_CLOSED_PROFIT" outcome with negative realized
+        # P&L is actually a loss (e.g. stop-loss exit). Relabel accordingly.
+        if pnl < 0 and outcome in _PROFIT_TO_LOSS_OUTCOME:
+            outcome = _PROFIT_TO_LOSS_OUTCOME[outcome]
         days_held = max((_utcnow() - cycle.started_at).days, 0) if cycle.started_at else None
         capital = cycle.initial_capital_at_risk or 0
         pct = (pnl / capital * 100.0) if capital else None
