@@ -371,3 +371,68 @@ async def test_already_idle_position_stays_idle(db_repos):
     pos = await db_repos.positions.get_by_symbol("test", "F")
     assert pos.state == PositionState.IDLE
     assert summary.manual_interventions == 0
+
+
+@pytest.mark.asyncio
+async def test_cc_fill_links_order_to_existing_cycle(db_repos):
+    """Bug A regression: when a covered call (SELL_TO_OPEN call) fills on a
+    SHARES_HELD position, the order must be tagged with the position's
+    existing wheel cycle. Previously only puts got cycle-linked, so CC orders
+    had cycle_id=NULL and the dashboard read the expired CSP for DTE/P&L."""
+    broker = PaperBroker(cash=20_000)
+    now = _utc()
+    # Open wheel cycle (from the original CSP that was assigned).
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(
+            account_id="test",
+            symbol="F",
+            strategy_id="monthly_wheel",
+            started_at=now - timedelta(days=20),
+            initial_csp_strike=10.0,
+            initial_csp_premium=0.40,
+        )
+    )
+    # SHARES_HELD position pointing at that cycle.
+    await db_repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol="F",
+            strategy_id="monthly_wheel",
+            state=PositionState.CC_PENDING,
+            shares=100,
+            cost_basis=9.60,
+            current_cycle_id=cycle_id,
+            state_changed_at=now,
+        )
+    )
+    # A CC (SELL_TO_OPEN call) placed + filled, initially no cycle_id.
+    cc_order = Order(
+        account_id="test",
+        symbol="F",
+        strategy_id="monthly_wheel",
+        order_type=OrderType.SELL_TO_OPEN,
+        contract_symbol="F250706C00012000",
+        strike=12.0,
+        expiration=date(2025, 7, 6),
+        option_type=OptionType.CALL,
+        quantity=1,
+        limit_price=0.30,
+        status=OrderStatus.PENDING,
+        placed_at=now,
+        client_order_id="wb-test-cc-1",
+    )
+    broker_order = await broker.place_order(cc_order)
+    persisted = cc_order.model_copy(update={"broker_order_id": broker_order.broker_order_id})
+    cc_id = await db_repos.orders.insert(persisted)
+    await broker.fill_order(broker_order.broker_order_id, fill_price=0.30)
+
+    rec = Reconciler(broker, db_repos, _config())
+    await rec.reconcile_once()
+
+    # Position is now CC_OPEN, still on the same cycle.
+    pos = await db_repos.positions.get_by_symbol("test", "F", strategy_id="monthly_wheel")
+    assert pos.state == PositionState.CC_OPEN
+    assert pos.current_cycle_id == cycle_id
+    # The CC order is now tagged with the cycle (was NULL before the fix).
+    cc_after = await db_repos.orders.get(cc_id)
+    assert cc_after.cycle_id == cycle_id

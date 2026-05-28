@@ -273,22 +273,41 @@ class Reconciler:
                     CycleOutcome.SPREAD_CLOSED_PROFIT,
                     summary,
                 )
+                # Clear the cycle pointer — the spread is closed and the
+                # position is now between cycles. Without this, the dashboard
+                # computes phantom P&L off the dead cycle's legs while a new
+                # spread open is in flight (position SPREAD_PENDING). Set to
+                # None so derived columns show "—" until a new open fills.
+                if position.id is not None:
+                    await self._repos.positions.update(position.id, current_cycle_id=None)
             return
 
         if local.order_type == OrderType.SELL_TO_OPEN:
             # CSP_PENDING → CSP_OPEN, or CC_PENDING → CC_OPEN.
             is_put = local.option_type == OptionType.PUT
             new_state = PositionState.CSP_OPEN if is_put else PositionState.CC_OPEN
-            cycle_id = await self._open_cycle_if_csp(local, fill_price, summary) if is_put else None
+            # Puts open a new wheel cycle; calls (CCs) continue the EXISTING
+            # cycle the position is already in (assignment → CC is one cycle).
+            existing_cycle = position.current_cycle_id if position else None
+            if is_put:
+                cycle_id = await self._open_cycle_if_csp(local, fill_price, summary)
+                effective_cycle = cycle_id or existing_cycle
+            else:
+                cycle_id = None
+                effective_cycle = existing_cycle
             await self._set_position_state(
                 position,
                 symbol,
                 new_state,
                 f"fill:{local.client_order_id}",
-                cycle_id=cycle_id or (position.current_cycle_id if position else None),
+                cycle_id=effective_cycle,
             )
-            if cycle_id is not None and local.id is not None:
-                await self._repos.orders.update(local.id, cycle_id=cycle_id)
+            # Tag the order with its cycle so the dashboard + P&L accounting
+            # can find it. Previously only puts that *opened* a cycle got
+            # tagged, so CC orders had cycle_id=NULL and the dashboard fell
+            # back to the (expired) CSP for DTE / unrealized.
+            if effective_cycle is not None and local.id is not None:
+                await self._repos.orders.update(local.id, cycle_id=effective_cycle)
 
         elif local.order_type == OrderType.BUY_TO_CLOSE:
             # The reconciler infers the resulting state from the contract type +

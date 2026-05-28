@@ -178,6 +178,13 @@ async def test_reconciler_multi_leg_close_fill_closes_cycle(db_repos):
     reconciler = Reconciler(broker, db_repos, _config())
     await reconciler.reconcile_once()
 
+    # Capture the cycle id while the spread is open — after close it's cleared
+    # from the position (cycle pointer reset so the dashboard doesn't read a
+    # dead cycle during the next pending window).
+    pos_open = await db_repos.positions.get_by_symbol("test", "F", strategy_id="put_spread")
+    opened_cycle_id = pos_open.current_cycle_id
+    assert opened_cycle_id is not None
+
     # Now place + fill a close at $0.10 debit.
     close_legs = [
         OrderLeg(
@@ -219,8 +226,10 @@ async def test_reconciler_multi_leg_close_fill_closes_cycle(db_repos):
     )
     assert pos is not None
     assert pos.state == PositionState.SPREAD_CLOSED
+    # Cycle pointer cleared on close (Bug B fix).
+    assert pos.current_cycle_id is None
 
-    cycle = await db_repos.cycles.get(pos.current_cycle_id)
+    cycle = await db_repos.cycles.get(opened_cycle_id)
     assert cycle is not None
     assert cycle.ended_at is not None
     assert cycle.cycle_outcome == "SPREAD_CLOSED_PROFIT"
