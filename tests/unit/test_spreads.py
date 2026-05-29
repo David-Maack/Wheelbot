@@ -310,6 +310,31 @@ async def test_orchestrator_sizing_respects_capital_cap():
     assert proposal.quantity == 3
 
 
+@pytest.mark.asyncio
+async def test_orchestrator_skips_when_one_spread_exceeds_cap():
+    """Finding #13: if a single spread's defined risk exceeds the per-spread
+    capital cap, the orchestrator must SKIP (return None) rather than flooring
+    to 1 contract and blowing through the limit."""
+    broker = PaperBroker()
+    broker.seed_chain(
+        "F",
+        [
+            _put(10.0, bid=0.39, ask=0.41, delta=-0.25),
+            _put(9.0, bid=0.10, ask=0.12, delta=-0.10),
+        ],
+    )
+    # max loss is 71; cap of 50 < 71 → cannot afford even one → skip.
+    strat = _strategy(max_capital_per_spread_usd=50)
+    proposal = await propose_for_symbol(
+        broker, _FakeRepos(), "F",
+        config={"account": {"id": "test"}},
+        universe=_universe(),
+        today=date(2025, 6, 1),
+        strategy=strat,
+    )
+    assert proposal is None
+
+
 # -- Router multi-leg path --------------------------------------------------
 
 

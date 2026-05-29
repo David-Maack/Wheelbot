@@ -151,12 +151,17 @@ def _sizing_quantity(
 
     Uses `max_capital_per_spread_usd` from strategy.params if present;
     otherwise falls back to a single contract. Defined risk = max_loss_per_spread.
+
+    Returns 0 when a single spread's defined risk already exceeds the cap — the
+    caller must SKIP rather than trade one anyway. Flooring at 1 (the old
+    behaviour) silently blew through the per-spread capital limit, which is
+    especially dangerous on a small bankroll.
     """
     cap = float(strategy.params.get("max_capital_per_spread_usd", 0) or 0)
     if cap <= 0 or candidate.max_loss_per_spread <= 0:
+        # No cap configured (or undefined risk) — default to a single contract.
         return 1
-    contracts = int(cap // candidate.max_loss_per_spread)
-    return max(contracts, 1)
+    return int(cap // candidate.max_loss_per_spread)
 
 
 async def propose_for_symbol(
@@ -219,6 +224,19 @@ async def propose_for_symbol(
         return None
 
     quantity = _sizing_quantity(strategy, config, candidate)
+    if quantity <= 0:
+        # One spread's defined risk exceeds the per-spread capital cap — skip
+        # rather than over-risk the account (or emit a 0-qty order the broker
+        # would reject).
+        log_checkpoint(
+            "spread_skip_over_cap",
+            status="skip",
+            symbol=symbol,
+            strategy=strategy_id,
+            max_loss=candidate.max_loss_per_spread,
+            cap=float(strategy.params.get("max_capital_per_spread_usd", 0) or 0),
+        )
+        return None
     legs = _build_legs(candidate)
     needs_screen, needs_human = _tier_flags(symbol, universe)
     rationale = (
