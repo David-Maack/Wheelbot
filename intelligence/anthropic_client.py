@@ -47,6 +47,45 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def parse_json_lenient(text: str) -> dict[str, Any] | None:
+    """Parse a JSON object from a model reply, tolerating markdown code fences
+    and surrounding prose.
+
+    Models (notably Haiku) wrap JSON in ```json ... ``` fences despite a
+    "no markdown" instruction. A bare json.loads() then fails and the caller
+    silently loses the decision — e.g. news_check defaulted every CSP to
+    "proceed", making the catalyst gate a no-op. Strip the fence (and, as a
+    fallback, extract the first {...} block) before parsing.
+
+    Returns the parsed dict, or None when no JSON object can be recovered.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    if s.startswith("```"):
+        s = s[3:]
+        if s[:4].lower() == "json":
+            s = s[4:]
+        fence = s.find("```")
+        if fence != -1:
+            s = s[:fence]
+        s = s.strip()
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except (ValueError, TypeError):
+        pass
+    # Fallback: grab the outermost {...} block and try again.
+    start, end = s.find("{"), s.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(s[start : end + 1])
+            return obj if isinstance(obj, dict) else None
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 class AnthropicClient:
     def __init__(
         self,
@@ -113,11 +152,11 @@ class AnthropicClient:
             raise
 
         text = response.content[0].text if response.content else ""
-        parsed: dict[str, Any] = {}
-        try:
-            parsed = json.loads(text)
-        except (ValueError, TypeError):
-            parsed = {"text": text}
+        # Tolerate ```json fences / surrounding prose — a bare json.loads() here
+        # silently dropped fenced replies to {"text": ...}, which made the
+        # news_check gate a no-op (decision fell back to "proceed" every time).
+        parsed_obj = parse_json_lenient(text)
+        parsed: dict[str, Any] = parsed_obj if parsed_obj is not None else {"text": text}
 
         cost = self._budget.cost_for(
             model,

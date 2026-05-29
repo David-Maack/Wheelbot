@@ -7,8 +7,16 @@ from typing import Any
 import pytest
 
 from core.models import LlmDecisionType
-from intelligence.anthropic_client import AnthropicClient
+from intelligence.anthropic_client import AnthropicClient, parse_json_lenient
 from intelligence.budget import BudgetExceeded, BudgetTracker
+
+
+# The exact shape Haiku returned in production (from the /decisions raw view) —
+# valid JSON wrapped in a ```json fence that broke a bare json.loads().
+_FENCED = (
+    "```json\n{\n  \"decision\": \"caution\",\n  "
+    "\"rationale\": \"elevated IV after a rally\",\n  \"confidence\": 0.72\n}\n```"
+)
 
 
 class _FakeUsage:
@@ -78,6 +86,39 @@ async def test_call_returns_text_when_response_not_json(db_repos):
         user_payload="just text",
     )
     assert result["parsed"] == {"text": "not even close to JSON"}
+
+
+def test_parse_json_lenient_variants():
+    """The regression fix: tolerate fences / prose around the JSON object."""
+    assert parse_json_lenient('{"decision": "proceed"}') == {"decision": "proceed"}
+    assert parse_json_lenient(_FENCED)["decision"] == "caution"
+    assert parse_json_lenient('```\n{"decision": "block"}\n```') == {"decision": "block"}
+    assert parse_json_lenient('Sure: {"decision": "proceed"} done') == {"decision": "proceed"}
+    # Unrecoverable / non-object → None so the caller keeps its {"text": ...} fallback.
+    assert parse_json_lenient("no json here") is None
+    assert parse_json_lenient("") is None
+    assert parse_json_lenient("[1, 2, 3]") is None
+
+
+@pytest.mark.asyncio
+async def test_call_parses_fenced_json_decision(db_repos):
+    """Regression: a ```json-fenced Haiku reply must yield the real decision,
+    not silently fall back to {"text": ...} (which made news_check a no-op)."""
+    fake = _FakeAnthropic(_FakeMessage(_FENCED, in_tokens=120, out_tokens=60))
+    budget = BudgetTracker(db_repos.llm_decisions, _config())
+    client = AnthropicClient(db_repos.llm_decisions, budget, client=fake)
+    result = await client.call(
+        decision_type=LlmDecisionType.NEWS_CHECK,
+        model="claude-haiku-4-5",
+        system="sys",
+        user_payload={"symbol": "F"},
+        max_output_tokens=256,
+    )
+    assert result["parsed"]["decision"] == "caution"
+    assert result["parsed"]["confidence"] == 0.72
+    # Persisted on the decision row so the dashboard shows it (not "—").
+    rows = await db_repos.llm_decisions.list_recent()
+    assert rows[0].decision == "caution"
 
 
 @pytest.mark.asyncio
