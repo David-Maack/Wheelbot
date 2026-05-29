@@ -49,9 +49,13 @@ class RouterConfig:
     stale_pending_minutes: float = 15.0
     # Slippage concession on multi-leg credit-spread OPENS. We price at
     # net_credit − open_slippage so the order is marketable enough to fill;
-    # mid-to-mid credit often won't cross. Closes are unaffected (debits
-    # cross naturally).
+    # mid-to-mid credit often won't cross.
     open_slippage: float = 0.05
+    # Slippage concession on multi-leg CLOSES. A spread buyback is a debit
+    # (net_credit < 0); pricing exactly at mid often won't cross, so we concede
+    # a little — willing to pay net_credit − close_slippage (more negative) to
+    # actually exit. Same subtraction direction as opens. Set to 0 to disable.
+    close_slippage: float = 0.05
     # Don't OPEN new positions in the final N minutes before the 16:00 ET
     # close. Opens placed near/after close can't fill or be managed. Closes
     # and rolls are exempt.
@@ -141,6 +145,7 @@ def _router_config(config: dict[str, Any]) -> RouterConfig:
         retry_max_backoff_seconds=float(section.get("retry_max_backoff_seconds", 60.0)),
         stale_pending_minutes=float(section.get("stale_pending_minutes", 15.0)),
         open_slippage=float(section.get("open_slippage", 0.05)),
+        close_slippage=float(section.get("close_slippage", 0.05)),
         entry_cutoff_minutes_before_close=int(
             section.get("entry_cutoff_minutes_before_close", 15)
         ),
@@ -464,14 +469,15 @@ class OrderRouter:
                 skipped_duplicate_pending=True,
             )
         client_id = replacement_id if action == "replace" else base_client_id
-        # Concede `open_slippage` of net credit on OPENS so the order is
-        # marketable enough to fill (mid-to-mid credit often won't cross).
-        # Closes (negative net_credit / debit) are left at their computed
-        # price — they cross naturally.
+        # Concede slippage so the package is marketable enough to fill —
+        # mid-to-mid often won't cross. OPENS give up a little credit
+        # (net_credit − open_slippage); CLOSES (net_credit < 0, a debit) pay a
+        # little more (net_credit − close_slippage, i.e. more negative). Same
+        # subtraction direction for both.
         if proposal.order_type == OrderType.MULTI_LEG_OPEN:
             limit_price = round(proposal.net_credit_per_spread - self._cfg.open_slippage, 2)
         else:
-            limit_price = round(proposal.net_credit_per_spread, 2)
+            limit_price = round(proposal.net_credit_per_spread - self._cfg.close_slippage, 2)
 
         last_exc: Exception | None = None
         backoff = self._cfg.retry_initial_backoff_seconds

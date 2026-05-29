@@ -423,7 +423,7 @@ async def test_router_places_multi_leg_via_paper_broker(db_repos):
 
 @pytest.mark.asyncio
 async def test_multi_leg_open_applies_slippage_to_limit(db_repos):
-    """Slippage concession is configurable and only applied to opens."""
+    """Open slippage concession is configurable."""
     broker = PaperBroker(cash=20_000)
     cfg = _router_config()
     cfg["execution"]["open_slippage"] = 0.10
@@ -433,6 +433,44 @@ async def test_multi_leg_open_applies_slippage_to_limit(db_repos):
     )
     # 0.29 net credit − 0.10 slippage → 0.19.
     assert result.placed.limit_price == pytest.approx(0.19)
+
+
+@pytest.mark.asyncio
+async def test_multi_leg_close_applies_slippage_to_limit(db_repos):
+    """A spread CLOSE concedes close_slippage too so the buyback crosses —
+    net_credit (a debit, negative) minus close_slippage = more negative."""
+    from core.models import OrderLeg
+    short = _put(10.0, bid=0.39, ask=0.41, delta=-0.25)
+    long = _put(9.0, bid=0.10, ask=0.12, delta=-0.10)
+    close = MultiLegProposal(
+        symbol="F",
+        legs=[
+            OrderLeg(
+                contract_symbol=short.occ_symbol, underlying="F",
+                option_type=OptionType.PUT, strike=10.0,
+                expiration=short.expiration, action=OrderType.BUY_TO_CLOSE,
+            ),
+            OrderLeg(
+                contract_symbol=long.occ_symbol, underlying="F",
+                option_type=OptionType.PUT, strike=9.0,
+                expiration=long.expiration, action=OrderType.SELL_TO_CLOSE,
+            ),
+        ],
+        net_credit_per_spread=-0.10,   # $0.10 debit to close
+        max_loss_per_spread=71.0,
+        width_dollars=1.0,
+        quantity=1,
+        rationale="put_spread close test",
+        strategy_id="put_spread",
+        order_type=OrderType.MULTI_LEG_CLOSE,
+    )
+    broker = PaperBroker(cash=20_000)
+    cfg = _router_config()
+    cfg["execution"]["close_slippage"] = 0.05
+    router = OrderRouter(broker, db_repos, cfg, _universe())
+    result = await router.place_multi_leg(close, sleep=_noop_sleep, today=date(2025, 6, 1))
+    # -0.10 debit − 0.05 slippage → -0.15 (willing to pay a bit more to exit).
+    assert result.placed.limit_price == pytest.approx(-0.15)
 
 
 @pytest.mark.asyncio
