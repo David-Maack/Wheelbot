@@ -107,6 +107,35 @@ async def test_credit_roll_picked_when_available():
 
 
 @pytest.mark.asyncio
+async def test_stale_zero_mid_bails_instead_of_fabricating_credit():
+    """Finding #11: a missing quote on the existing short surfaces as
+    current_short_mid == 0.0. With it, every candidate (new_premium - 0) looks
+    like a credit and the bot would roll on garbage. The advisor must bail
+    (return None — leave the position) when the short mid is non-positive."""
+    broker = PaperBroker()
+    broker.seed_chain(
+        "F",
+        [
+            _put_chain_candidate(strike=9.5, days_out=35, mid=2.00, delta=-0.25),
+            _put_chain_candidate(strike=10.0, days_out=35, mid=2.20, delta=-0.27),
+        ],
+    )
+    ctx = RollContext(
+        symbol="F",
+        short_contract=_put_short(),  # triggered (delta -0.55)
+        short_quantity=1,
+        short_premium_collected_per_share=0.50,
+        current_short_mid=0.0,        # stale/missing quote
+        underlying_price=9.5,
+    )
+    decision = await evaluate_roll(
+        broker=broker, ctx=ctx, config=_config(), universe=_universe(),
+        today=date(2025, 6, 1),
+    )
+    assert decision is None  # bailed — no roll/assign/close off a bad quote
+
+
+@pytest.mark.asyncio
 async def test_let_assign_when_no_credit_roll_for_put():
     broker = PaperBroker()
     # Only debit-roll candidates available.

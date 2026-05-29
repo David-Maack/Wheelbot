@@ -86,6 +86,24 @@ async def evaluate_roll(
     if not _is_triggered(ctx, trigger):
         return None
 
+    # Finding #11: the credit-roll math (new_premium - current_short_mid) is only
+    # meaningful with a real cost-to-close. A stale/missing quote on the existing
+    # short surfaces as current_short_mid == 0.0 (the reconciler falls back to 0
+    # when the broker returns no mid/last). Because the trigger is delta-based, a
+    # triggered short ALWAYS has meaningful value — a non-positive mid here means
+    # a bad quote, not a real zero. Making a roll/close/assign decision off that
+    # would fabricate a phantom credit (every candidate looks like a credit when
+    # the cost to close reads as 0). Leave the position alone and re-evaluate
+    # next tick when the quote refreshes.
+    if ctx.current_short_mid <= 0:
+        log_checkpoint(
+            "roll_advisor_skip_stale_mid",
+            status="skip",
+            symbol=ctx.symbol,
+            current_short_mid=ctx.current_short_mid,
+        )
+        return None
+
     side = "put" if ctx.short_contract.option_type == OptionType.PUT else "call"
     candidate = await _find_credit_roll(
         broker=broker,
@@ -198,6 +216,9 @@ async def _find_credit_roll(
         if c.bid is None or c.ask is None:
             continue
         new_premium = (c.bid + c.ask) / 2
+        if new_premium <= 0:
+            # Stale/zero quote on the candidate leg — not a real roll target.
+            continue
         net_credit = new_premium - ctx.current_short_mid
         if only_credit and net_credit <= 0:
             continue
