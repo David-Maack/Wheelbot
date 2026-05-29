@@ -96,11 +96,14 @@ class PaperBroker(Broker):
                     state_changed_at=now,
                 )
             )
-        # Surface open short option legs as positions on the underlying. The reconciler
-        # is the component that interprets these; we just report broker truth.
+        # Surface open short option legs as positions on the underlying. The
+        # reconciler is the component that interprets these; we just report
+        # broker truth. We emit the short leg as its OWN row even when the
+        # underlying shares are also held — that's exactly what a real broker
+        # does for an open covered call (100 shares + a short call are two
+        # distinct positions), and the reconciler relies on seeing the live
+        # short leg to know the wheel leg is still open.
         for occ, order in self._open_options.items():
-            if order.symbol in self._stock:
-                continue  # already represented by a stock row
             out.append(
                 Position(
                     account_id=self._account_id,

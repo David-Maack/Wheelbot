@@ -533,25 +533,33 @@ class Reconciler:
         broker_positions: list[Position],
         summary: ReconcileSummary,
     ) -> None:
-        broker_by_symbol = {p.symbol.upper(): p for p in broker_positions}
+        # A single underlying can have MULTIPLE broker rows at once — most
+        # importantly an open covered call (the 100 shares AND the short call
+        # are two separate broker positions). Collapsing to one row (last wins)
+        # loses the decisive "is the short leg still alive?" signal and made the
+        # CC diff fire expiration prematurely / get stuck. Group ALL rows per
+        # symbol and let _diff_one reason over the set.
+        rows_by_symbol: dict[str, list[Position]] = {}
+        for p in broker_positions:
+            rows_by_symbol.setdefault(p.symbol.upper(), []).append(p)
         local_positions = await self._repos.positions.list_all(self._account_id)
         local_by_symbol = {p.symbol.upper(): p for p in local_positions}
 
         # Detect transitions implied purely by *position state* that fills alone
         # don't surface — assignments and worthless expirations.
         for symbol, local in local_by_symbol.items():
-            broker = broker_by_symbol.get(symbol)
-            await self._diff_one(symbol, local, broker, summary)
+            await self._diff_one(symbol, local, rows_by_symbol.get(symbol, []), summary)
 
         # Symbols at broker we don't track at all.
-        for symbol, broker in broker_by_symbol.items():
+        for symbol, rows in rows_by_symbol.items():
             if symbol in local_by_symbol:
                 continue
             # Newly discovered position — treat as MANUAL_INTERVENTION rather
             # than guess at state. Spec §10: "do NOT auto-correct."
+            rep = rows[0]
             await self._flag_manual_intervention(
-                broker.symbol,
-                f"broker shows {broker.state} for {broker.symbol} but no local row",
+                rep.symbol,
+                f"broker shows {rep.state} for {rep.symbol} but no local row",
                 summary,
             )
 
@@ -559,34 +567,44 @@ class Reconciler:
         self,
         symbol: str,
         local: Position,
-        broker: Position | None,
+        broker_rows: list[Position],
         summary: ReconcileSummary,
     ) -> None:
-        # Case: local says CSP_OPEN. Broker shows shares → assignment.
-        # Broker shows nothing → worthless expiration.
+        # Aggregate the broker's view of this underlying. A live short option
+        # leg is the decisive signal that a wheel leg is still open — it must
+        # override any equity row (an open covered call holds BOTH the shares
+        # and the short call simultaneously).
+        has_short_put = any(r.state == PositionState.CSP_OPEN for r in broker_rows)
+        has_short_call = any(r.state == PositionState.CC_OPEN for r in broker_rows)
+        total_shares = sum((r.shares or 0) for r in broker_rows)
+        has_shares = total_shares > 0 or any(
+            r.state == PositionState.SHARES_HELD for r in broker_rows
+        )
+        broker_present = bool(broker_rows)
+
+        # Case: local says CSP_OPEN. Short put still alive → still open.
+        # Shares appeared → assignment. Nothing left → worthless expiration.
         if local.state == PositionState.CSP_OPEN:
-            if broker is None or broker.shares == 0 and broker.state not in (
-                PositionState.CSP_OPEN,
-                PositionState.SHARES_HELD,
-            ):
-                await self._on_csp_expiration(local, summary)
-                return
-            if broker.shares >= 100 or broker.state == PositionState.SHARES_HELD:
+            if has_short_put:
+                return  # short put still alive — nothing to do
+            if has_shares:
                 await self._on_assignment(local, summary)
                 return
-            # Still open at broker — nothing to do.
+            await self._on_csp_expiration(local, summary)
             return
 
+        # Case: local says CC_OPEN. Short CALL still alive → still open.
+        # Otherwise: shares remain → call expired worthless (keep shares);
+        # nothing remains → called away. This mirrors the CSP branch — we key
+        # off "is the short leg still alive?" instead of requiring an exact
+        # shares+state pair, which previously left the CC stuck at CC_OPEN.
         if local.state == PositionState.CC_OPEN:
-            if broker is None or (broker.shares == 0 and broker.state not in (
-                PositionState.CC_OPEN,
-                PositionState.SHARES_HELD,
-            )):
-                await self._on_called_away(local, summary)
-                return
-            if broker.shares > 0 and broker.state == PositionState.SHARES_HELD:
+            if has_short_call:
+                return  # short call still alive — CC still open
+            if has_shares:
                 await self._on_cc_expiration(local, summary)
                 return
+            await self._on_called_away(local, summary)
             return
 
         if local.state in (PositionState.CSP_PENDING, PositionState.CC_PENDING):
@@ -598,20 +616,19 @@ class Reconciler:
             # Broker shows nothing for this symbol → both legs OTM at expiry,
             # full credit retained. Anything else is asymmetric (one leg ITM,
             # one OTM, or partial assignment) and needs a human eye.
-            if broker is None:
+            if not broker_present:
                 await self._on_spread_expiration(local, summary)
                 return
             # Broker still showing positions on this underlying — could be the
             # spread legs themselves (ok, no action) or shares from assignment
-            # of the short put (max-loss path). Conservatively flag any state
-            # we can't classify as benign. Stock holdings here are NOT benign:
-            # they mean the short put assigned but the long put hasn't been
-            # exercised yet — that's defined-risk-realized territory and a
-            # human should confirm the close-out path.
-            if broker.shares != 0 or broker.state == PositionState.SHARES_HELD:
+            # of the short put (max-loss path). Stock holdings here are NOT
+            # benign: they mean the short put assigned but the long put hasn't
+            # been exercised yet — defined-risk-realized territory a human
+            # should confirm.
+            if has_shares:
                 await self._flag_manual_intervention(
                     local.symbol,
-                    f"spread {local.symbol} shows shares={broker.shares} at broker — "
+                    f"spread {local.symbol} shows shares={total_shares} at broker — "
                     "likely assignment on short leg; review max-loss handling",
                     summary,
                 )

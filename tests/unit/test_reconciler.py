@@ -382,6 +382,117 @@ async def test_called_away_missing_cc_strike_flags_manual_intervention(db_repos)
     assert summary.manual_interventions == 1
 
 
+# -- Covered-call lifecycle through reconcile_once (finding #8) ---------------
+#
+# An OPEN covered call holds the 100 shares AND a short call simultaneously, so
+# the broker returns TWO rows for the same underlying. The reconciler must read
+# the live short-call row as "still open" rather than collapsing the rows and
+# mis-firing expiration.
+
+
+async def _seed_cc_open(db_repos, broker: PaperBroker) -> tuple[int, str]:
+    """Put the broker + DB into a live covered-call state and return
+    (cycle_id, cc_occ_symbol)."""
+    from core.models import OrderType as _OT
+
+    cc_occ = "F250706C00010500"
+    # Broker truth: 100 shares held + a short call open against them.
+    broker._stock["F"] = (100, 9.0)
+    broker._open_options[cc_occ] = Order(
+        account_id="test", symbol="F",
+        order_type=_OT.SELL_TO_OPEN,
+        contract_symbol=cc_occ, strike=10.5,
+        expiration=date(2025, 7, 6), option_type=OptionType.CALL,
+        quantity=1, fill_price=0.30, status=OrderStatus.FILLED,
+        placed_at=_utc(), client_order_id="wb-cc-open",
+    )
+
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(
+            account_id="test", symbol="F", started_at=_utc(),
+            initial_csp_strike=9.5, initial_csp_premium=50.0, n_orders=3,
+        )
+    )
+    # CSP + assignment buy + CC sell so cc_strike + P&L resolve on called-away.
+    await db_repos.orders.insert(Order(
+        account_id="test", symbol="F", cycle_id=cycle_id,
+        order_type=OrderType.SELL_TO_OPEN, contract_symbol="F250706P00009500",
+        strike=9.5, expiration=date(2025, 7, 6), option_type=OptionType.PUT,
+        quantity=1, fill_price=0.50, status=OrderStatus.FILLED,
+        placed_at=_utc(), client_order_id="wb-csp",
+    ))
+    await db_repos.orders.insert(Order(
+        account_id="test", symbol="F", cycle_id=cycle_id,
+        order_type=OrderType.BUY_TO_OPEN, contract_symbol=None,
+        quantity=100, fill_price=9.0, status=OrderStatus.FILLED,
+        placed_at=_utc(), client_order_id="wb-assign",
+    ))
+    await db_repos.orders.insert(Order(
+        account_id="test", symbol="F", cycle_id=cycle_id,
+        order_type=OrderType.SELL_TO_OPEN, contract_symbol=cc_occ,
+        strike=10.5, expiration=date(2025, 7, 6), option_type=OptionType.CALL,
+        quantity=1, fill_price=0.30, status=OrderStatus.FILLED,
+        placed_at=_utc(), client_order_id="wb-cc",
+    ))
+    await db_repos.positions.insert(Position(
+        account_id="test", symbol="F", state=PositionState.CC_OPEN,
+        shares=100, cost_basis=9.0, current_cycle_id=cycle_id,
+        state_changed_at=_utc(),
+    ))
+    return cycle_id, cc_occ
+
+
+@pytest.mark.asyncio
+async def test_open_cc_is_not_treated_as_expired(db_repos):
+    """The bug: broker returns both a SHARES_HELD row and a CC_OPEN row for an
+    open covered call. Collapsing them (last wins) could surface SHARES_HELD and
+    fire _on_cc_expiration prematurely. The live short call must keep it open."""
+    broker = PaperBroker(cash=20_000)
+    await _seed_cc_open(db_repos, broker)
+
+    rec = Reconciler(broker, db_repos, _config())
+    summary = await rec.reconcile_once()
+
+    pos = await db_repos.positions.get_by_symbol("test", "F")
+    assert pos.state == PositionState.CC_OPEN  # unchanged — still open
+    assert summary.expirations_processed == 0
+    assert summary.called_aways_processed == 0
+
+
+@pytest.mark.asyncio
+async def test_cc_expires_worthless_transitions_to_shares_held(db_repos):
+    """Short call gone but shares remain → call expired worthless, keep shares."""
+    broker = PaperBroker(cash=20_000)
+    _cycle_id, cc_occ = await _seed_cc_open(db_repos, broker)
+    await broker.expire(cc_occ)  # short call expires worthless
+
+    rec = Reconciler(broker, db_repos, _config())
+    summary = await rec.reconcile_once()
+
+    pos = await db_repos.positions.get_by_symbol("test", "F")
+    assert pos.state == PositionState.SHARES_HELD
+    assert pos.shares == 100
+    assert summary.expirations_processed == 1
+
+
+@pytest.mark.asyncio
+async def test_cc_called_away_transitions_to_idle_and_closes_cycle(db_repos):
+    """Short call assigned → shares delivered out → called away, cycle closed."""
+    broker = PaperBroker(cash=20_000)
+    cycle_id, cc_occ = await _seed_cc_open(db_repos, broker)
+    await broker.assign(cc_occ)  # short call assigned: shares sold at strike
+
+    rec = Reconciler(broker, db_repos, _config())
+    summary = await rec.reconcile_once()
+
+    pos = await db_repos.positions.get_by_symbol("test", "F")
+    assert pos.state == PositionState.IDLE
+    assert pos.current_cycle_id is None
+    assert summary.called_aways_processed == 1
+    closed = await db_repos.cycles.get(cycle_id)
+    assert closed.cycle_outcome == "CC_CALLED_AWAY"
+
+
 @pytest.mark.asyncio
 async def test_pending_orders_keep_cursor_from_advancing_past_them(db_repos):
     """Regression: Alpaca returns 'accepted' + filled_avg_price set briefly
