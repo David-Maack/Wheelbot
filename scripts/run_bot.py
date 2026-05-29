@@ -196,6 +196,7 @@ async def _execute_roll_action(
             order_type=OrderType.BUY_TO_CLOSE,
             quantity=qty,
             rationale=f"roll_advisor:{outcome.action.value}",
+            strategy_id=position.strategy_id,
         )
         try:
             btc_result = await router.place(btc)
@@ -219,6 +220,7 @@ async def _execute_roll_action(
             order_type=OrderType.SELL_TO_OPEN,
             quantity=qty,
             rationale=f"roll_advisor:ROLL credit {outcome.rule.expected_credit_per_share}",
+            strategy_id=position.strategy_id,
         )
         try:
             sto_result = await router.place(sto)

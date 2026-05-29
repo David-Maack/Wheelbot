@@ -67,10 +67,11 @@ def _short_order(qty: int = 1) -> Order:
     )
 
 
-def _position() -> Position:
+def _position(strategy_id: str = "monthly_wheel") -> Position:
     return Position(
         id=1,
         account_id="test", symbol="F",
+        strategy_id=strategy_id,
         state=PositionState.CSP_OPEN,
         shares=0,
         current_cycle_id=1,
@@ -210,3 +211,38 @@ async def test_quantity_propagates_from_short_order():
         position=_position(), short=_short_order(qty=3), short_contract=_short_contract(),
     )
     assert captured == [3, 3]
+
+
+@pytest.mark.asyncio
+async def test_strategy_id_propagates_from_position():
+    """Finding #4: roll BTC+STO must inherit the rolled position's strategy_id,
+    not the Proposal default ('monthly_wheel'). Otherwise the order is tagged to
+    the wrong strategy, the router's position lookup misses, and the
+    idempotency key (client_order_id) is wrong."""
+    outcome = RollOutcome(
+        action=RollAction.ROLL,
+        rule=RollDecision(
+            action=RollAction.ROLL,
+            rationale="credit roll",
+            new_contract=_new_contract(),
+            expected_credit_per_share=0.40,
+        ),
+        llm=None,
+        halted=False,
+        reason="rule_only",
+    )
+
+    captured: list[str] = []
+
+    class _Capture:
+        async def place(self, proposal):
+            captured.append(proposal.strategy_id)
+            from types import SimpleNamespace
+            return SimpleNamespace(placed=SimpleNamespace())
+
+    await _execute_roll_action(
+        router=_Capture(), outcome=outcome,  # type: ignore[arg-type]
+        position=_position(strategy_id="put_spread"),
+        short=_short_order(), short_contract=_short_contract(),
+    )
+    assert captured == ["put_spread", "put_spread"]
