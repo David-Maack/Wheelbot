@@ -246,6 +246,45 @@ async def test_regime_bypasses_buy_to_close_even_when_csps_disallowed(db_repos, 
 
 
 @pytest.mark.asyncio
+async def test_close_passes_all_gates_on_tiny_account_near_bp_floor(db_repos, monkeypatch):
+    """Finding #1: a CSP buyback must NOT be blocked by buying-power floor,
+    per-position cap, or earnings. A buyback frees collateral; gating it would
+    trap the bot in a losing position it's trying to stop out of."""
+    # Earnings says we're inside a blackout window (would block an OPEN).
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: True)
+    # Tiny account, high BP floor — an OPEN of this strike would be rejected.
+    broker = PaperBroker(cash=1_000)
+    cfg = _config(buying_power_floor_pct=90, max_position_pct_of_account=1)
+    gate = RiskGate(broker, db_repos, cfg, _universe())
+
+    close_proposal = Proposal(
+        symbol="F",
+        contract=_put_contract(),
+        order_type=OrderType.BUY_TO_CLOSE,
+        quantity=1,
+        rationale="stop-loss close",
+    )
+    res = await gate.evaluate(close_proposal, today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["buying_power_floor"] == "skip"
+    assert statuses["per_position_cap"] == "skip"
+    assert statuses["earnings_blackout"] == "skip"
+    # The close must pass overall — nothing should block an exit.
+    assert res.passed
+
+
+@pytest.mark.asyncio
+async def test_open_still_blocked_by_bp_floor_on_tiny_account(db_repos, monkeypatch):
+    """Counterpart: a new CSP entry IS still gated by the BP floor."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    broker = PaperBroker(cash=1_000)
+    gate = RiskGate(broker, db_repos, _config(buying_power_floor_pct=90), _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["buying_power_floor"] == "fail"
+
+
+@pytest.mark.asyncio
 async def test_evaluate_raises_on_first_failure_by_default(db_repos, monkeypatch):
     monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
     broker = PaperBroker(cash=1_000)  # too tight → BP failure
@@ -609,10 +648,14 @@ def _hood_proposal() -> Proposal:
 
 
 async def _seed_candidate(db_repos, *, symbol: str, score: float, run_date: str | None = None):
-    """Insert a candidates row for today (or given date)."""
+    """Insert a candidates row for today (or given date).
+
+    Uses the UTC date so it matches the rule's SQLite `date('now')` (UTC).
+    date.today() is local and drifts off by a day near the UTC boundary.
+    """
     import datetime as _dt
     if run_date is None:
-        run_date = _dt.date.today().isoformat()
+        run_date = _dt.datetime.now(_dt.UTC).date().isoformat()
     conn = await db_repos.db.connect()
     await conn.execute(
         "INSERT INTO candidates (run_date, symbol, score, rationale) "

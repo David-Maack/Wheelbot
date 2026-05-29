@@ -76,6 +76,24 @@ class RiskCheckResult:
         return [r for r in self.results if r.status == "fail"]
 
 
+_CLOSE_ORDER_TYPES = (
+    OrderType.BUY_TO_CLOSE,
+    OrderType.SELL_TO_CLOSE,
+    OrderType.MULTI_LEG_CLOSE,
+)
+
+
+def _is_close(proposal: Proposal | MultiLegProposal) -> bool:
+    """True for any order that reduces/exits an existing position.
+
+    Closes must bypass entry-side risk gates (buying-power floor, per-position
+    cap, earnings blackout, regime, tier-2 screen, concurrent caps). A buyback
+    RELEASES collateral and reduces exposure — gating it can trap the bot in a
+    losing position it's trying to stop out of.
+    """
+    return proposal.order_type in _CLOSE_ORDER_TYPES
+
+
 def _notional(proposal: Proposal | MultiLegProposal) -> float:
     """Capital-at-risk for the proposal.
 
@@ -156,6 +174,9 @@ class RiskGate:
         account: Any,
         params: dict[str, Any],
     ) -> None:
+        if _is_close(proposal):
+            result.add("buying_power_floor", "skip", "close — frees collateral, not gated")
+            return
         floor_pct = float(params.get("buying_power_floor_pct", 20))
         bp_after = account.buying_power - _notional(proposal)
         floor = account.equity * (floor_pct / 100.0)
@@ -176,6 +197,9 @@ class RiskGate:
         account: Any,
         params: dict[str, Any],
     ) -> None:
+        if _is_close(proposal):
+            result.add("per_position_cap", "skip", "close — reduces exposure, not gated")
+            return
         cap_pct = float(params.get("max_position_pct_of_account", 30))
         notional = _notional(proposal)
         cap = account.equity * (cap_pct / 100.0)
@@ -291,6 +315,9 @@ class RiskGate:
         params: dict[str, Any],
         today: date | None,
     ) -> None:
+        if _is_close(proposal):
+            result.add("earnings_blackout", "skip", "close — not gated by earnings")
+            return
         days_before = int(params.get("earnings_blackout_days_before", 5))
         days_after = int(params.get("earnings_blackout_days_after", 2))
         in_window = in_blackout(
@@ -320,6 +347,9 @@ class RiskGate:
         today: date | None,
     ) -> None:
         """Use the short leg's expiration — it's the leg that bears assignment risk."""
+        if _is_close(proposal):
+            result.add("earnings_blackout", "skip", "close — not gated by earnings")
+            return
         days_before = int(params.get("earnings_blackout_days_before", 5))
         days_after = int(params.get("earnings_blackout_days_after", 2))
         short_leg = next(
