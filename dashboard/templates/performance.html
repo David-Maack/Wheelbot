@@ -178,7 +178,8 @@
 
     const outcomeLabels = Object.keys(PERF.outcomes);
     const outcomeValues = outcomeLabels.map(k => PERF.outcomes[k]);
-    const palette = ["#128a30", "#1e7eb1", "#c97700", "#b22222", "#8a4ec0", "#666"];
+    // Reuse the palette declared above — a second declaration in the same
+    // scope is a JS SyntaxError that blanks every chart on the page.
     new Chart(document.getElementById("outcomeChart"), {
       type: "doughnut",
       data: {

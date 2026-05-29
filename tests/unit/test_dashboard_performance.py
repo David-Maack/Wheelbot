@@ -143,6 +143,18 @@ async def test_view_renders_with_data(app_client):
     assert "cumChart" in resp.text  # canvas id present
 
 
+@pytest.mark.asyncio
+async def test_palette_declared_once(app_client):
+    """Finding #6: two `const palette` in the same DOMContentLoaded scope is a
+    JS redeclaration SyntaxError that blanks every chart on the page. Guard so
+    the duplicate can't sneak back in."""
+    client, deps = app_client
+    await _seed_cycle(deps.repos, symbol="F", pnl=50.0, outcome="CSP_EXPIRED", days_held=30, ended_offset_days=2)
+    resp = await client.get("/performance", headers=_auth())
+    assert resp.status_code == 200
+    assert resp.text.count("const palette =") == 1
+
+
 # -- Per-strategy breakdown -----------------------------------------------
 
 
