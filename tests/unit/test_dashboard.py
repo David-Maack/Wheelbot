@@ -217,11 +217,12 @@ async def test_positions_row_populates_dte_and_unrealized_for_put_spread(app_cli
 
 
 @pytest.mark.asyncio
-async def test_spread_pending_with_open_cycle_relabels_as_closing(app_client):
-    """An open spread with a CLOSE order in flight is parked at SPREAD_PENDING by
-    the router (it sets SPREAD_PENDING for opens AND closes). The dashboard must
-    not show it as a bare 'PENDING with P&L' — it relabels to SPREAD_CLOSING and
-    keeps the real unrealized gain of the spread being exited."""
+async def test_spread_pending_never_shows_pnl_even_with_attached_cycle(app_client):
+    """The bug David hit: a SPREAD_PENDING position whose current_cycle_id points
+    at a (stale/earlier) cycle with a FILLED open leg was showing that cycle's
+    DTE + unrealized P&L — so a pending OPEN looked like it already had a gain.
+    Pending means nothing is settled; the dashboard must show "—" regardless of
+    any attached cycle."""
     from dashboard.app import _positions_rows, _QuoteCache
     _client, deps, broker = app_client
     expiration = datetime.now(UTC).date() + timedelta(days=20)
@@ -231,45 +232,43 @@ async def test_spread_pending_with_open_cycle_relabels_as_closing(app_client):
         short_strike=400.0, long_strike=395.0, option_type="PUT",
         fill_price=0.80,
         expiration=expiration,
-        short_mid=0.12, long_mid=0.04,  # debit-to-close 0.08 → big gain
-        state=PositionState.SPREAD_PENDING,  # close order in flight
+        short_mid=0.12, long_mid=0.04,  # would compute a big gain if mis-attributed
+        state=PositionState.SPREAD_PENDING,  # order in flight, nothing settled
     )
 
     cache = _QuoteCache(ttl_seconds=60)
     rows = await _positions_rows(deps, cache)
     row = next(r for r in rows if r["symbol"] == "MSFT")
-    # Relabeled — no longer a confusing bare SPREAD_PENDING.
-    assert row["state"] == "SPREAD_CLOSING"
-    assert row["dte"] == 20
-    # Real unrealized: (0.80 - 0.08) × 100 = 72 (the spread we're closing is up).
-    assert row["unrealized"] == pytest.approx(72.0)
+    assert row["state"] == "SPREAD_PENDING"   # honest — order still in flight
+    assert row["dte"] is None
+    assert row["unrealized"] is None
+    assert row["unrealized_pct"] is None
 
 
 @pytest.mark.asyncio
-async def test_spread_pending_open_with_no_cycle_shows_dash(app_client):
-    """A genuine pending OPEN (no filled cycle) stays SPREAD_PENDING with no
-    P&L — the GOOGL case. This is the control that proves the relabel only fires
-    for close-in-flight positions."""
+async def test_spread_open_still_shows_pnl(app_client):
+    """Control: a genuinely OPEN spread still shows DTE + unrealized (the fix
+    only suppresses P&L for *_PENDING states, not open ones)."""
     from dashboard.app import _positions_rows, _QuoteCache
     _client, deps, broker = app_client
-    now = datetime.now(UTC).replace(tzinfo=None)
-    await deps.repos.positions.insert(
-        Position(
-            account_id="test",
-            symbol="GOOGL",
-            strategy_id="put_spread",
-            state=PositionState.SPREAD_PENDING,
-            shares=0,
-            current_cycle_id=None,  # nothing filled yet
-            state_changed_at=now,
-        )
+    expiration = datetime.now(UTC).date() + timedelta(days=20)
+    await _seed_spread_position(
+        deps, broker,
+        symbol="MSFT", strategy_id="put_spread",
+        short_strike=400.0, long_strike=395.0, option_type="PUT",
+        fill_price=0.80,
+        expiration=expiration,
+        short_mid=0.12, long_mid=0.04,  # debit-to-close 0.08
+        state=PositionState.SPREAD_OPEN,
     )
+
     cache = _QuoteCache(ttl_seconds=60)
     rows = await _positions_rows(deps, cache)
-    row = next(r for r in rows if r["symbol"] == "GOOGL")
-    assert row["state"] == "SPREAD_PENDING"  # unchanged
-    assert row["dte"] is None
-    assert row["unrealized"] is None
+    row = next(r for r in rows if r["symbol"] == "MSFT")
+    assert row["state"] == "SPREAD_OPEN"
+    assert row["dte"] == 20
+    # (0.80 - 0.08) × 100 = 72
+    assert row["unrealized"] == pytest.approx(72.0)
 
 
 @pytest.mark.asyncio
