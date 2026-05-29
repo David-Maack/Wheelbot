@@ -258,9 +258,36 @@ async def propose_all_closes(
         return []
     account_id = config.get("account", {}).get("id", "primary")
     active = await repos.positions.list_active(account_id, strategy_id=strategy.id)
+
+    # Serialize against the roll evaluator (finding #10). The reconciler's
+    # roll-trigger scan runs BEFORE this close pass in the same tick; if it
+    # rolled a challenged short it has already placed a BUY_TO_CLOSE (and a
+    # SELL_TO_OPEN re-open) that are now PENDING. Proposing a close on the same
+    # leg would either collide on the idempotency key (harmless) or, worse, let
+    # the roll's re-open win while a stop-loss close was silently subsumed —
+    # re-opening a position we wanted flat. Any in-flight order on this
+    # (symbol, strategy) means the leg is already being acted on, so skip it
+    # and let the pending action resolve first. (Also stops us re-proposing a
+    # close while a prior close is still pending.)
+    pending = await repos.orders.list_pending(account_id)
+    inflight = {
+        (o.symbol.upper(), o.strategy_id)
+        for o in pending
+        if o.status in (OrderStatus.PENDING, OrderStatus.PARTIAL)
+    }
+
     out: list[Proposal] = []
     for pos in active:
         if pos.state not in (PositionState.CSP_OPEN, PositionState.CC_OPEN):
+            continue
+        if (pos.symbol.upper(), pos.strategy_id) in inflight:
+            log_checkpoint(
+                "wheel_close_skip_inflight",
+                status="skip",
+                symbol=pos.symbol,
+                strategy=strategy.id,
+                reason="order already in flight (roll/close pending)",
+            )
             continue
         proposal = await propose_close_for_position(
             broker, repos, pos, today=today, strategy=strategy,

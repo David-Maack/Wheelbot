@@ -316,6 +316,39 @@ async def test_propose_all_closes_walks_active_wheel_positions(db_repos):
 
 
 @pytest.mark.asyncio
+async def test_propose_all_closes_skips_position_with_inflight_order(db_repos):
+    """Finding #10: serialize roll vs close. The roll evaluator runs earlier in
+    the tick and may already have placed a PENDING BUY_TO_CLOSE (+ re-open) on
+    a challenged short. The close pass must skip a position that already has an
+    in-flight order on its (symbol, strategy) rather than stacking a second
+    action / letting the roll's re-open silently win."""
+    position, _ = await _seed_open_csp(
+        db_repos, fill_price=1.00, symbol="F", contract="F250706P00010000",
+    )
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.44, ask=0.46))  # 55% — would fire
+
+    # Simulate the roll evaluator already having placed a BUY_TO_CLOSE this tick.
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await db_repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", strategy_id="monthly_wheel",
+            order_type=OrderType.BUY_TO_CLOSE, contract_symbol="F250706P00010000",
+            strike=10.0, expiration=date(2025, 6, 1) + timedelta(days=35),
+            option_type=OptionType.PUT, quantity=1, limit_price=0.45,
+            status=OrderStatus.PENDING, placed_at=now, client_order_id="wb-roll-btc",
+        )
+    )
+
+    config = {"account": {"id": "test"}}
+    proposals = await propose_all_closes(
+        broker, db_repos, config, strategy=_strategy(),
+    )
+    # Close suppressed because an order is already in flight on this leg.
+    assert proposals == []
+
+
+@pytest.mark.asyncio
 async def test_csp_time_close_fires_when_dte_below_threshold(db_repos):
     """Sprint 13 sub-sprint 2: time-close on a CSP when DTE ≤ time_close_dte."""
     position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
