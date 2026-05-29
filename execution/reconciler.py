@@ -706,6 +706,22 @@ class Reconciler:
             )
 
     async def _on_called_away(self, local: Position, summary: ReconcileSummary) -> None:
+        # Persist a synthetic SELL_TO_CLOSE order at the CC strike so cycle
+        # P&L captures the share leg. Same reason as _on_assignment.
+        cc_strike = await self._cycle_cc_strike(local.current_cycle_id)
+        shares_sold = local.shares
+        # Phantom-loss guard: assignment already recorded the share PURCHASE
+        # (synthetic BUY_TO_OPEN at the CSP strike). If we held shares but can't
+        # recover the CC strike, we can't record the offsetting SALE — closing
+        # the cycle now would book the full cost basis as a loss. Hand it to a
+        # human instead of corrupting the books.
+        if shares_sold > 0 and cc_strike is None:
+            await self._flag_manual_intervention(
+                local.symbol,
+                "called_away_missing_cc_strike",
+                summary,
+            )
+            return
         summary.called_aways_processed += 1
         await notify(
             "position.called_away",
@@ -713,10 +729,6 @@ class Reconciler:
             symbol=local.symbol,
             cycle_id=local.current_cycle_id,
         )
-        # Persist a synthetic SELL_TO_CLOSE order at the CC strike so cycle
-        # P&L captures the share leg. Same reason as _on_assignment.
-        cc_strike = await self._cycle_cc_strike(local.current_cycle_id)
-        shares_sold = local.shares
         if local.current_cycle_id is not None and shares_sold > 0 and cc_strike is not None:
             await self._repos.orders.insert(
                 Order(

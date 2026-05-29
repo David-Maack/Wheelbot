@@ -317,6 +317,72 @@ async def test_called_away_persists_synthetic_stock_sell_for_cycle_pnl(db_repos)
 
 
 @pytest.mark.asyncio
+async def test_called_away_missing_cc_strike_flags_manual_intervention(db_repos):
+    """Finding #5: if shares were held but the CC strike can't be recovered, we
+    can't record the offsetting share SALE. Closing the cycle now would book the
+    full cost basis as a phantom loss. Instead, flag MANUAL_INTERVENTION and
+    leave the cycle open for a human."""
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(
+            account_id="test", symbol="F", started_at=_utc(),
+            initial_csp_strike=9.5, initial_csp_premium=50.0, n_orders=2,
+        )
+    )
+    # CSP fill (+50 premium).
+    await db_repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", cycle_id=cycle_id,
+            order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol="F250706P00009500",
+            strike=9.5, expiration=date(2025, 7, 6),
+            option_type=OptionType.PUT,
+            quantity=1, fill_price=0.50,
+            status=OrderStatus.FILLED,
+            placed_at=_utc(),
+            client_order_id="wb-csp",
+        )
+    )
+    # Synthetic BUY_TO_OPEN from assignment (the share purchase, -900).
+    await db_repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", cycle_id=cycle_id,
+            order_type=OrderType.BUY_TO_OPEN,
+            contract_symbol=None, strike=None, expiration=None, option_type=None,
+            quantity=100, fill_price=9.0,
+            status=OrderStatus.FILLED,
+            placed_at=_utc(),
+            client_order_id="wb-csp-assign",
+        )
+    )
+    # NOTE: deliberately NO CC SELL_TO_OPEN CALL order → _cycle_cc_strike None.
+    pos_id = await db_repos.positions.insert(
+        Position(
+            account_id="test", symbol="F",
+            state=PositionState.CC_OPEN,
+            shares=100, cost_basis=9.0,
+            current_cycle_id=cycle_id,
+            state_changed_at=_utc(),
+        )
+    )
+
+    broker = PaperBroker(cash=30_000)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    pos = await db_repos.positions.get(pos_id)
+    await rec._on_called_away(pos, summary)
+
+    # Cycle stays OPEN (not closed at a phantom loss).
+    cyc = await db_repos.cycles.get(cycle_id)
+    assert cyc.cycle_outcome is None
+    assert cyc.final_pnl is None
+    # Position is flagged for human review.
+    reloaded = await db_repos.positions.get(pos_id)
+    assert reloaded.state == PositionState.MANUAL_INTERVENTION
+    assert summary.called_aways_processed == 0
+    assert summary.manual_interventions == 1
+
+
+@pytest.mark.asyncio
 async def test_pending_orders_keep_cursor_from_advancing_past_them(db_repos):
     """Regression: Alpaca returns 'accepted' + filled_avg_price set briefly
     before flipping to 'filled'. If our cursor advances past placed_at, we
