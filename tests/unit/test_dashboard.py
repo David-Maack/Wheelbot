@@ -109,11 +109,14 @@ async def _seed_spread_position(
     expiration: date,
     short_mid: float,
     long_mid: float,
+    state: PositionState = PositionState.SPREAD_OPEN,
 ):
-    """Create a SPREAD_OPEN position with a FILLED MULTI_LEG_OPEN parent order.
+    """Create a position with a FILLED MULTI_LEG_OPEN parent order.
 
     Mirrors what the reconciler does after a multi-leg fill: cycle row,
-    position in SPREAD_OPEN, parent order with `raw_request["legs"]`.
+    position (SPREAD_OPEN by default), parent order with `raw_request["legs"]`.
+    Pass state=SPREAD_PENDING to simulate a close order in flight on an open
+    spread (the cycle stays open until the close fills).
     """
     from core.models import OrderType as OT
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -170,7 +173,7 @@ async def _seed_spread_position(
             account_id="test",
             symbol=symbol,
             strategy_id=strategy_id,
-            state=PositionState.SPREAD_OPEN,
+            state=state,
             shares=0,
             current_cycle_id=cycle_id,
             state_changed_at=now,
@@ -211,6 +214,62 @@ async def test_positions_row_populates_dte_and_unrealized_for_put_spread(app_cli
     assert row["unrealized"] == pytest.approx(18.0)
     # P&L % = (0.30 - 0.12) / 0.30 * 100 = 60% captured
     assert row["unrealized_pct"] == pytest.approx(60.0)
+
+
+@pytest.mark.asyncio
+async def test_spread_pending_with_open_cycle_relabels_as_closing(app_client):
+    """An open spread with a CLOSE order in flight is parked at SPREAD_PENDING by
+    the router (it sets SPREAD_PENDING for opens AND closes). The dashboard must
+    not show it as a bare 'PENDING with P&L' — it relabels to SPREAD_CLOSING and
+    keeps the real unrealized gain of the spread being exited."""
+    from dashboard.app import _positions_rows, _QuoteCache
+    _client, deps, broker = app_client
+    expiration = datetime.now(UTC).date() + timedelta(days=20)
+    await _seed_spread_position(
+        deps, broker,
+        symbol="MSFT", strategy_id="put_spread",
+        short_strike=400.0, long_strike=395.0, option_type="PUT",
+        fill_price=0.80,
+        expiration=expiration,
+        short_mid=0.12, long_mid=0.04,  # debit-to-close 0.08 → big gain
+        state=PositionState.SPREAD_PENDING,  # close order in flight
+    )
+
+    cache = _QuoteCache(ttl_seconds=60)
+    rows = await _positions_rows(deps, cache)
+    row = next(r for r in rows if r["symbol"] == "MSFT")
+    # Relabeled — no longer a confusing bare SPREAD_PENDING.
+    assert row["state"] == "SPREAD_CLOSING"
+    assert row["dte"] == 20
+    # Real unrealized: (0.80 - 0.08) × 100 = 72 (the spread we're closing is up).
+    assert row["unrealized"] == pytest.approx(72.0)
+
+
+@pytest.mark.asyncio
+async def test_spread_pending_open_with_no_cycle_shows_dash(app_client):
+    """A genuine pending OPEN (no filled cycle) stays SPREAD_PENDING with no
+    P&L — the GOOGL case. This is the control that proves the relabel only fires
+    for close-in-flight positions."""
+    from dashboard.app import _positions_rows, _QuoteCache
+    _client, deps, broker = app_client
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await deps.repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol="GOOGL",
+            strategy_id="put_spread",
+            state=PositionState.SPREAD_PENDING,
+            shares=0,
+            current_cycle_id=None,  # nothing filled yet
+            state_changed_at=now,
+        )
+    )
+    cache = _QuoteCache(ttl_seconds=60)
+    rows = await _positions_rows(deps, cache)
+    row = next(r for r in rows if r["symbol"] == "GOOGL")
+    assert row["state"] == "SPREAD_PENDING"  # unchanged
+    assert row["dte"] is None
+    assert row["unrealized"] is None
 
 
 @pytest.mark.asyncio

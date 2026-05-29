@@ -318,12 +318,14 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
         dte: int | None = None
         unrealized: float | None = None
         unrealized_pct: float | None = None
+        has_open_leg = False  # True once we find a FILLED open order for the cycle
         if p.current_cycle_id:
             cycle = await deps.repos.cycles.get(p.current_cycle_id)
             if cycle:
                 # Find an open option order for this position to compute DTE / unrealized.
                 latest_open_option = await _latest_open_option_for_cycle(deps, cycle.id)
                 if latest_open_option:
+                    has_open_leg = True
                     if latest_open_option.order_type == OrderType.MULTI_LEG_OPEN:
                         # Multi-leg path: short-leg expiration drives DTE; debit-to-close
                         # nets BOTH legs to compute unrealized vs the original credit.
@@ -349,11 +351,22 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                                         / latest_open_option.fill_price
                                         * 100
                                     )
+        # A spread with a close order in flight is still OPEN at the broker
+        # until the close fills, but the router parks it at SPREAD_PENDING for
+        # BOTH opens and closes (unlike single-leg closes, which stay *_OPEN).
+        # When the cycle still has a FILLED open leg, the position is really an
+        # open spread being closed — relabel so the row isn't a confusing
+        # "PENDING that somehow has unrealized P&L" (the figure shown is the real
+        # gain of the spread we're exiting). A true pending OPEN has no filled
+        # cycle and keeps its SPREAD_PENDING label + "—" across the board.
+        display_state = str(p.state)
+        if p.state == PositionState.SPREAD_PENDING and has_open_leg:
+            display_state = "SPREAD_CLOSING"
         out.append(
             {
                 "symbol": p.symbol,
                 "strategy_id": p.strategy_id,
-                "state": str(p.state),
+                "state": display_state,
                 "days_in_state": days_in_state,
                 "shares": p.shares,
                 "cost_basis": p.cost_basis,
