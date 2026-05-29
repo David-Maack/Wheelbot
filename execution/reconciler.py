@@ -55,6 +55,26 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def _observed_partial_fill(local: Order, broker_view: Order) -> bool:
+    """True if some quantity executed before the order terminated.
+
+    Two signals, in priority order:
+      1. We persisted PARTIAL on a prior tick (the reliable, broker-agnostic
+         signal — the reconcile loop writes status every tick).
+      2. Best-effort: the broker's raw payload carries a positive `filled_qty`
+         below the ordered quantity (catches a partial-then-cancel that
+         collapsed into a single tick, e.g. EOD auto-cancel of a DAY order).
+    """
+    if local.status == OrderStatus.PARTIAL:
+        return True
+    raw = broker_view.raw_response or {}
+    try:
+        filled = float(raw.get("filled_qty") or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 < filled < float(broker_view.quantity or local.quantity or 0)
+
+
 # When a cycle is closed with a "profit" outcome by the caller but the realized
 # P&L is actually negative (e.g. a stop-loss / defensive buyback hardcoded to
 # CSP_CLOSED_PROFIT), relabel to the matching loss outcome so the dashboard's
@@ -237,7 +257,20 @@ class Reconciler:
             if local_was_pending and now_filled:
                 await self._on_fill(local, broker_view, summary)
             elif local_was_pending and now_cancelled:
-                await self._on_cancel(local, broker_view, summary)
+                # A DAY order that partially filled and then cancelled (or got
+                # cancelled at EOD with some contracts/legs already executed)
+                # leaves REAL filled quantity live at the broker. _on_cancel
+                # would reset the position as if nothing filled, orphaning those
+                # contracts. Hand it to a human instead of corrupting state.
+                if _observed_partial_fill(local, broker_view):
+                    await self._flag_manual_intervention(
+                        local.symbol,
+                        f"order {local.broker_order_id} {broker_view.status.value} "
+                        f"after partial fill — manual reconcile",
+                        summary,
+                    )
+                else:
+                    await self._on_cancel(local, broker_view, summary)
 
     async def _on_fill(
         self,

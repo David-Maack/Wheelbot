@@ -334,3 +334,95 @@ async def test_single_leg_cancel_does_not_clobber_manual_intervention(db_repos):
     assert summary.cancellations_processed == 0
     pos = await db_repos.positions.get_by_symbol("test", "MARA")
     assert pos.state == PositionState.MANUAL_INTERVENTION  # untouched
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_then_cancel_flags_manual_not_reset(db_repos):
+    """Finding #7: a multi-contract order that partially fills and then cancels
+    leaves REAL contracts live at the broker. _on_cancel would reset the
+    position to IDLE, orphaning them. Instead the reconciler must flag
+    MANUAL_INTERVENTION and leave the cycle/position for a human."""
+    broker = PaperBroker(cash=20_000)
+    rogue = Order(
+        account_id="test",
+        symbol="MARA",
+        order_type=OrderType.SELL_TO_OPEN,
+        contract_symbol="MARA260529P00011000",
+        strike=11.0,
+        expiration=date(2026, 5, 29),
+        option_type=OptionType.PUT,
+        quantity=3,                       # multi-contract → partial fill possible
+        limit_price=0.20,
+        status=OrderStatus.PENDING,
+        placed_at=_utc(),
+        client_order_id="wb-csp-partial",
+    )
+    placed = await broker.place_order(rogue)
+    # We'd recorded a PARTIAL on a prior tick (1 of 3 contracts filled).
+    await db_repos.orders.insert(
+        rogue.model_copy(
+            update={
+                "broker_order_id": placed.broker_order_id,
+                "status": OrderStatus.PARTIAL,
+            },
+        )
+    )
+    await db_repos.positions.insert(
+        Position(
+            account_id="test",
+            symbol="MARA",
+            strategy_id="weekly_wheel",
+            state=PositionState.CSP_PENDING,
+            shares=0,
+            state_changed_at=_utc(),
+        )
+    )
+
+    # Remaining quantity cancelled (e.g. EOD on a DAY order).
+    await broker.cancel_order(placed.broker_order_id)
+
+    rec = Reconciler(broker, db_repos, _config())
+    summary = await rec.reconcile_once()
+
+    # NOT treated as a clean cancel — no reset to IDLE.
+    assert summary.cancellations_processed == 0
+    assert summary.manual_interventions == 1
+    pos = await db_repos.positions.get_by_symbol("test", "MARA")
+    assert pos.state == PositionState.MANUAL_INTERVENTION
+
+
+def test_observed_partial_fill_signals():
+    """Unit-cover both detection signals of _observed_partial_fill."""
+    from execution.reconciler import _observed_partial_fill
+
+    def _order(**kw):
+        base = dict(
+            account_id="t", symbol="F", order_type=OrderType.SELL_TO_OPEN,
+            quantity=3, status=OrderStatus.PENDING, placed_at=_utc(),
+        )
+        base.update(kw)
+        return Order(**base)
+
+    # 1. Persisted PARTIAL on the local row.
+    assert _observed_partial_fill(
+        _order(status=OrderStatus.PARTIAL), _order(status=OrderStatus.CANCELLED)
+    ) is True
+
+    # 2. Best-effort: raw payload shows a partial filled_qty below ordered qty.
+    bv = _order(status=OrderStatus.CANCELLED, raw_response={"filled_qty": "1"})
+    assert _observed_partial_fill(_order(status=OrderStatus.PENDING), bv) is True
+
+    # Fully filled (filled_qty == quantity) is NOT a partial.
+    bv_full = _order(status=OrderStatus.CANCELLED, raw_response={"filled_qty": "3"})
+    assert _observed_partial_fill(_order(status=OrderStatus.PENDING), bv_full) is False
+
+    # No fill at all → clean cancel.
+    bv_zero = _order(status=OrderStatus.CANCELLED, raw_response={"filled_qty": "0"})
+    assert _observed_partial_fill(_order(status=OrderStatus.PENDING), bv_zero) is False
+
+    # Missing / malformed payload → no false positive.
+    assert _observed_partial_fill(
+        _order(status=OrderStatus.PENDING), _order(status=OrderStatus.CANCELLED)
+    ) is False
+    bv_bad = _order(status=OrderStatus.CANCELLED, raw_response={"filled_qty": "oops"})
+    assert _observed_partial_fill(_order(status=OrderStatus.PENDING), bv_bad) is False
