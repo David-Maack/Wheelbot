@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -337,14 +337,14 @@ class OrderRouter:
                         + " | qty=1 cannot be halved — treated as block",
                     )
                 effective_qty = halved
-                proposal = Proposal(
-                    symbol=proposal.symbol,
-                    contract=proposal.contract,
-                    order_type=proposal.order_type,
+                # Preserve EVERY other field (strategy_id especially — rebuilding
+                # the Proposal by hand previously dropped it, silently re-tagging
+                # a halved weekly_wheel CSP as the default monthly_wheel and
+                # corrupting its idempotency key + position lookup).
+                proposal = replace(
+                    proposal,
                     quantity=halved,
                     rationale=proposal.rationale + " (size halved by news_check)",
-                    requires_screen=proposal.requires_screen,
-                    requires_human=proposal.requires_human,
                 )
 
         if self._cfg.dry_run:

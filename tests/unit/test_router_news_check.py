@@ -127,6 +127,30 @@ async def test_caution_halves_qty_when_possible(db_repos):
 
 
 @pytest.mark.asyncio
+async def test_caution_halving_preserves_strategy_id(db_repos):
+    """Regression: rebuilding the Proposal on a caution-halve previously dropped
+    strategy_id, silently re-tagging a halved weekly_wheel CSP as monthly_wheel
+    (wrong idempotency key + position lookup). It must be preserved."""
+    broker = PaperBroker(cash=40_000)
+    news = _NewsStub("caution", "shaky guidance")
+    router = OrderRouter(broker, db_repos, _config(), _universe(), news_checker=news)
+    weekly = Proposal(
+        symbol="F",
+        contract=_contract(),
+        order_type=OrderType.SELL_TO_OPEN,
+        quantity=4,
+        rationale="csp test",
+        strategy_id="weekly_wheel",
+    )
+    result = await router.place(weekly, sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert result.placed is not None
+    assert result.placed.quantity == 2            # halved
+    assert result.placed.strategy_id == "weekly_wheel"  # NOT defaulted to monthly_wheel
+    pos = await db_repos.positions.get_by_symbol("test", "F", strategy_id="weekly_wheel")
+    assert pos is not None
+
+
+@pytest.mark.asyncio
 async def test_caution_with_qty_one_blocks(db_repos):
     """Spec stretch: caution + qty=1 → block (can't halve a single contract)."""
     broker = PaperBroker(cash=20_000)
