@@ -109,6 +109,20 @@ async def test_persist_drops_unknown_symbols(db_repos):
 
 
 @pytest.mark.asyncio
+async def test_persist_returns_zero_on_malformed_response(db_repos):
+    """A truncated / non-JSON model reply falls back to {"text": ...} with no
+    `candidates` key — persists nothing. run_screener now logs
+    `screener_zero_candidates` (status=fail) on this so it isn't silent."""
+    from intelligence.screener import TickerSnapshot
+
+    snapshots = [TickerSnapshot(symbol="F", tier=1)]
+    # Parse-failure fallback shape from AnthropicClient.call.
+    assert await _persist_candidates(db_repos, snapshots, {"text": "not json"}, date(2025, 6, 1)) == 0
+    # Empty list shape.
+    assert await _persist_candidates(db_repos, snapshots, {"candidates": []}, date(2025, 6, 1)) == 0
+
+
+@pytest.mark.asyncio
 async def test_run_screener_skipped_when_disabled(db_repos):
     broker = PaperBroker()
     config = {"intelligence": {"llm_screener_enabled": False}}

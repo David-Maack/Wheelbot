@@ -256,6 +256,20 @@ async def run_screener(
         n_written = await _persist_candidates(repos, snapshots, result["parsed"], run_date)
         ctx["candidates_written"] = n_written
         ctx["cost_usd"] = round(result["cost_usd"], 4)
+        # A successful API call that yields ZERO candidates is a silent failure:
+        # the model returned non-JSON / truncated output (parsed falls back to
+        # {"text": ...}), or an empty list. Without this, every tier-2 entry the
+        # NEXT day fails the screen gate ("no LLM screener row") with no obvious
+        # cause. Surface it loudly so the cron's exit/log makes the problem visible.
+        if n_written == 0:
+            parsed = result.get("parsed") or {}
+            log_checkpoint(
+                "screener_zero_candidates",
+                status="fail",
+                reason="model returned no parseable candidates",
+                had_text_fallback="text" in parsed,
+                raw_preview=str(result.get("raw_text", ""))[:200],
+            )
         return {
             "candidates_written": n_written,
             "cost_usd": result["cost_usd"],
