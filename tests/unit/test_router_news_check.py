@@ -151,6 +151,34 @@ async def test_caution_halving_preserves_strategy_id(db_repos):
 
 
 @pytest.mark.asyncio
+async def test_advisory_mode_caution_proceeds_full_size(db_repos):
+    """Advisory mode (paper testing): a 'caution' is logged but the order
+    proceeds at FULL size — only a hard 'block' cancels."""
+    broker = PaperBroker(cash=20_000)
+    news = _NewsStub("caution", "elevated IV")
+    cfg = _config()
+    cfg["intelligence"] = {"news_check_advisory": True}
+    router = OrderRouter(broker, db_repos, cfg, _universe(), news_checker=news)
+    result = await router.place(_proposal(qty=2), sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert result.placed is not None
+    assert result.placed.quantity == 2          # NOT halved
+    assert result.news_decision == "caution"
+
+
+@pytest.mark.asyncio
+async def test_advisory_mode_still_blocks_on_block(db_repos):
+    """Advisory only softens 'caution' — a hard 'block' still cancels."""
+    broker = PaperBroker(cash=20_000)
+    news = _NewsStub("block", "fraud probe")
+    cfg = _config()
+    cfg["intelligence"] = {"news_check_advisory": True}
+    router = OrderRouter(broker, db_repos, cfg, _universe(), news_checker=news)
+    result = await router.place(_proposal(qty=2), sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert result.placed is None
+    assert result.news_decision == "block"
+
+
+@pytest.mark.asyncio
 async def test_caution_with_qty_one_blocks(db_repos):
     """Spec stretch: caution + qty=1 → block (can't halve a single contract)."""
     broker = PaperBroker(cash=20_000)

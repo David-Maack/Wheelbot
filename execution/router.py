@@ -60,6 +60,12 @@ class RouterConfig:
     # close. Opens placed near/after close can't fill or be managed. Closes
     # and rolls are exempt.
     entry_cutoff_minutes_before_close: int = 15
+    # news_check enforcement. When True (advisory mode, used during paper
+    # testing), a "caution" verdict is logged but the order proceeds at FULL
+    # size; only an explicit "block" cancels. When False (full enforcement),
+    # "caution" halves the size (and a 1-lot caution becomes a block). The
+    # underlying news_check still runs + records either way.
+    news_check_advisory: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +144,7 @@ def _client_order_id(proposal: Proposal, today: date | None = None) -> str:
 
 def _router_config(config: dict[str, Any]) -> RouterConfig:
     section = config.get("execution", {}) or {}
+    intel = config.get("intelligence", {}) or {}
     return RouterConfig(
         dry_run=bool(section.get("dry_run", False)),
         retry_max_attempts=int(section.get("retry_max_attempts", 5)),
@@ -149,6 +156,7 @@ def _router_config(config: dict[str, Any]) -> RouterConfig:
         entry_cutoff_minutes_before_close=int(
             section.get("entry_cutoff_minutes_before_close", 15)
         ),
+        news_check_advisory=bool(intel.get("news_check_advisory", False)),
     )
 
 
@@ -318,7 +326,17 @@ class OrderRouter:
                     news_decision="block",
                     news_rationale=news_rationale,
                 )
-            if news_decision == "caution":
+            if news_decision == "caution" and self._cfg.news_check_advisory:
+                # Advisory mode (paper testing): record the caution but proceed
+                # at full size. Only a hard "block" stops the order.
+                log_checkpoint(
+                    "router_news_caution_advisory",
+                    status="ok",
+                    symbol=proposal.symbol,
+                    note="advisory mode — proceeding at full size",
+                    rationale=news_rationale,
+                )
+            elif news_decision == "caution":
                 halved = effective_qty // 2
                 if halved == 0:
                     # Spec-stretch: caution + qty=1 → block (halving a single

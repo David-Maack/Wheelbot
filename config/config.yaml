@@ -82,6 +82,12 @@ regime:
 intelligence:
   llm_screener_enabled: true
   llm_news_check_enabled: true
+  # news_check enforcement. TESTING PHASE = advisory: a "caution" verdict is
+  # logged (visible in /decisions) but the CSP proceeds at full size; only a
+  # hard "block" cancels. Keeps wheel data volume up while Haiku tends to
+  # caution-on-everything. FLIP TO false (full enforcement: caution halves,
+  # 1-lot caution => block) before going live on the real bankroll.
+  news_check_advisory: true
   llm_roll_advisor_enabled: false   # turn on after collecting 3+ months of data
   llm_provider: anthropic
   screener_model: claude-opus-4-7
