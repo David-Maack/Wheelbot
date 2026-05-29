@@ -54,6 +54,19 @@ def test_map_status_unknown_falls_back_to_pending():
     assert _map_status("some_new_alpaca_state") == OrderStatus.PENDING
 
 
+def test_map_status_done_for_day_and_calculated_are_pending_not_rejected():
+    """Finding #9: `calculated` (post-fill settlement accounting) and
+    `done_for_day` are NOT rejections. Mapping them to REJECTED would make the
+    reconciler treat a filled/unfinished order as cancelled and reset the
+    position. They must hold as PENDING until a definitive terminal status."""
+    assert _map_status("calculated") == OrderStatus.PENDING
+    assert _map_status("done_for_day") == OrderStatus.PENDING
+    # Genuine rejections still map to REJECTED.
+    assert _map_status("rejected") == OrderStatus.REJECTED
+    assert _map_status("suspended") == OrderStatus.REJECTED
+    assert _map_status("stopped") == OrderStatus.REJECTED
+
+
 def test_parse_occ_round_trip():
     parsed = _parse_occ("F250620P00010000")
     assert parsed is not None

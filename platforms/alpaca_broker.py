@@ -42,9 +42,20 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 # Alpaca order statuses → our OrderStatus.
-_PENDING = {"new", "pending_new", "accepted", "accepted_for_bidding", "pending_review", "held"}
+#
+# `done_for_day` and `calculated` are deliberately PENDING, not REJECTED:
+#   - `calculated` is a post-fill settlement-accounting state that commonly
+#     FOLLOWS a fill. Mapping it to REJECTED would make the reconciler treat a
+#     filled order as cancelled and run _on_cancel — resetting a real position
+#     to IDLE. Hold as PENDING and wait for the definitive `filled`.
+#   - `done_for_day` just means "no more fills today"; the unfilled remainder of
+#     a DAY order is canceled/expired at session end (→ CANCELLED) on its own.
+_PENDING = {
+    "new", "pending_new", "accepted", "accepted_for_bidding", "pending_review",
+    "held", "done_for_day", "calculated",
+}
 _CANCELLED = {"canceled", "pending_cancel", "expired", "replaced", "pending_replace"}
-_REJECTED = {"rejected", "suspended", "stopped", "done_for_day", "calculated"}
+_REJECTED = {"rejected", "suspended", "stopped"}
 
 
 def _utcnow() -> datetime:
