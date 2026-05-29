@@ -6,9 +6,14 @@ account:
   broker: "alpaca_paper"        # alpaca_paper | tastytrade_sandbox | tastytrade
   # Sprint 12 sub-sprint 4: global cap on active positions across ALL strategies.
   # Per-strategy caps (max_concurrent on each strategy) are additionally enforced;
-  # this is the ceiling. Sized for a small live bankroll — on $5-wide spreads,
-  # 4 simultaneous positions = ~$1400 max exposure. Raise as the account grows.
-  max_concurrent_total: 4
+  # this is the ceiling.
+  #
+  # TESTING PHASE (paper, gathering data): set to the SUM of per-strategy caps
+  # (2 monthly + 4 weekly + 4 put_spread + 4 bear_call = 14) so the per-strategy
+  # caps are what actually bind and nothing throttles while we collect data.
+  # BEFORE GOING LIVE on the smaller real bankroll, tighten this back down
+  # (≈4) — on $5-wide spreads, 4 simultaneous positions ≈ $1400 max exposure.
+  max_concurrent_total: 14
 
 database:
   path: "/mnt/wheelbot-storage/wheelbot.db"
@@ -159,7 +164,7 @@ strategies:
     display_name: "Monthly Wheel"
     type: wheel
     enabled: true
-    max_concurrent: 4
+    max_concurrent: 2
     params:
       dte_min: 30
       dte_max: 45
