@@ -337,8 +337,8 @@ class AlpacaBroker(Broker):
             update={
                 "broker_order_id": str(placed.id),
                 "status": _map_status(placed.status),
-                "limit_price": float(placed.limit_price) if placed.limit_price else order.limit_price,
-                "fill_price": float(placed.filled_avg_price) if placed.filled_avg_price else None,
+                "limit_price": float(placed.limit_price) if placed.limit_price is not None else order.limit_price,
+                "fill_price": float(placed.filled_avg_price) if placed.filled_avg_price is not None else None,
                 "placed_at": _strip_tz(placed.submitted_at) or order.placed_at or _utcnow(),
                 "filled_at": _strip_tz(placed.filled_at),
                 "raw_request": req.model_dump(mode="json"),
@@ -432,7 +432,12 @@ class AlpacaBroker(Broker):
             option_type=None,
             quantity=quantity,
             limit_price=limit_price,
-            fill_price=float(placed.filled_avg_price) if placed.filled_avg_price else None,
+            # Alpaca's filled_avg_price for an MLEG package is the net debit
+            # paid (positive). Our convention is positive=credit, so negate on
+            # the way out to stay consistent with _to_order_multi_leg (the
+            # read-back path) and the cycle PnL math. `is not None` guard so a
+            # genuine 0.0 fill isn't silently dropped to None.
+            fill_price=-float(placed.filled_avg_price) if placed.filled_avg_price is not None else None,
             status=_map_status(placed.status),
             placed_at=_strip_tz(placed.submitted_at) or _utcnow(),
             filled_at=_strip_tz(placed.filled_at),
@@ -620,8 +625,8 @@ class AlpacaBroker(Broker):
             expiration=parsed[1] if parsed else None,
             option_type=parsed[2] if parsed else None,
             quantity=int(float(raw.qty or 0)),
-            limit_price=float(raw.limit_price) if raw.limit_price else None,
-            fill_price=float(raw.filled_avg_price) if raw.filled_avg_price else None,
+            limit_price=float(raw.limit_price) if raw.limit_price is not None else None,
+            fill_price=float(raw.filled_avg_price) if raw.filled_avg_price is not None else None,
             status=_map_status(raw.status),
             placed_at=_strip_tz(raw.submitted_at) or _utcnow(),
             filled_at=_strip_tz(raw.filled_at),

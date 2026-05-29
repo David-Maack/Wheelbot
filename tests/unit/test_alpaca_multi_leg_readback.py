@@ -156,6 +156,138 @@ def test_to_order_mleg_pending_no_fill_price(broker):
     assert order.filled_at is None
 
 
+class _FakeReq:
+    """Stand-in for Alpaca's *Request models: records kwargs, dumps to dict."""
+
+    def __init__(self, **kwargs):
+        self._kwargs = kwargs
+
+    def model_dump(self, mode=None):
+        return {k: str(v) for k, v in self._kwargs.items()}
+
+
+def _stub_submit_modules(monkeypatch):
+    """Stub the alpaca request/exception modules place_multi_leg_order imports."""
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules,
+        "alpaca.common.exceptions",
+        SimpleNamespace(APIError=type("APIError", (Exception,), {})),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "alpaca.trading.requests",
+        SimpleNamespace(
+            LimitOrderRequest=_FakeReq,
+            MarketOrderRequest=_FakeReq,
+            OptionLegRequest=_FakeReq,
+        ),
+    )
+
+
+async def test_place_multi_leg_order_negates_fill_price_at_submit(broker, monkeypatch):
+    """Finding #2 regression: the SUBMIT path must negate filled_avg_price the
+    same way the READ-BACK path does. Alpaca reports a credit spread's fill as a
+    debit-positive number; storing it un-negated on a fast fill silently flips
+    spread P&L depending on which path observed the order first."""
+    from datetime import UTC, datetime
+
+    from core.models import OptionType, OrderType
+
+    _stub_submit_modules(monkeypatch)
+
+    # A credit spread that fills instantly: Alpaca returns filled_avg_price as a
+    # POSITIVE debit-style number (0.42). Our convention is credit-positive, so
+    # the stored Order must carry -0.42.
+    placed = SimpleNamespace(
+        id="mleg-submit-1",
+        status="filled",
+        submitted_at=datetime.now(UTC),
+        filled_at=datetime.now(UTC),
+        filled_avg_price="0.42",
+        model_dump=lambda mode=None: {"id": "mleg-submit-1"},
+    )
+    broker._trading = SimpleNamespace(submit_order=lambda req: placed)
+
+    from core.models import OrderLeg as Leg
+
+    legs = [
+        Leg(
+            contract_symbol="TSLA260612P00400000",
+            underlying="TSLA",
+            option_type=OptionType.PUT,
+            strike=400.0,
+            expiration=__import__("datetime").date(2026, 6, 12),
+            action=OrderType.SELL_TO_OPEN,
+        ),
+        Leg(
+            contract_symbol="TSLA260612P00395000",
+            underlying="TSLA",
+            option_type=OptionType.PUT,
+            strike=395.0,
+            expiration=__import__("datetime").date(2026, 6, 12),
+            action=OrderType.BUY_TO_OPEN,
+        ),
+    ]
+
+    order = await broker.place_multi_leg_order(
+        underlying="TSLA",
+        legs=legs,
+        quantity=1,
+        limit_price=0.50,           # our credit-positive convention
+        client_order_id="wb-submit-test",
+    )
+
+    # fill negated to credit-positive convention, matching _to_order_multi_leg
+    assert order.fill_price == -0.42
+    # limit kept in our convention on the returned Order (negated only on the wire)
+    assert order.limit_price == 0.50
+    assert order.order_type == OrderType.MULTI_LEG_OPEN
+
+
+async def test_place_multi_leg_order_zero_fill_not_dropped(broker, monkeypatch):
+    """Finding #3 regression: a genuine 0.0 fill must survive as 0.0, not None
+    (the old `if placed.filled_avg_price else None` falsy check ate zeros)."""
+    from datetime import UTC, datetime
+
+    from core.models import OptionType, OrderType
+    from core.models import OrderLeg as Leg
+
+    _stub_submit_modules(monkeypatch)
+
+    placed = SimpleNamespace(
+        id="mleg-submit-zero",
+        status="filled",
+        submitted_at=datetime.now(UTC),
+        filled_at=datetime.now(UTC),
+        filled_avg_price="0",          # a zero fill — must not become None
+        model_dump=lambda mode=None: {"id": "mleg-submit-zero"},
+    )
+    broker._trading = SimpleNamespace(submit_order=lambda req: placed)
+
+    legs = [
+        Leg(
+            contract_symbol="TSLA260612P00400000",
+            underlying="TSLA",
+            option_type=OptionType.PUT,
+            strike=400.0,
+            expiration=__import__("datetime").date(2026, 6, 12),
+            action=OrderType.SELL_TO_OPEN,
+        ),
+    ]
+
+    order = await broker.place_multi_leg_order(
+        underlying="TSLA",
+        legs=legs,
+        quantity=1,
+        limit_price=None,
+        client_order_id="wb-submit-zero",
+    )
+    assert order.fill_price == 0.0
+    assert order.fill_price is not None
+
+
 def test_is_leg_child_skips_orders_without_our_client_order_id(broker):
     """Defensive filter in get_orders_since: legs (and manual broker orders)
     are skipped because they don't carry our `wb-` client_order_id prefix."""
