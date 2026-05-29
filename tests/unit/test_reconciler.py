@@ -317,6 +317,71 @@ async def test_called_away_persists_synthetic_stock_sell_for_cycle_pnl(db_repos)
 
 
 @pytest.mark.asyncio
+async def test_called_away_quantity_comes_from_cycle_not_drifted_local_shares(db_repos):
+    """Finding #12: the synthetic share SELL_TO_CLOSE must be sized from the
+    cycle's CSP contract count (matching the assignment BUY_TO_OPEN), not from
+    local.shares. If local.shares has drifted, sizing off it leaves the buy and
+    sell legs unequal and corrupts cycle P&L."""
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(
+            account_id="test", symbol="F", started_at=_utc(),
+            initial_csp_strike=9.5, initial_csp_premium=100.0, n_orders=3,
+        )
+    )
+    # 2-contract CSP (+0.50 × 2 × 100 = +100).
+    await db_repos.orders.insert(Order(
+        account_id="test", symbol="F", cycle_id=cycle_id,
+        order_type=OrderType.SELL_TO_OPEN, contract_symbol="F250706P00009500",
+        strike=9.5, expiration=date(2025, 7, 6), option_type=OptionType.PUT,
+        quantity=2, fill_price=0.50, status=OrderStatus.FILLED,
+        placed_at=_utc(), client_order_id="wb-csp",
+    ))
+    # Assignment buy of 200 shares @ 9.0 (-1800).
+    await db_repos.orders.insert(Order(
+        account_id="test", symbol="F", cycle_id=cycle_id,
+        order_type=OrderType.BUY_TO_OPEN, contract_symbol=None,
+        quantity=200, fill_price=9.0, status=OrderStatus.FILLED,
+        placed_at=_utc(), client_order_id="wb-assign",
+    ))
+    # CC sell of 2 contracts @ strike 10.5 / 0.30 (+60).
+    await db_repos.orders.insert(Order(
+        account_id="test", symbol="F", cycle_id=cycle_id,
+        order_type=OrderType.SELL_TO_OPEN, contract_symbol="F250706C00010500",
+        strike=10.5, expiration=date(2025, 7, 6), option_type=OptionType.CALL,
+        quantity=2, fill_price=0.30, status=OrderStatus.FILLED,
+        placed_at=_utc(), client_order_id="wb-cc",
+    ))
+    # Position shares DRIFTED to 100 (should be 200). The fix must ignore this.
+    pos_id = await db_repos.positions.insert(Position(
+        account_id="test", symbol="F", state=PositionState.CC_OPEN,
+        shares=100, cost_basis=9.0, current_cycle_id=cycle_id,
+        state_changed_at=_utc(),
+    ))
+
+    broker = PaperBroker(cash=30_000)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    pos = await db_repos.positions.get(pos_id)
+    await rec._on_called_away(pos, summary)
+
+    # The synthetic SELL_TO_CLOSE must be 200 shares (cycle), not 100 (drift).
+    c = await db_repos.db.connect()
+    async with c.execute(
+        "SELECT quantity, fill_price FROM orders WHERE cycle_id = ? AND order_type = ?",
+        (cycle_id, OrderType.SELL_TO_CLOSE.value),
+    ) as cur:
+        sell_rows = await cur.fetchall()
+    assert len(sell_rows) == 1
+    assert int(sell_rows[0]["quantity"]) == 200
+
+    closed = await db_repos.cycles.get(cycle_id)
+    # +100 (CSP) - 1800 (BTO 200@9) + 60 (CC) + 2100 (STC 200@10.5) = +460.
+    # The buggy local.shares path would give 100@10.5 = +1050 → -590.
+    assert closed.cycle_outcome == "CC_CALLED_AWAY"
+    assert closed.final_pnl == pytest.approx(460.0)
+
+
+@pytest.mark.asyncio
 async def test_called_away_missing_cc_strike_flags_manual_intervention(db_repos):
     """Finding #5: if shares were held but the CC strike can't be recovered, we
     can't record the offsetting share SALE. Closing the cycle now would book the

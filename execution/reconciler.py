@@ -759,7 +759,14 @@ class Reconciler:
         # Persist a synthetic SELL_TO_CLOSE order at the CC strike so cycle
         # P&L captures the share leg. Same reason as _on_assignment.
         cc_strike = await self._cycle_cc_strike(local.current_cycle_id)
-        shares_sold = local.shares
+        # The share-SALE quantity MUST match the share-PURCHASE quantity that
+        # assignment recorded (its synthetic BUY_TO_OPEN is sized from
+        # _cycle_csp_quantity). If we sized this off local.shares and that count
+        # had drifted, the buy and sell legs wouldn't net out and cycle P&L
+        # would be wrong. Derive from the same cycle source; fall back to
+        # local.shares only when the CSP quantity can't be recovered.
+        n_contracts = await self._cycle_csp_quantity(local.current_cycle_id)
+        shares_sold = (100 * n_contracts) if n_contracts else local.shares
         # Phantom-loss guard: assignment already recorded the share PURCHASE
         # (synthetic BUY_TO_OPEN at the CSP strike). If we held shares but can't
         # recover the CC strike, we can't record the offsetting SALE — closing
