@@ -7,7 +7,7 @@ from datetime import UTC, date
 import pytest
 
 from core.models import Regime, RegimeSnapshot
-from risk.regime import RegimeInputs, _flatten_yf_columns, _upsert, classify_regime
+from risk.regime import RegimeInputs, _upsert, classify_regime
 
 
 def test_classify_high_vol_when_vix_above_max():
@@ -85,22 +85,8 @@ async def test_upsert_writes_and_replaces_row(db_repos):
     assert row["vix_close"] == 20.0
 
 
-def test_flatten_yf_columns_handles_multiindex():
-    """yfinance >= 0.2.34 returns MultiIndex columns even for single-ticker
-    downloads. _flatten_yf_columns must collapse them so df['Close'] is a Series."""
-    pd = pytest.importorskip("pandas")
-    cols = pd.MultiIndex.from_tuples([("Close", "SPY"), ("High", "SPY"), ("Low", "SPY")])
-    df = pd.DataFrame([[100.0, 101.0, 99.0], [102.0, 103.0, 101.0]], columns=cols)
-    flat = _flatten_yf_columns(df)
-    # After flatten, df["Close"] is a Series, not a sub-DataFrame.
-    assert float(flat["Close"].iloc[-1]) == 102.0
-
-
-def test_flatten_yf_columns_is_noop_for_flat_columns():
-    pd = pytest.importorskip("pandas")
-    df = pd.DataFrame({"Close": [100.0, 102.0], "High": [101.0, 103.0]})
-    flat = _flatten_yf_columns(df)
-    assert float(flat["Close"].iloc[-1]) == 102.0
+# yfinance MultiIndex flattening tests moved to tests/unit/test_yf_helpers.py
+# when the helper was centralised in data/yf_helpers.py (TICKET-001).
 
 
 @pytest.mark.asyncio

@@ -71,34 +71,14 @@ def classify_regime(
     return Regime.BULL_TREND, True, False
 
 
-def _flatten_yf_columns(df: Any) -> Any:
-    """Newer yfinance versions return MultiIndex columns even for single-ticker
-    downloads, so `df["Close"]` becomes a sub-DataFrame instead of a Series.
-    Collapse to flat columns by taking the field name (level 0)."""
-    cols = getattr(df, "columns", None)
-    if cols is not None and hasattr(cols, "levels"):
-        df.columns = cols.get_level_values(0)
-    return df
-
-
 def _fetch_yfinance_inputs() -> RegimeInputs | None:
     """Pull SPY + VIX history and compute the snapshot inputs. None on data gap."""
-    try:
-        import yfinance as yf  # noqa: PLC0415
-    except ImportError:
-        log_checkpoint("regime_yfinance_missing", status="fail")
-        return None
+    from data.yf_helpers import safe_history
 
-    try:
-        spy = yf.download("SPY", period="1y", interval="1d", progress=False, auto_adjust=False)
-        vix = yf.download("^VIX", period="1mo", interval="1d", progress=False, auto_adjust=False)
-    except Exception as exc:  # network etc.
-        log_checkpoint("regime_yfinance_fail", status="fail", error=str(exc))
+    spy = safe_history("SPY", period="1y")
+    vix = safe_history("^VIX", period="1mo")
+    if spy.empty or vix.empty:
         return None
-    if spy is None or spy.empty or vix is None or vix.empty:
-        return None
-    spy = _flatten_yf_columns(spy)
-    vix = _flatten_yf_columns(vix)
 
     spy_close = float(spy["Close"].iloc[-1])
     spy_sma_200 = float(spy["Close"].tail(200).mean()) if len(spy) >= 200 else float("nan")

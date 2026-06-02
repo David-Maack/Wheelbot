@@ -9,7 +9,6 @@ import pytest
 
 from core.models import IvHistory, OptionType, Quote, UniverseEntry
 from intelligence.screener import (
-    _flatten_yf_columns,
     _payload_from,
     _persist_candidates,
     run_screener,
@@ -17,26 +16,8 @@ from intelligence.screener import (
 from platforms.paper_broker import PaperBroker
 
 
-# -- yfinance MultiIndex column workaround ----------------------------------
-
-
-def test_flatten_yf_columns_collapses_multiindex():
-    """Regression for the 2026-05-21 screener crash: newer yfinance returns
-    MultiIndex columns even for single-ticker downloads, so `df["Close"]`
-    became a sub-DataFrame and `.mean()` returned a Series → float(...) failed."""
-    pd = pytest.importorskip("pandas")
-    cols = pd.MultiIndex.from_tuples([("Close", "F"), ("High", "F"), ("Low", "F")])
-    df = pd.DataFrame([[10.0, 10.5, 9.5], [11.0, 11.2, 10.8]], columns=cols)
-    flat = _flatten_yf_columns(df)
-    # After flatten, df["Close"] is a Series and .mean() returns a scalar.
-    assert float(flat["Close"].mean()) == pytest.approx(10.5)
-
-
-def test_flatten_yf_columns_noop_on_flat_columns():
-    pd = pytest.importorskip("pandas")
-    df = pd.DataFrame({"Close": [10.0, 11.0], "High": [10.5, 11.5]})
-    flat = _flatten_yf_columns(df)
-    assert float(flat["Close"].mean()) == pytest.approx(10.5)
+# yfinance MultiIndex flattening tests moved to tests/unit/test_yf_helpers.py
+# when the helper was centralised in data/yf_helpers.py (TICKET-001).
 
 
 class _StubAnthropic:
