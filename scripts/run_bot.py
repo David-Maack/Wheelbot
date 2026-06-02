@@ -1,3 +1,23 @@
+# =====================================================================
+# DEPLOY NOTE — DB MIGRATIONS
+# =====================================================================
+# Migrations in db/migrations/ are baked into the Docker image at build
+# time. A `git pull` on the LXC host does NOT apply new migrations — the
+# running container still has the old image.
+#
+# To deploy a migration:
+#   1. cd /opt/wheelbot && git pull
+#   2. docker compose build wheelbot
+#   3. docker compose up -d wheelbot
+#   4. Verify:  docker exec wheelbot python -m scripts.db_health
+#                docker exec wheelbot bash scripts/migrate_check.sh
+#
+# The bot's first reconcile tick after restart re-fetches broker state, so
+# any old PENDING orders the cursor lost track of get re-evaluated. Watch
+# for transient MANUAL_INTERVENTION flags in the minute after restart and
+# clear them with scripts.reenable_strategy / manual_close once verified.
+# =====================================================================
+
 """Long-running WheelBot entrypoint.
 
 This is the main process the LXC container runs. It:
