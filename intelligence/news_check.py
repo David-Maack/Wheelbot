@@ -26,7 +26,7 @@ from typing import Any
 from core.checkpoint import log_checkpoint
 from core.models import LlmDecisionType
 from intelligence.anthropic_client import AnthropicClient
-from intelligence.budget import BudgetExceeded
+from intelligence.budget import BudgetExceeded, ModelNotPriced
 from intelligence.news import Headline, NewsSource, NewsSourceUnavailable
 
 VALID_DECISIONS = {"proceed", "caution", "block"}
@@ -116,6 +116,22 @@ async def news_check(
     except BudgetExceeded as exc:
         log_checkpoint("news_check_budget_skip", status="skip", symbol=symbol, error=str(exc))
         return NewsCheckResult("proceed", "budget exhausted; degrading", "skipped:budget")
+    except ModelNotPriced as exc:
+        # Loud log — fail-open per news_check policy, but this is a config error
+        # (typo'd model name or deprecated model) that needs attention.
+        log_checkpoint(
+            "news_check_model_not_priced",
+            status="fail",
+            symbol=symbol,
+            model=model,
+            error=str(exc),
+            note="config error: model missing from pricing table — fix and redeploy",
+        )
+        return NewsCheckResult(
+            "proceed",
+            f"news_check_model {model!r} not in pricing table; degrading",
+            "skipped:model_not_priced",
+        )
     except Exception as exc:
         log_checkpoint("news_check_llm_fail", status="fail", symbol=symbol, error=str(exc))
         return NewsCheckResult("proceed", f"LLM call failed: {exc}", "skipped:llm_error")

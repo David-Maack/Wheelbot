@@ -388,7 +388,10 @@ async def main(argv: list[str] | None = None) -> int:
     # to fail-open / rule-only; the bot still runs.
     anthropic: AnthropicClient | None = None
     if os.environ.get("ANTHROPIC_API_KEY"):
-        budget = BudgetTracker(repos.llm_decisions, config)
+        # strict=True refuses to price unknown models so a typo'd *_model
+        # config value or a deprecated model surfaces loudly instead of
+        # silently bypassing the daily cap at $0/tok.
+        budget = BudgetTracker(repos.llm_decisions, config, strict=True)
         anthropic = AnthropicClient(repos.llm_decisions, budget)
         log_checkpoint(
             "bot_anthropic", status="ok", daily_budget_usd=budget.daily_cap_usd

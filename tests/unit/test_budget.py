@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 
 from core.models import LlmDecision, LlmDecisionType
-from intelligence.budget import BudgetExceeded, BudgetTracker
+from intelligence.budget import BudgetExceeded, BudgetTracker, ModelNotPriced
 
 
 def _utc() -> datetime:
@@ -77,3 +77,41 @@ async def test_pricing_overrides_in_config(db_repos):
     assert tracker.price("claude-haiku-4-5")["input_per_mtok"] == pytest.approx(99.0)
     # Output price falls back to default.
     assert tracker.price("claude-haiku-4-5")["output_per_mtok"] == pytest.approx(5.0)
+
+
+# -- TICKET-002: strict mode for the pricing table --------------------------
+
+
+@pytest.mark.asyncio
+async def test_strict_unknown_model_raises(db_repos):
+    """Default strict mode: an unknown model raises ModelNotPriced rather
+    than silently bypassing the cap at $0/tok."""
+    tracker = BudgetTracker(db_repos.llm_decisions, _config())  # strict=True default
+    with pytest.raises(ModelNotPriced):
+        tracker.price("claude-typo-not-real")
+    # And via the budget gate — same exception, same layer that catches BudgetExceeded.
+    with pytest.raises(ModelNotPriced):
+        await tracker.check(
+            "claude-typo-not-real",
+            prompt_tokens_estimate=100,
+            max_output_tokens=50,
+        )
+
+
+@pytest.mark.asyncio
+async def test_strict_known_model_prices_correctly(db_repos):
+    """Strict mode doesn't change pricing behaviour for KNOWN models."""
+    tracker = BudgetTracker(db_repos.llm_decisions, _config())
+    assert tracker.strict is True
+    cost = tracker.cost_for("claude-haiku-4-5", input_tokens=1_000_000, output_tokens=500_000)
+    assert cost.total == pytest.approx(3.5)
+
+
+@pytest.mark.asyncio
+async def test_nonstrict_unknown_model_warns_and_returns_zero(db_repos):
+    """Legacy behaviour preserved when strict=False — returns $0/tok dict."""
+    tracker = BudgetTracker(db_repos.llm_decisions, _config(), strict=False)
+    prices = tracker.price("claude-typo-not-real")
+    assert prices == {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
+    cost = tracker.cost_for("claude-typo-not-real", input_tokens=999_999, output_tokens=999_999)
+    assert cost.total == 0.0

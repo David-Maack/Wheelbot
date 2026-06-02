@@ -35,7 +35,9 @@ async def main() -> int:
         broker = make_broker(config)
         ivr = IVRProvider(repos.iv_history)
         news = make_news_source(config)
-        budget = BudgetTracker(repos.llm_decisions, config)
+        # strict=True — an unknown screener_model hard-fails the cron run
+        # rather than silently bypassing the daily cap. See TICKET-002.
+        budget = BudgetTracker(repos.llm_decisions, config, strict=True)
         anthropic = AnthropicClient(repos.llm_decisions, budget)
         result = await run_screener(
             broker=broker,

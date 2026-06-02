@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
 
+from core.checkpoint import log_checkpoint
 from core.notify import notify
 from db.repo import LlmDecisionsRepo
 
@@ -36,6 +37,14 @@ DEFAULT_PRICING_USD_PER_MTOK = {
 
 class BudgetExceeded(Exception):
     """Raised pre-call when the daily cap would be breached."""
+
+
+class ModelNotPriced(Exception):
+    """Raised in strict mode when an unknown model would otherwise be priced
+    at $0/tok — a silent bypass of the daily budget gate that would also log
+    $0 cost to llm_decisions. Catch this at the same layer that catches
+    BudgetExceeded (the LLM caller) and decide whether to hard-fail (screener)
+    or fail-open with a loud log (news_check)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,8 +62,16 @@ class BudgetTracker:
         self,
         decisions_repo: LlmDecisionsRepo,
         config: dict[str, Any],
+        *,
+        strict: bool = True,
     ) -> None:
+        """`strict=True` (the default) refuses to price unknown models — see
+        `ModelNotPriced`. Production entry points always run strict so a typo
+        in a `*_model` config value (or a model deprecation) surfaces loudly
+        instead of silently bypassing the daily cap. Tests can pass
+        `strict=False` to exercise the legacy $0-default path."""
         self._repo = decisions_repo
+        self._strict = strict
         intel = config.get("intelligence", {}) or {}
         self._daily_cap = float(intel.get("daily_budget_usd", 1.0))
         overrides = (intel.get("pricing") or {})
@@ -68,10 +85,33 @@ class BudgetTracker:
     def daily_cap_usd(self) -> float:
         return self._daily_cap
 
+    @property
+    def strict(self) -> bool:
+        return self._strict
+
     def price(self, model: str) -> dict[str, float]:
-        return self._pricing.get(
-            model, {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
+        """Look up per-mtok pricing for `model`.
+
+        Strict mode (default): an unknown model raises `ModelNotPriced` — the
+        caller must catch it. Non-strict mode (tests / legacy): logs a warning
+        and returns $0/tok, the pre-TICKET-002 silent behaviour.
+        """
+        prices = self._pricing.get(model)
+        if prices is not None:
+            return prices
+        if self._strict:
+            raise ModelNotPriced(
+                f"Model {model!r} not in pricing table — refusing to price. "
+                "Add it to DEFAULT_PRICING_USD_PER_MTOK or "
+                "intelligence.pricing.<model> in config."
+            )
+        log_checkpoint(
+            "budget_unknown_model_zero_cost",
+            status="fail",
+            model=model,
+            note="non-strict mode — pricing as $0/tok (silently bypasses cap)",
         )
+        return {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
 
     def cost_for(
         self, model: str, *, input_tokens: int, output_tokens: int
