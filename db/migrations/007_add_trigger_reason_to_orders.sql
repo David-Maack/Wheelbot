@@ -1,0 +1,23 @@
+-- Migration 007 — TICKET-005 (delta-based hard stop on short premium positions)
+--
+-- Adds a structured close-reason tag to the orders table so the dashboard
+-- (and post-hoc analysis) can distinguish WHY a BUY_TO_CLOSE order was placed.
+-- Previously this lived only in the free-text rationale and wasn't queryable.
+--
+-- Allowed values written by wheel_close.py:
+--   profit                       — current mid hit the profit_close_pct target
+--   time                         — short-leg DTE crossed time_close_dte
+--   stop_loss                    — current mid hit csp_stop_loss_mult × original premium
+--   delta_stop_close             — |short delta| crossed delta_stop_threshold,
+--                                  delta_stop_action=close
+--   delta_stop_close_fallback    — delta_stop_action=roll, but the roll evaluator
+--                                  declined AND short DTE was below
+--                                  delta_stop_roll_fallback_dte — we closed instead
+--                                  of carrying naked into expiry
+--   roll                         — reconciler's roll evaluator placed the BTC leg
+--   manual_close                 — operator close via scripts/manual_close.py
+--
+-- Run via: docker exec wheelbot python -m scripts.run_migration --version 007
+-- Idempotent — runner skips if 007 is already applied.
+
+ALTER TABLE orders ADD COLUMN trigger_reason TEXT;

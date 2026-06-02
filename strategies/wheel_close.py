@@ -43,9 +43,68 @@ from core.models import (
     Position,
     PositionState,
 )
+from core.notify import notify
 from core.strategies import StrategyDefinition
+from data.greeks import fill_greeks
 from db.repo import Repos
 from strategies.wheel import Proposal
+
+
+async def _current_short_delta(
+    broker: Broker, position: Position, short_order: Order, today: date
+) -> float | None:
+    """Compute the *current* |delta| of the short leg via fresh quotes + BS.
+
+    Mirrors `scripts/run_bot._make_roll_evaluator`: spot from the underlying
+    quote, contract mid from the option quote, then `fill_greeks` with the
+    module defaults (r=0.045, no dividend yield). Using the same defaults as
+    the roll evaluator keeps the delta values directly comparable to
+    `roll_trigger_delta` — otherwise the two thresholds would mean different
+    things and the validation in core.strategies wouldn't catch it.
+
+    Returns None when any input is unavailable; the caller is expected to
+    log `wheel_close_delta_unavailable` and skip the trigger for this tick.
+    """
+    if (
+        short_order.strike is None
+        or short_order.expiration is None
+        or short_order.option_type is None
+        or short_order.contract_symbol is None
+    ):
+        return None
+    try:
+        underlying = await broker.get_quote(position.symbol)
+    except Exception:
+        return None
+    spot = (
+        underlying.mid
+        if underlying.mid is not None
+        else (underlying.last or underlying.bid or underlying.ask)
+    )
+    if spot is None:
+        return None
+    try:
+        opt = await broker.get_quote(short_order.contract_symbol)
+    except Exception:
+        return None
+    contract_mid = (
+        opt.mid
+        if opt.mid is not None
+        else (opt.last or (((opt.bid or 0) + (opt.ask or 0)) / 2 if opt.bid and opt.ask else None))
+    )
+    if contract_mid is None or contract_mid <= 0:
+        return None
+    greeks = fill_greeks(
+        underlying_price=float(spot),
+        strike=float(short_order.strike),
+        expiration=short_order.expiration,
+        option_type=short_order.option_type,
+        market_price=float(contract_mid),
+        today=today,
+    )
+    if greeks is None or greeks.delta is None:
+        return None
+    return abs(greeks.delta)
 
 
 def _threshold_pct(strategy: StrategyDefinition, state: PositionState) -> float:
@@ -106,6 +165,8 @@ async def propose_close_for_position(
     *,
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
+    has_inflight: bool = False,
+    delta_unavailable_counters: dict[int, int] | None = None,
 ) -> Proposal | None:
     """Build a BUY_TO_CLOSE proposal when any close trigger fires.
 
@@ -187,8 +248,148 @@ async def propose_close_for_position(
             stop_threshold_mid = stop_loss_mult * original_premium
             stop_trigger = current_mid >= stop_threshold_mid
 
-    if not (profit_trigger or time_trigger or stop_trigger):
+    # Delta-stop trigger (TICKET-005) — CSP only (CCs target called-away).
+    # Computed AFTER the mid-based checks so the broker quote calls happen only
+    # when the cheaper checks haven't already fired. Delta is fetched fresh
+    # every tick (no stale persisted delta); see _current_short_delta.
+    delta_threshold_raw = strategy.params.get("delta_stop_threshold")
+    delta_action = str(strategy.params.get("delta_stop_action", "close")).lower()
+    fallback_dte_raw = strategy.params.get("delta_stop_roll_fallback_dte", 7)
+    stuck_alert_ticks = int(strategy.params.get("delta_stop_stuck_alert_ticks", 12))
+    delta_stop_close_trigger = False
+    delta_stop_fallback_trigger = False
+    current_delta: float | None = None
+    if (
+        position.state == PositionState.CSP_OPEN
+        and delta_threshold_raw is not None
+        and float(delta_threshold_raw) > 0
+        and not (profit_trigger or time_trigger or stop_trigger)
+    ):
+        current_delta = await _current_short_delta(broker, position, short_order, today)
+        if current_delta is None:
+            # Quote / spot / BS failed. Skip this trigger silently per tick, but
+            # tally consecutive failures so a quote that stays dead for ~an hour
+            # escalates to Discord (the danger zone is unreadable, which is
+            # itself a problem worth a human glance).
+            counters = delta_unavailable_counters if delta_unavailable_counters is not None else {}
+            key = position.id if position.id is not None else -1
+            counters[key] = counters.get(key, 0) + 1
+            log_checkpoint(
+                "wheel_close_delta_unavailable",
+                status="skip",
+                symbol=position.symbol,
+                strategy=strategy.id,
+                contract=short_order.contract_symbol,
+                consecutive_failures=counters[key],
+                threshold=stuck_alert_ticks,
+            )
+            if counters[key] == stuck_alert_ticks:
+                # Fire ONCE at the threshold — don't spam Discord every tick after.
+                await notify(
+                    "wheel_close_delta_stuck_unavailable",
+                    f"{position.symbol} delta unreadable for "
+                    f"{stuck_alert_ticks} consecutive ticks",
+                    symbol=position.symbol,
+                    strategy=strategy.id,
+                    contract=short_order.contract_symbol,
+                    state=str(position.state),
+                    position_id=position.id,
+                )
+                log_checkpoint(
+                    "wheel_close_delta_stuck_unavailable",
+                    status="fail",
+                    symbol=position.symbol,
+                    strategy=strategy.id,
+                    contract=short_order.contract_symbol,
+                    consecutive_failures=counters[key],
+                )
+        else:
+            # Reset on any successful read.
+            if delta_unavailable_counters is not None and position.id in delta_unavailable_counters:
+                delta_unavailable_counters[position.id] = 0
+            if current_delta >= float(delta_threshold_raw):
+                if delta_action == "close":
+                    delta_stop_close_trigger = True
+                elif delta_action == "manual":
+                    log_checkpoint(
+                        "wheel_close_delta_stop_manual",
+                        status="ok",
+                        symbol=position.symbol,
+                        strategy=strategy.id,
+                        delta=current_delta,
+                        threshold=float(delta_threshold_raw),
+                    )
+                    if position.id is not None:
+                        await repos.positions.update_state(
+                            position.id,
+                            PositionState.MANUAL_INTERVENTION,
+                            f"delta_stop_manual delta={current_delta:.2f}",
+                        )
+                    return None
+                elif delta_action == "roll":
+                    # Reconciler's roll scan runs BEFORE this close pass. If it
+                    # rolled, an in-flight BTC exists for this (symbol, strategy)
+                    # — we're called only when has_inflight is False, so by the
+                    # time we get here the roll evaluator either declined
+                    # (LET_ASSIGN / CLOSE-without-credit) or no credit-roll was
+                    # available. Fall back to close ONLY when we're close to
+                    # expiry — the universe's quality gate said we're willing to
+                    # hold the shares, so otherwise just defer.
+                    if not has_inflight and short_dte <= int(fallback_dte_raw):
+                        delta_stop_fallback_trigger = True
+                        log_checkpoint(
+                            "wheel_close_delta_stop_fallback_chosen",
+                            status="ok",
+                            symbol=position.symbol,
+                            strategy=strategy.id,
+                            delta=current_delta,
+                            threshold=float(delta_threshold_raw),
+                            short_dte=short_dte,
+                            fallback_dte=int(fallback_dte_raw),
+                        )
+                    else:
+                        log_checkpoint(
+                            "wheel_close_delta_stop_defer_roll",
+                            status="ok",
+                            symbol=position.symbol,
+                            strategy=strategy.id,
+                            delta=current_delta,
+                            threshold=float(delta_threshold_raw),
+                            short_dte=short_dte,
+                            has_inflight=has_inflight,
+                        )
+                        return None
+                else:
+                    log_checkpoint(
+                        "wheel_close_delta_stop_unknown_action",
+                        status="fail",
+                        symbol=position.symbol,
+                        strategy=strategy.id,
+                        action=delta_action,
+                    )
+
+    if not (
+        profit_trigger
+        or time_trigger
+        or stop_trigger
+        or delta_stop_close_trigger
+        or delta_stop_fallback_trigger
+    ):
         return None
+
+    # Pick the trigger_reason in priority order. profit ranks first because it
+    # represents a normal-course exit (most common); stop_loss/delta_stop/time
+    # signal a defensive close (each has different post-hoc meaning).
+    if profit_trigger:
+        trigger_reason = "profit"
+    elif stop_trigger:
+        trigger_reason = "stop_loss"
+    elif delta_stop_close_trigger:
+        trigger_reason = "delta_stop_close"
+    elif delta_stop_fallback_trigger:
+        trigger_reason = "delta_stop_close_fallback"
+    else:
+        trigger_reason = "time"
 
     contract = OptionContract(
         underlying=position.symbol,
@@ -214,6 +415,12 @@ async def propose_close_for_position(
             f"stop_loss mid={current_mid:.2f} ≥ threshold {stop_threshold_mid:.2f} "
             f"(orig {original_premium:.2f}, mult={stop_loss_mult:.1f}×)"
         )
+    if delta_stop_close_trigger or delta_stop_fallback_trigger:
+        rationale_parts.append(
+            f"delta_stop |delta|={current_delta:.2f} ≥ "
+            f"{float(delta_threshold_raw):.2f} (action={delta_action}"
+            + (f", fallback dte={short_dte}≤{int(fallback_dte_raw)})" if delta_stop_fallback_trigger else ")")
+        )
     if time_trigger:
         rationale_parts.append(
             f"time_close dte={short_dte} ≤ {int(time_close_dte_raw)}"
@@ -228,12 +435,24 @@ async def propose_close_for_position(
         strategy=strategy.id,
         contract=short_order.contract_symbol,
         mid=current_mid,
+        trigger_reason=trigger_reason,
         profit_trigger=profit_trigger,
         time_trigger=time_trigger,
         stop_trigger=stop_trigger,
+        delta_stop_close_trigger=delta_stop_close_trigger,
+        delta_stop_fallback_trigger=delta_stop_fallback_trigger,
+        delta=current_delta,
         short_dte=short_dte,
         original_premium=original_premium,
     )
+    if trigger_reason == "delta_stop_close":
+        log_checkpoint(
+            "wheel_close_delta_stop_close",
+            status="ok",
+            symbol=position.symbol,
+            strategy=strategy.id,
+            delta=current_delta,
+        )
     return Proposal(
         symbol=position.symbol,
         contract=contract,
@@ -241,6 +460,7 @@ async def propose_close_for_position(
         quantity=short_order.quantity,
         rationale=rationale,
         strategy_id=strategy.id,
+        trigger_reason=trigger_reason,
     )
 
 
@@ -251,9 +471,15 @@ async def propose_all_closes(
     *,
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
+    delta_unavailable_counters: dict[int, int] | None = None,
 ) -> list[Proposal]:
     """Walk active CSP_OPEN / CC_OPEN positions for this strategy; propose
-    profit closes where the threshold is met."""
+    closes where any trigger fires.
+
+    `delta_unavailable_counters` is process-local state owned by the caller
+    (run_bot.main()): a dict[position_id, consecutive_failures] used by the
+    delta-stop trigger to escalate a chronically-unreadable quote to Discord.
+    Tests can pass a fresh dict; production passes the long-lived one."""
     if strategy is None:
         return []
     account_id = config.get("account", {}).get("id", "primary")
@@ -280,7 +506,12 @@ async def propose_all_closes(
     for pos in active:
         if pos.state not in (PositionState.CSP_OPEN, PositionState.CC_OPEN):
             continue
-        if (pos.symbol.upper(), pos.strategy_id) in inflight:
+        pos_inflight = (pos.symbol.upper(), pos.strategy_id) in inflight
+        if pos_inflight:
+            # In-flight order means the leg is already being acted on. Short-
+            # circuit BEFORE calling propose_close_for_position so we don't
+            # make broker.get_quote calls for positions we'd skip anyway —
+            # important for the per-tick cost on the delta-stop path.
             log_checkpoint(
                 "wheel_close_skip_inflight",
                 status="skip",
@@ -290,7 +521,10 @@ async def propose_all_closes(
             )
             continue
         proposal = await propose_close_for_position(
-            broker, repos, pos, today=today, strategy=strategy,
+            broker, repos, pos,
+            today=today, strategy=strategy,
+            has_inflight=pos_inflight,
+            delta_unavailable_counters=delta_unavailable_counters,
         )
         if proposal is not None:
             out.append(proposal)

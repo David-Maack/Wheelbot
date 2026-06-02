@@ -364,6 +364,9 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                                         / latest_open_option.fill_price
                                         * 100
                                     )
+        last_close_trigger: str | None = None
+        if p.id is not None:
+            last_close_trigger = await deps.repos.orders.last_close_trigger_for_position(p.id)
         out.append(
             {
                 "symbol": p.symbol,
@@ -375,6 +378,7 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 "dte": dte,
                 "unrealized": unrealized,
                 "unrealized_pct": unrealized_pct,
+                "last_close_trigger": last_close_trigger,
             }
         )
     return out

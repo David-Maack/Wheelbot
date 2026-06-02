@@ -23,6 +23,7 @@ from core.models import (
     IvHistory,
     LlmDecision,
     Order,
+    OrderType,
     Position,
     PositionState,
     RegimeSnapshot,
@@ -317,6 +318,34 @@ class OrdersRepo(_Repo):
             (account_id, limit),
         )
         return [Order(**r) for r in rows]
+
+    async def last_close_trigger_for_position(
+        self, position_id: int
+    ) -> str | None:
+        """Most recent close-side order's `trigger_reason` for this position's
+        current cycle. Returns None when the position has no current cycle or
+        the cycle has no close orders yet (or the close had no trigger_reason
+        — pre-TICKET-005 orders won't).
+
+        Used by the dashboard /positions table to show WHY the most recent
+        close fired (profit / time / stop_loss / delta_stop_close / ...).
+        """
+        c = await self.db.connect()
+        async with c.execute(
+            "SELECT trigger_reason FROM orders WHERE cycle_id = ("
+            "SELECT current_cycle_id FROM positions WHERE id = ?"
+            ") AND order_type IN (?, ?) "
+            "ORDER BY placed_at DESC LIMIT 1",
+            (
+                position_id,
+                OrderType.BUY_TO_CLOSE.value,
+                OrderType.MULTI_LEG_CLOSE.value,
+            ),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or row["trigger_reason"] is None:
+            return None
+        return str(row["trigger_reason"])
 
     async def insert(self, order: Order) -> int:
         return await self._insert(self._serialize(order))

@@ -522,3 +522,239 @@ async def test_propose_all_closes_skips_non_open_states(db_repos):
         broker, db_repos, {"account": {"id": "test"}}, strategy=_strategy(),
     )
     assert proposals == []
+
+
+# -- TICKET-005: delta hard stop --------------------------------------------
+
+
+def _underlying_quote(symbol: str, spot: float) -> Quote:
+    """Underlying quote shaped so spot = mid."""
+    return Quote(symbol=symbol, bid=spot - 0.01, ask=spot + 0.01)
+
+
+@pytest.mark.asyncio
+async def test_existing_triggers_now_carry_trigger_reason(db_repos):
+    """Regression: profit/time/stop_loss closes must stamp trigger_reason on
+    the returned Proposal so the dashboard (and migration 007) can read it."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Mid 0.45 → 55% profit (under 0.50 target).
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.44, ask=0.46))
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1), strategy=_strategy(),
+    )
+    assert proposal is not None and proposal.trigger_reason == "profit"
+
+
+@pytest.mark.asyncio
+async def test_delta_stop_close_triggers_at_threshold(db_repos):
+    """action=close: |delta| ≥ 0.55 fires a BUY_TO_CLOSE tagged delta_stop_close."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Spot deep ITM relative to strike 10.0 → delta ~0.97 on the put.
+    # Mid 0.80 keeps us BELOW profit target (target 0.50 of original 1.00) so the
+    # profit/stop_loss triggers don't fire — isolating the delta-stop path.
+    # Spot just below strike → intrinsic 1.00, mid 1.05 (above intrinsic so
+    # the IV solver converges and fill_greeks returns a real delta — deep ITM
+    # put delta is ~0.95). Mid 1.05 > profit target 0.50 keeps profit off too.
+    broker.seed_quote(_underlying_quote("F", spot=9.0))
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=1.04, ask=1.06))
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1),
+        strategy=_strategy(
+            csp_stop_loss_mult=0,
+            delta_stop_threshold=0.55,
+            delta_stop_action="close",
+        ),
+    )
+    assert proposal is not None
+    assert proposal.order_type == OrderType.BUY_TO_CLOSE
+    assert proposal.trigger_reason == "delta_stop_close"
+
+
+@pytest.mark.asyncio
+async def test_delta_below_threshold_no_trigger(db_repos):
+    """A 0.20-delta CSP with no other trigger active returns no proposal."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Spot well above strike → tiny put delta.
+    broker.seed_quote(_underlying_quote("F", spot=11.0))
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1),
+        strategy=_strategy(
+            csp_stop_loss_mult=0,
+            delta_stop_threshold=0.55,
+            delta_stop_action="close",
+        ),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_delta_stop_roll_defers_to_reconciler_when_dte_high(db_repos):
+    """action=roll with plenty of DTE left: no proposal — the reconciler's
+    roll-trigger scan handles it. Fallback only fires under the DTE floor."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Spot just below strike → intrinsic 1.00, mid 1.05 (above intrinsic so
+    # the IV solver converges and fill_greeks returns a real delta — deep ITM
+    # put delta is ~0.95). Mid 1.05 > profit target 0.50 keeps profit off too.
+    broker.seed_quote(_underlying_quote("F", spot=9.0))
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=1.04, ask=1.06))
+    # today = expiration − 30 days → short_dte = 30 (well above fallback_dte=7).
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1) + timedelta(days=35 - 30),
+        strategy=_strategy(
+            csp_stop_loss_mult=0,
+            delta_stop_threshold=0.55,
+            delta_stop_action="roll",
+            delta_stop_roll_fallback_dte=7,
+        ),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_delta_stop_roll_falls_back_to_close_at_dte_boundary(db_repos):
+    """Boundary: short_dte EXACTLY equal to delta_stop_roll_fallback_dte must
+    trigger the fallback (uses <= per scope agreement). Catches off-by-one."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Spot just below strike → intrinsic 1.00, mid 1.05 (above intrinsic so
+    # the IV solver converges and fill_greeks returns a real delta — deep ITM
+    # put delta is ~0.95). Mid 1.05 > profit target 0.50 keeps profit off too.
+    broker.seed_quote(_underlying_quote("F", spot=9.0))
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=1.04, ask=1.06))
+    # expiration is +35 days from 2025-06-01; today = +28 days → short_dte = 7.
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1) + timedelta(days=28),
+        strategy=_strategy(
+            csp_stop_loss_mult=0,
+            delta_stop_threshold=0.55,
+            delta_stop_action="roll",
+            delta_stop_roll_fallback_dte=7,
+        ),
+    )
+    assert proposal is not None
+    assert proposal.trigger_reason == "delta_stop_close_fallback"
+
+
+@pytest.mark.asyncio
+async def test_delta_stop_manual_flags_intervention(db_repos):
+    """action=manual: position state flips to MANUAL_INTERVENTION; no proposal."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Spot just below strike → intrinsic 1.00, mid 1.05 (above intrinsic so
+    # the IV solver converges and fill_greeks returns a real delta — deep ITM
+    # put delta is ~0.95). Mid 1.05 > profit target 0.50 keeps profit off too.
+    broker.seed_quote(_underlying_quote("F", spot=9.0))
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=1.04, ask=1.06))
+    proposal = await propose_close_for_position(
+        broker, db_repos, position,
+        today=date(2025, 6, 1),
+        strategy=_strategy(
+            csp_stop_loss_mult=0,
+            delta_stop_threshold=0.55,
+            delta_stop_action="manual",
+        ),
+    )
+    assert proposal is None
+    reloaded = await db_repos.positions.get(position.id)
+    assert reloaded.state == PositionState.MANUAL_INTERVENTION
+
+
+@pytest.mark.asyncio
+async def test_delta_stop_inflight_short_circuits_before_broker_call(db_repos):
+    """Idempotency: when a PENDING close already exists for (symbol, strategy),
+    propose_all_closes must skip the position WITHOUT calling broker.get_quote
+    at all. Catches an accidental reorder of the short-circuit vs the BS fetch
+    that would still produce the right result (no duplicate proposal) but
+    waste a quote call per tick per blocked position."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    # Seed a PENDING BTC for this (symbol, strategy).
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await db_repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", strategy_id="monthly_wheel",
+            order_type=OrderType.BUY_TO_CLOSE,
+            contract_symbol="F250706P00010000",
+            strike=10.0, expiration=date(2025, 6, 1) + timedelta(days=35),
+            option_type=OptionType.PUT, quantity=1, limit_price=0.40,
+            status=OrderStatus.PENDING, placed_at=now,
+            client_order_id="wb-already-pending",
+        )
+    )
+
+    class _CountingBroker(PaperBroker):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.get_quote_calls = 0
+        async def get_quote(self, symbol):
+            self.get_quote_calls += 1
+            return await super().get_quote(symbol)
+
+    broker = _CountingBroker()
+    # Spot just below strike → intrinsic 1.00, mid 1.05 (above intrinsic so
+    # the IV solver converges and fill_greeks returns a real delta — deep ITM
+    # put delta is ~0.95). Mid 1.05 > profit target 0.50 keeps profit off too.
+    broker.seed_quote(_underlying_quote("F", spot=9.0))
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=1.04, ask=1.06))
+
+    proposals = await propose_all_closes(
+        broker, db_repos, {"account": {"id": "test"}},
+        strategy=_strategy(
+            delta_stop_threshold=0.55,
+            delta_stop_action="close",
+        ),
+    )
+    assert proposals == []
+    assert broker.get_quote_calls == 0, (
+        f"PENDING short-circuit must run BEFORE the delta fetch; "
+        f"got {broker.get_quote_calls} broker.get_quote call(s)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delta_unavailable_counter_escalates_at_threshold(db_repos, monkeypatch):
+    """11 consecutive failures: no Discord. 12th failure: notify fires once,
+    with the position context. Failure = broker returns no underlying quote
+    so spot is None and _current_short_delta returns None."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    # No underlying quote seeded → broker.get_quote('F') raises BrokerUnavailable
+    # which the helper catches and converts to a None delta.
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+
+    notify_calls: list[dict] = []
+    async def _capture_notify(event, message, **fields):
+        notify_calls.append({"event": event, "message": message, **fields})
+    monkeypatch.setattr("strategies.wheel_close.notify", _capture_notify)
+
+    counters: dict[int, int] = {}
+    strategy = _strategy(
+        csp_stop_loss_mult=0,
+        delta_stop_threshold=0.55,
+        delta_stop_action="close",
+        delta_stop_stuck_alert_ticks=12,
+    )
+    today = date(2025, 6, 1)
+    for tick in range(15):
+        await propose_close_for_position(
+            broker, db_repos, position,
+            today=today, strategy=strategy,
+            delta_unavailable_counters=counters,
+        )
+    # Counter reflects all 15 failures.
+    assert counters[position.id] >= 12
+    # notify fired EXACTLY once — at the 12th — not every tick after.
+    stuck_events = [n for n in notify_calls if n["event"] == "wheel_close_delta_stuck_unavailable"]
+    assert len(stuck_events) == 1
+    assert stuck_events[0]["symbol"] == "F"
+    assert stuck_events[0]["strategy"] == "monthly_wheel"
+    assert stuck_events[0]["position_id"] == position.id

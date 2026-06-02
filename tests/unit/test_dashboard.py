@@ -271,6 +271,97 @@ async def test_spread_open_still_shows_pnl(app_client):
     assert row["unrealized"] == pytest.approx(72.0)
 
 
+# -- TICKET-005: trigger_reason column ------------------------------------
+
+
+async def _seed_csp_with_close(
+    deps,
+    *,
+    symbol: str,
+    contract: str,
+    trigger_reason: str | None,
+):
+    """Seed CSP_OPEN with an open cycle + a FILLED BUY_TO_CLOSE carrying the
+    given trigger_reason. Returns the position's id."""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await deps.repos.cycles.insert(
+        WheelCycle(
+            account_id="test", symbol=symbol, strategy_id="monthly_wheel",
+            started_at=now,
+        )
+    )
+    await deps.repos.orders.insert(
+        Order(
+            account_id="test", symbol=symbol, strategy_id="monthly_wheel",
+            cycle_id=cycle_id,
+            order_type=OrderType.SELL_TO_OPEN, contract_symbol=contract,
+            strike=10.0, expiration=date(2026, 8, 15),
+            option_type=__import__("core.models", fromlist=["OptionType"]).OptionType.PUT,
+            quantity=1, fill_price=1.00, status=OrderStatus.FILLED,
+            placed_at=now, filled_at=now,
+        )
+    )
+    if trigger_reason is not None:
+        await deps.repos.orders.insert(
+            Order(
+                account_id="test", symbol=symbol, strategy_id="monthly_wheel",
+                cycle_id=cycle_id,
+                order_type=OrderType.BUY_TO_CLOSE, contract_symbol=contract,
+                strike=10.0, expiration=date(2026, 8, 15),
+                option_type=__import__("core.models", fromlist=["OptionType"]).OptionType.PUT,
+                quantity=1, fill_price=0.50, status=OrderStatus.FILLED,
+                placed_at=now + timedelta(minutes=1),
+                filled_at=now + timedelta(minutes=1),
+                trigger_reason=trigger_reason,
+            )
+        )
+    pos_id = await deps.repos.positions.insert(
+        Position(
+            account_id="test", symbol=symbol, strategy_id="monthly_wheel",
+            state=PositionState.CSP_OPEN,
+            shares=0, current_cycle_id=cycle_id,
+            state_changed_at=now,
+        )
+    )
+    return pos_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["delta_stop_close", "delta_stop_close_fallback"])
+async def test_positions_table_renders_close_trigger_column(app_client, trigger):
+    """Both delta_stop_close AND the new delta_stop_close_fallback value must
+    render through the template. Parametrised so anyone hardcoding the column
+    to recognise only one value gets caught immediately."""
+    client, deps, _broker = app_client
+    await _seed_csp_with_close(
+        deps, symbol="F", contract="F260815P00010000", trigger_reason=trigger,
+    )
+
+    # Hit the HTMX partial route — same template the full page renders.
+    resp = await client.get("/positions/_table", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    assert "Close Trigger" in body, "header missing"
+    assert trigger in body, f"trigger value {trigger!r} not rendered"
+    # The CSS hook for future colour-coding must be present.
+    assert f"trigger-{trigger}" in body, "trigger-<value> CSS hook missing"
+
+
+@pytest.mark.asyncio
+async def test_positions_table_renders_dash_when_no_close_yet(app_client):
+    """A position with no BUY_TO_CLOSE yet renders '—', not 'None'."""
+    client, deps, _broker = app_client
+    await _seed_csp_with_close(
+        deps, symbol="F", contract="F260815P00010000", trigger_reason=None,
+    )
+
+    resp = await client.get("/positions/_table", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    assert "Close Trigger" in resp.text
+    # Templates should NEVER spit out "None" into the HTML.
+    assert ">None<" not in resp.text
+
+
 @pytest.mark.asyncio
 async def test_positions_row_populates_dte_and_unrealized_for_bear_call_spread(app_client):
     """SPREAD_OPEN bear_call_spread also gets DTE + unrealized.

@@ -95,6 +95,7 @@ def load_strategies(config: dict[str, Any]) -> list[StrategyDefinition]:
                 params=dict(entry.get("params", {}) or {}),
             )
         )
+    _validate(out)
     log_checkpoint(
         "strategies_loaded",
         status="ok",
@@ -102,6 +103,33 @@ def load_strategies(config: dict[str, Any]) -> list[StrategyDefinition]:
         ids=[s.id for s in out],
     )
     return out
+
+
+def _validate(strategies: list[StrategyDefinition]) -> None:
+    """Cross-param invariants enforced at load time.
+
+    TICKET-005: when a wheel strategy uses `delta_stop_action: roll`, the roll
+    evaluator's trigger must fire AT OR BEFORE the delta-stop threshold —
+    otherwise the delta stop wins and the "let the roll handle it" branch is
+    unreachable. We raise here rather than silently misordering the triggers.
+    """
+    for s in strategies:
+        if s.type != "wheel":
+            continue
+        action = str(s.params.get("delta_stop_action", "")).lower()
+        if action != "roll":
+            continue
+        threshold = s.params.get("delta_stop_threshold")
+        trigger = s.params.get("roll_trigger_delta")
+        if threshold is None or trigger is None:
+            continue  # the feature isn't fully configured for this strategy
+        if float(trigger) > float(threshold):
+            raise ValueError(
+                f"strategy {s.id!r}: roll_trigger_delta ({trigger}) must be "
+                f"<= delta_stop_threshold ({threshold}) when "
+                f"delta_stop_action='roll' — otherwise the delta stop would "
+                f"fire before the roll evaluator gets a chance to act."
+            )
 
 
 def universe_for_strategy(

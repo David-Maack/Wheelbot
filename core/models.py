@@ -138,6 +138,10 @@ class Order(_Base):
     filled_at: datetime | None = None
     raw_request: dict[str, Any] | None = None
     raw_response: dict[str, Any] | None = None
+    # Structured close-reason tag (migration 007). Populated by the proposer for
+    # BUY_TO_CLOSE / MULTI_LEG_CLOSE orders so the dashboard + post-hoc analysis
+    # can distinguish why a close fired. See db/migrations/007 for allowed values.
+    trigger_reason: str | None = None
 
 
 class WheelCycle(_Base):

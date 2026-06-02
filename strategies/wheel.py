@@ -44,6 +44,9 @@ class Proposal:
     strategy_id: str = "monthly_wheel"
     requires_screen: bool = False  # tier 2
     requires_human: bool = False  # tier 3
+    # Structured close-reason tag for BUY_TO_CLOSE proposals (TICKET-005).
+    # Plumbed through the router into orders.trigger_reason. None for entries.
+    trigger_reason: str | None = None
 
 
 def _tier_flags(symbol: str, universe: dict[str, Any]) -> tuple[bool, bool]:

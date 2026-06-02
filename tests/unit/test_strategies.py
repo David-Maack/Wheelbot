@@ -2,12 +2,77 @@
 
 from __future__ import annotations
 
+import pytest
+
 from core.models import UniverseEntry
 from core.strategies import (
     StrategyDefinition,
     load_strategies,
     universe_for_strategy,
 )
+
+
+def test_load_strategies_rejects_roll_trigger_above_delta_stop():
+    """TICKET-005 validation: when delta_stop_action=roll, the roll evaluator's
+    trigger must fire at or before the delta-stop threshold — otherwise the
+    delta stop wins and 'defer to the roll' is unreachable."""
+    cfg = {
+        "strategies": [
+            {
+                "id": "broken_wheel",
+                "type": "wheel",
+                "enabled": True,
+                "max_concurrent": 2,
+                "params": {
+                    "roll_trigger_delta": 0.60,
+                    "delta_stop_threshold": 0.55,
+                    "delta_stop_action": "roll",
+                },
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="roll_trigger_delta"):
+        load_strategies(cfg)
+
+
+def test_load_strategies_accepts_valid_delta_stop_roll_config():
+    """Valid layering: trigger 0.50 < threshold 0.55 → load succeeds."""
+    cfg = {
+        "strategies": [
+            {
+                "id": "ok_wheel",
+                "type": "wheel",
+                "enabled": True,
+                "max_concurrent": 2,
+                "params": {
+                    "roll_trigger_delta": 0.50,
+                    "delta_stop_threshold": 0.55,
+                    "delta_stop_action": "roll",
+                },
+            }
+        ],
+    }
+    assert load_strategies(cfg)[0].id == "ok_wheel"
+
+
+def test_load_strategies_validation_skips_when_action_is_close():
+    """When action=close the roll-vs-threshold ordering doesn't matter."""
+    cfg = {
+        "strategies": [
+            {
+                "id": "weekly_close",
+                "type": "wheel",
+                "enabled": True,
+                "max_concurrent": 4,
+                "params": {
+                    "roll_trigger_delta": 0.60,
+                    "delta_stop_threshold": 0.55,
+                    "delta_stop_action": "close",
+                },
+            }
+        ],
+    }
+    assert load_strategies(cfg)[0].id == "weekly_close"
 
 
 def test_load_legacy_config_synthesizes_single_strategy():

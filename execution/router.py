@@ -564,6 +564,10 @@ class OrderRouter:
             status=OrderStatus.PENDING,
             placed_at=_utcnow(),
             client_order_id=client_order_id or _client_order_id(proposal, today),
+            # TICKET-005: plumb the structured close-reason from the proposer
+            # into orders.trigger_reason so the dashboard + post-hoc analysis
+            # can read it without parsing the rationale string.
+            trigger_reason=proposal.trigger_reason,
         )
 
     async def _submit_with_retry(

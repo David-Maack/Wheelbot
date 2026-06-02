@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS orders (
     filled_at         DATETIME,
     raw_request       JSON,                           -- full broker request body
     raw_response      JSON,                           -- full broker response
+    trigger_reason    TEXT,                           -- TICKET-005 (migration 007) — close-reason tag
     FOREIGN KEY (cycle_id) REFERENCES wheel_cycles(id)
 );
 

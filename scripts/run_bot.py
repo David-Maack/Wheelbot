@@ -266,6 +266,7 @@ async def _propose_and_route(
     config: dict[str, Any],
     universe: dict[str, Any],
     strategies: list[StrategyDefinition],
+    delta_unavailable_counters: dict[int, int],
 ):
     """Iterate enabled strategies; dispatch by type to the right orchestrator;
     route each proposal through the router. Per-strategy summary lines so the
@@ -301,6 +302,7 @@ async def _propose_and_route(
             # Profit-closes first — free up capital before considering new entries.
             close_proposals = await propose_all_wheel_closes(
                 broker, repos, config, strategy=strategy,
+                delta_unavailable_counters=delta_unavailable_counters,
             )
             open_proposals = await propose_all(
                 broker, repos, config, strategy_universe, ivr, strategy=strategy,
@@ -441,6 +443,11 @@ async def main(argv: list[str] | None = None) -> int:
         disabled=[s.id for s in strategies if not s.enabled],
     )
 
+    # TICKET-005: process-local counters for the delta-stop "stuck unavailable"
+    # detector. dict[position_id, consecutive_failures]. Resets on process
+    # restart (acceptable — restart implies someone's looking).
+    delta_unavailable_counters: dict[int, int] = {}
+
     async def _post_tick(_loop: ReconcilerLoop, ks: KillSwitchResult | None):
         if ks is not None and ks.tripped:
             log_checkpoint("bot_skip_kill_switch", status="ok", reason=ks.reason)
@@ -448,6 +455,7 @@ async def main(argv: list[str] | None = None) -> int:
         await _propose_and_route(
             broker=broker, repos=repos, router=router, ivr=ivr,
             config=config, universe=universe, strategies=enabled_strategies,
+            delta_unavailable_counters=delta_unavailable_counters,
         )
 
     loop = ReconcilerLoop(

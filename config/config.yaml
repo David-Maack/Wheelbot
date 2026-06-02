@@ -200,6 +200,16 @@ strategies:
       # assignment risk dominates. CC stop-loss is intentionally not set —
       # called-away is the wheel's profitable outcome, not a loss to exit.
       csp_stop_loss_mult: 2.0
+      # TICKET-005: delta-based hard stop. Price-based stop alone leaves you
+      # gamma-exposed near the money (delta 0.20 → 0.55 without 2× premium
+      # move on a steady drift). Action 'roll' defers to the reconciler's
+      # roll evaluator (which fires at roll_trigger_delta=0.50, comfortably
+      # below 0.55); the fallback kicks in only if the roll declined AND we
+      # have <= 14 days left, which is plenty of room on the 30-45 DTE band.
+      delta_stop_threshold: 0.55
+      delta_stop_action: roll
+      delta_stop_roll_fallback_dte: 14
+      delta_stop_stuck_alert_ticks: 12
 
   - id: weekly_wheel
     display_name: "Weekly Wheel"
@@ -224,6 +234,16 @@ strategies:
       auto_disable_drawdown_usd: -300
       # CSP stop-loss — see monthly_wheel.
       csp_stop_loss_mult: 2.0
+      # TICKET-005: delta hard stop. Weekly gamma punishes patience — at 0.55
+      # delta on a 5-DTE put, a single bad day can take you to 0.80+. Action
+      # 'close' exits immediately rather than rolling (the dte_max=14 cap
+      # gives the roll evaluator very little forward room). Fallback DTE is
+      # half the dte_max so a freshly-opened 7-DTE position at delta 0.55
+      # still triggers the fallback if anything weird happens at entry.
+      delta_stop_threshold: 0.55
+      delta_stop_action: close
+      delta_stop_roll_fallback_dte: 7
+      delta_stop_stuck_alert_ticks: 12
 
   - id: put_spread
     display_name: "Bull Put Spread"
