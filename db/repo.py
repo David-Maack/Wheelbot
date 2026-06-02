@@ -62,7 +62,20 @@ def _row_to_dict(row: aiosqlite.Row, json_fields: tuple[str, ...] = ()) -> dict[
 
 
 class Database:
-    """Connection holder. One per process. Open with `connect()` or use as context manager."""
+    """Connection holder. One per process. Open with `connect()` or use as context manager.
+
+    Concurrent-access policy (TICKET-003):
+      The same SQLite file is touched by multiple processes — the bot loop, the
+      screener cron, the regime cron, the daily-summary cron, and the dashboard
+      readers. WAL is required (multiple readers + one writer concurrently), and
+      a `busy_timeout` is required so a contending writer waits a few seconds
+      instead of failing immediately with SQLITE_BUSY.
+
+      Readers should use the default DEFERRED transaction mode (which aiosqlite
+      gives via `async with conn.execute(...)`) — NEVER use `BEGIN IMMEDIATE`
+      from a reader, which would block the writer. The single writer is the bot
+      loop; everything else (screener, dashboard) reads.
+    """
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
@@ -73,8 +86,18 @@ class Database:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = await aiosqlite.connect(self.path)
             self._conn.row_factory = aiosqlite.Row
+            # Order matters: foreign_keys + WAL first, then performance/contention pragmas.
             await self._conn.execute("PRAGMA foreign_keys = ON")
             await self._conn.execute("PRAGMA journal_mode = WAL")
+            # synchronous=NORMAL is safe with WAL (durability still survives an OS
+            # crash; only a power-loss-mid-commit risks losing the last txn). Trades
+            # a small durability window for a large write-throughput win — fine for
+            # an audit-trail DB where the broker is the source of truth.
+            await self._conn.execute("PRAGMA synchronous = NORMAL")
+            # busy_timeout in ms — how long any contending statement waits for the
+            # writer to release before returning SQLITE_BUSY. 5s comfortably covers
+            # the bot loop's slowest commits.
+            await self._conn.execute("PRAGMA busy_timeout = 5000")
             await self._conn.commit()
         return self._conn
 
