@@ -122,6 +122,43 @@ def apply_migration(conn: sqlite3.Connection, migration: Migration) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
+def apply_pending(db_path: Path | str | None = None) -> list[Migration]:
+    """Apply every unapplied migration, in order. Returns the list of
+    migrations that were applied (empty when up-to-date).
+
+    Programmatic counterpart of `python -m scripts.run_migration --all-pending`,
+    intended to be called from `scripts/run_bot.py` at startup so a deploy
+    that ships a new migration self-heals on `docker compose up -d --build`
+    instead of requiring an extra step the operator can (and did) forget.
+
+    Raises:
+        FileNotFoundError: the DB file doesn't exist yet (fresh install —
+            run `scripts/bootstrap_db.py` first to create the base schema).
+        sqlite3.Error: any migration's SQL failed; the writer transaction
+            rolled back, the schema is in its pre-migration state, and the
+            bot caller should NOT proceed.
+    """
+    config = load_config()
+    resolved = (
+        Path(db_path)
+        if db_path is not None
+        else Path(config.get("database", {}).get("path", "wheelbot.db"))
+    )
+    if not resolved.exists():
+        raise FileNotFoundError(f"DB not found: {resolved}")
+    conn = sqlite3.connect(resolved)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        _ensure_schema_migrations(conn)
+        applied = _applied_versions(conn)
+        pending = [m for m in _discover() if m.version not in applied]
+        for m in pending:
+            apply_migration(conn, m)
+        return pending
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()

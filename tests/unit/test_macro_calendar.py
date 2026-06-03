@@ -446,3 +446,96 @@ async def test_idempotent_refresh_no_duplicates(db_repos):
     await db_repos.macro_events.upsert_many([evt])
     await db_repos.macro_events.upsert_many([evt])
     assert await db_repos.macro_events.count() == 1
+
+
+@pytest.mark.asyncio
+async def test_upsert_many_returns_attempts_and_distinct_rows(db_repos):
+    """4 items mapping to 2 distinct (event_date, event_type) tuples should
+    report (4, 2) — locks in the honest-logging fix for the misleading
+    'rows_upserted=50' we hit in production with only 18 distinct rows."""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    # Simulating Finnhub: FOMC Statement + Press Conference same day, then
+    # CPI YoY + Core CPI MoM same day — all collapse via UNIQUE.
+    events = [
+        MacroEvent(event_date=date(2026, 6, 17), event_type="FOMC", impact="high",
+                   description="FOMC Statement", fetched_at=now, created_at=now),
+        MacroEvent(event_date=date(2026, 6, 17), event_type="FOMC", impact="high",
+                   description="FOMC Press Conference", fetched_at=now, created_at=now),
+        MacroEvent(event_date=date(2026, 7, 15), event_type="CPI", impact="high",
+                   description="CPI YoY", fetched_at=now, created_at=now),
+        MacroEvent(event_date=date(2026, 7, 15), event_type="CPI", impact="high",
+                   description="Core CPI MoM", fetched_at=now, created_at=now),
+    ]
+    attempts, distinct = await db_repos.macro_events.upsert_many(events)
+    assert attempts == 4
+    assert distinct == 2
+    assert await db_repos.macro_events.count() == 2
+
+
+# -- apply_pending (auto-migrate on bot startup) ----------------------------
+
+
+def test_apply_pending_runs_unapplied_migrations(tmp_path, monkeypatch):
+    """The programmatic helper applies every unapplied migration and returns
+    the list. Locks in the contract scripts/run_bot.py depends on."""
+    import sqlite3
+    from scripts import run_migration
+
+    # Build a fresh DB with only schema_migrations populated for 001.
+    db_path = tmp_path / "wb.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE schema_migrations ("
+        " version TEXT PRIMARY KEY, name TEXT NOT NULL, applied_at DATETIME)"
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at) "
+        "VALUES ('001', 'daily_state', '2026-01-01 00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    # Stub config so load_config() inside apply_pending finds our temp DB.
+    monkeypatch.setattr(
+        "scripts.run_migration.load_config",
+        lambda: {"database": {"path": str(db_path)}},
+    )
+    # Point at a tiny migrations dir with two synthetic migrations.
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "002_two.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS t2 (id INTEGER PRIMARY KEY);"
+    )
+    (migrations_dir / "003_three.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS t3 (id INTEGER PRIMARY KEY);"
+    )
+    monkeypatch.setattr("scripts.run_migration.MIGRATIONS_DIR", migrations_dir)
+
+    applied = run_migration.apply_pending()
+    assert [m.version for m in applied] == ["002", "003"]
+
+    # Re-running is a no-op.
+    applied_again = run_migration.apply_pending()
+    assert applied_again == []
+
+    # Tables created.
+    conn = sqlite3.connect(db_path)
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()]
+    assert "t2" in tables and "t3" in tables
+    conn.close()
+
+
+def test_apply_pending_raises_on_missing_db(tmp_path, monkeypatch):
+    """If the DB file doesn't exist (fresh install — bootstrap_db not run),
+    apply_pending raises FileNotFoundError so the bot caller refuses to
+    start and the operator sees the actionable error instead of a stack
+    trace from later code."""
+    from scripts import run_migration
+    monkeypatch.setattr(
+        "scripts.run_migration.load_config",
+        lambda: {"database": {"path": str(tmp_path / "does_not_exist.db")}},
+    )
+    with pytest.raises(FileNotFoundError):
+        run_migration.apply_pending()

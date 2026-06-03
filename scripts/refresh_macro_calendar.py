@@ -30,14 +30,14 @@ async def main_async() -> int:
     db_path = Path(config.get("database", {}).get("path", "wheelbot.db")).expanduser()
     async with Database(db_path) as db:
         repos = Repos(db)
-        written, source = await refresh_events(repos, config)
+        distinct_rows, source = await refresh_events(repos, config)
     log_checkpoint(
         "run_refresh_macro_calendar_done",
         status="ok",
-        rows_upserted=written,
+        distinct_rows=distinct_rows,
         source=source,
     )
-    print(f"macro calendar refreshed: {written} rows ({source})")
+    print(f"macro calendar refreshed: {distinct_rows} distinct rows ({source})")
     return 0
 
 

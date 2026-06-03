@@ -389,12 +389,13 @@ async def refresh_events(
         events, valid_until = load_yaml_calendar()
         maybe_log_yaml_stale(valid_until)
 
-    written = await repos.macro_events.upsert_many(events)
+    attempts, distinct_rows = await repos.macro_events.upsert_many(events)
     log_checkpoint(
         "macro_refresh_done",
         status="ok",
         source=source,
         events_returned=len(events),
-        rows_upserted=written,
+        upsert_attempts=attempts,
+        distinct_rows_after=distinct_rows,
     )
-    return written, source
+    return distinct_rows, source

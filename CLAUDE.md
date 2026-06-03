@@ -20,24 +20,39 @@ it short and stable; longer-lived design docs live in `docs/`.
 
 ## Deployment Gotchas
 
-### DB migrations are baked into the Docker image
+### DB migrations are baked into the Docker image AND auto-apply on startup
 
-Migrations in `db/migrations/` are applied by the Docker image at build time.
-A `git pull` on the LXC host does **not** update the running container — the
-image is unchanged.
+Migrations in `db/migrations/` are baked into the Docker image at build time.
+**As of TICKET-007 follow-up, `scripts/run_bot.py` calls
+`scripts.run_migration.apply_pending()` at startup**, so a fresh container
+self-heals onto the latest schema — no extra step. Per-migration writes are
+transactional; if any fails, the bot exits non-zero and the container is
+marked unhealthy by Docker rather than running on a partial schema.
 
-**To deploy a migration:**
+A `git pull` on the LXC host alone does NOT update the running container.
+You still need to rebuild the image.
+
+**To deploy:**
 ```
 cd /opt/wheelbot
 git pull
-docker compose build wheelbot
-docker compose up -d wheelbot
+docker compose up -d --build wheelbot
+# auto-applies any pending migrations during startup; watch the log:
+docker logs wheelbot --tail 20 | grep -E 'bot_migrations'
+# Verify:
 docker exec wheelbot python -m scripts.db_health
 docker exec wheelbot bash scripts/migrate_check.sh
 ```
 
 `migrate_check.sh` diffs the host's `db/migrations/` directory against the
-files inside the running container and reports any drift.
+files inside the running container AND lists applied versions from
+`schema_migrations` — drift detector.
+
+If a deploy somehow misses the auto-apply (e.g. you ran the bot under a
+different entrypoint), the manual fallback is:
+```
+docker exec wheelbot python -m scripts.run_migration --all-pending
+```
 
 ### Config + code changes both need `--build`
 

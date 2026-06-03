@@ -396,6 +396,36 @@ async def main(argv: list[str] | None = None) -> int:
     universe = load_universe()
 
     db_path = Path(config.get("database", {}).get("path", "wheelbot.db")).expanduser()
+
+    # Apply any pending migrations BEFORE we open the long-lived connection.
+    # `docker compose up -d --build` historically required a follow-up
+    # `python -m scripts.run_migration --all-pending` step that was easy to
+    # forget — this auto-heals it. apply_pending() raises on any per-migration
+    # failure (transactions are atomic), and we let that propagate so the
+    # container exits non-zero rather than running against a partial schema.
+    if db_path.exists():
+        try:
+            from scripts.run_migration import apply_pending
+            applied = apply_pending(db_path)
+            if applied:
+                log_checkpoint(
+                    "bot_migrations_applied",
+                    status="ok",
+                    versions=[m.version for m in applied],
+                )
+            else:
+                log_checkpoint("bot_migrations_up_to_date", status="ok")
+        except Exception as exc:
+            log_checkpoint("bot_migrations_fail", status="fail", error=str(exc))
+            raise
+    else:
+        log_checkpoint(
+            "bot_migrations_skip_no_db",
+            status="skip",
+            db_path=str(db_path),
+            note="DB file missing — run scripts.bootstrap_db before first start",
+        )
+
     db = Database(db_path)
     await db.connect()
     repos = Repos(db)

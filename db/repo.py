@@ -661,12 +661,21 @@ class MacroEventsRepo(_Repo):
 
     table = "macro_events"
 
-    async def upsert_many(self, events: list) -> int:
-        """Upsert a batch. Returns the count of rows written/updated."""
+    async def upsert_many(self, events: list) -> tuple[int, int]:
+        """Upsert a batch. Returns `(upsert_attempts, distinct_rows_after)`.
+
+        The two diverge when several input items share an `(event_date,
+        event_type)` tuple — UNIQUE collapses them to one row, last-writer
+        wins on description. Finnhub returns 4 separate items per FOMC day
+        (Statement / Press Conference / Minutes / Economic Projections) and
+        ~3 per CPI day, so ~50 attempts commonly produce ~18 distinct rows.
+        Returning both makes the refresh log honest:
+            macro_refresh_done upsert_attempts=50 distinct_rows_after=18
+        """
         if not events:
-            return 0
+            return 0, await self.count()
         c = await self.db.connect()
-        written = 0
+        attempts = 0
         for evt in events:
             await c.execute(
                 "INSERT INTO macro_events "
@@ -685,9 +694,9 @@ class MacroEventsRepo(_Repo):
                     evt.created_at.isoformat(),
                 ),
             )
-            written += 1
+            attempts += 1
         await c.commit()
-        return written
+        return attempts, await self.count()
 
     async def between(self, start: date, end: date) -> list:
         """All events with event_date in [start, end] inclusive, sorted ascending."""
