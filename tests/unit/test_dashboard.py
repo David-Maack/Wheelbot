@@ -348,6 +348,116 @@ async def test_positions_table_renders_close_trigger_column(app_client, trigger)
 
 
 @pytest.mark.asyncio
+async def test_positions_table_renders_earnings_warning_badge(app_client, monkeypatch):
+    """TICKET-006: when next_earnings returns a date inside the position's
+    remaining DTE ± window, the row renders a ⚠ badge with the earnings date
+    in the title attribute. Same predicate + same days_before/days_after as
+    the recheck loop — single source of truth."""
+    from data.earnings import EarningsLookup
+    client, deps, broker = app_client
+
+    # Open a CSP_OPEN with expiration 14 days from today (the dashboard uses
+    # UTC.today as 'today').
+    today = datetime.now(UTC).date()
+    expiration = today + timedelta(days=14)
+    occ = f"F{expiration.strftime('%y%m%d')}P00010000"
+    cycle_id = await deps.repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="F", strategy_id="monthly_wheel",
+                   started_at=datetime.now(UTC).replace(tzinfo=None))
+    )
+    await deps.repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", strategy_id="monthly_wheel",
+            cycle_id=cycle_id,
+            order_type=OrderType.SELL_TO_OPEN, contract_symbol=occ,
+            strike=10.0, expiration=expiration,
+            option_type=__import__("core.models", fromlist=["OptionType"]).OptionType.PUT,
+            quantity=1, fill_price=0.50, status=OrderStatus.FILLED,
+            placed_at=datetime.now(UTC).replace(tzinfo=None),
+            filled_at=datetime.now(UTC).replace(tzinfo=None),
+        )
+    )
+    await deps.repos.positions.insert(
+        Position(
+            account_id="test", symbol="F", strategy_id="monthly_wheel",
+            state=PositionState.CSP_OPEN, shares=0,
+            current_cycle_id=cycle_id,
+            state_changed_at=datetime.now(UTC).replace(tzinfo=None),
+        )
+    )
+    broker.seed_quote(__import__("core.models", fromlist=["Quote"]).Quote(symbol=occ, bid=0.40, ask=0.42))
+
+    # Earnings 10 days from today → inside (default 5/2 window around expiry).
+    earnings_date = today + timedelta(days=10)
+    def _stub_lookup(symbol: str, **_):
+        if symbol == "F":
+            return EarningsLookup("F", earnings_date, "finnhub")
+        return EarningsLookup(symbol, None, "none")
+    monkeypatch.setattr("dashboard.app._next_earnings", _stub_lookup)
+    # Ensure the dashboard config carries the earnings_recheck window block —
+    # the dashboard reads days_before/days_after from there.
+    deps.config.setdefault("risk", {})["earnings_recheck"] = {
+        "enabled": True, "check_interval_ticks": 12, "action": "flag_manual",
+        "days_before": 5, "days_after": 2,
+    }
+
+    resp = await client.get("/positions/_table", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    # Badge present + title attribute carries the earnings date.
+    assert "warn-earnings" in body, "earnings-warning CSS class missing"
+    assert "⚠" in body, "warning glyph missing"
+    assert earnings_date.isoformat() in body, "earnings date not in title attr"
+
+
+@pytest.mark.asyncio
+async def test_positions_table_no_badge_when_earnings_outside_window(app_client, monkeypatch):
+    """Negative case — earnings 60 days out → no badge, body has no
+    warn-earnings class. Catches a future regression where the predicate
+    always returns True."""
+    from data.earnings import EarningsLookup
+    client, deps, broker = app_client
+    today = datetime.now(UTC).date()
+    expiration = today + timedelta(days=14)
+    occ = f"F{expiration.strftime('%y%m%d')}P00010000"
+    cycle_id = await deps.repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="F", strategy_id="monthly_wheel",
+                   started_at=datetime.now(UTC).replace(tzinfo=None))
+    )
+    await deps.repos.orders.insert(
+        Order(
+            account_id="test", symbol="F", strategy_id="monthly_wheel",
+            cycle_id=cycle_id, order_type=OrderType.SELL_TO_OPEN,
+            contract_symbol=occ, strike=10.0, expiration=expiration,
+            option_type=__import__("core.models", fromlist=["OptionType"]).OptionType.PUT,
+            quantity=1, fill_price=0.50, status=OrderStatus.FILLED,
+            placed_at=datetime.now(UTC).replace(tzinfo=None),
+            filled_at=datetime.now(UTC).replace(tzinfo=None),
+        )
+    )
+    await deps.repos.positions.insert(
+        Position(
+            account_id="test", symbol="F", strategy_id="monthly_wheel",
+            state=PositionState.CSP_OPEN, shares=0,
+            current_cycle_id=cycle_id,
+            state_changed_at=datetime.now(UTC).replace(tzinfo=None),
+        )
+    )
+    broker.seed_quote(__import__("core.models", fromlist=["Quote"]).Quote(symbol=occ, bid=0.40, ask=0.42))
+
+    def _stub_lookup(symbol: str, **_):
+        return EarningsLookup(symbol, today + timedelta(days=60), "finnhub")
+    monkeypatch.setattr("dashboard.app._next_earnings", _stub_lookup)
+    deps.config.setdefault("risk", {})["earnings_recheck"] = {
+        "days_before": 5, "days_after": 2,
+    }
+
+    resp = await client.get("/positions/_table", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    assert "warn-earnings" not in resp.text
+
+
+@pytest.mark.asyncio
 async def test_positions_table_renders_dash_when_no_close_yet(app_client):
     """A position with no BUY_TO_CLOSE yet renders '—', not 'None'."""
     client, deps, _broker = app_client

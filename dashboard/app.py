@@ -19,7 +19,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,9 @@ from core.broker import Broker, BrokerUnavailable
 from core.broker_factory import make_broker
 from core.config import load_config
 from core.models import Order, OrderStatus, OrderType, Position, PositionState, WheelCycle
+from data.earnings import next_earnings as _next_earnings
 from db.repo import Database, Repos
+from risk.earnings_recheck import is_in_earnings_window as _is_in_earnings_window
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(ROOT / "templates"))
@@ -320,6 +322,25 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
     positions = await deps.repos.positions.list_all(account_id)
     out: list[dict[str, Any]] = []
     today = datetime.now(UTC).replace(tzinfo=None)
+    # TICKET-006: cache earnings lookups per-render so the table isn't N calls
+    # to next_earnings when multiple positions share a symbol (rare but real
+    # under multi-strategy on the same underlying). The provider itself
+    # already has a 6h TTL — this is just dedup within one render.
+    earnings_cfg = (deps.config.get("risk", {}) or {}).get("earnings_recheck", {}) or {}
+    earnings_days_before = int(earnings_cfg.get("days_before", 5))
+    earnings_days_after = int(earnings_cfg.get("days_after", 2))
+    _earnings_lookup_cache: dict[str, "date | None"] = {}
+
+    def _lookup_earnings(symbol: str) -> "date | None":
+        if symbol in _earnings_lookup_cache:
+            return _earnings_lookup_cache[symbol]
+        try:
+            result = _next_earnings(symbol).next_date
+        except Exception:
+            result = None
+        _earnings_lookup_cache[symbol] = result
+        return result
+
     for p in positions:
         if p.state == PositionState.IDLE:
             continue
@@ -367,6 +388,34 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
         last_close_trigger: str | None = None
         if p.id is not None:
             last_close_trigger = await deps.repos.orders.last_close_trigger_for_position(p.id)
+
+        # TICKET-006: earnings_warning badge — uses the SAME predicate
+        # (is_in_earnings_window) and the SAME days_before/days_after from
+        # risk.earnings_recheck as the recheck loop, so the badge and the
+        # actual mutation can't disagree. Only meaningful on open short-leg
+        # states where the short_expiration is well-defined.
+        earnings_warning = False
+        earnings_date_iso: str | None = None
+        if p.state in (
+            PositionState.CSP_OPEN, PositionState.CC_OPEN, PositionState.SPREAD_OPEN,
+        ):
+            short_expiration: "date | None" = None
+            if p.state in (PositionState.CSP_OPEN, PositionState.CC_OPEN):
+                # Reuse the DTE already resolved above when available.
+                if dte is not None:
+                    short_expiration = today.date() + timedelta(days=dte)
+            elif p.state == PositionState.SPREAD_OPEN and dte is not None:
+                short_expiration = today.date() + timedelta(days=dte)
+            if short_expiration is not None:
+                e_date = _lookup_earnings(p.symbol)
+                if e_date is not None and _is_in_earnings_window(
+                    e_date, short_expiration,
+                    days_before=earnings_days_before,
+                    days_after=earnings_days_after,
+                ):
+                    earnings_warning = True
+                    earnings_date_iso = e_date.isoformat()
+
         out.append(
             {
                 "symbol": p.symbol,
@@ -379,6 +428,8 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 "unrealized": unrealized,
                 "unrealized_pct": unrealized_pct,
                 "last_close_trigger": last_close_trigger,
+                "earnings_warning": earnings_warning,
+                "earnings_date_iso": earnings_date_iso,
             }
         )
     return out

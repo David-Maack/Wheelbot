@@ -66,6 +66,7 @@ from execution.kill_switch import KillSwitchResult
 from execution.loop import ReconcilerLoop
 from execution.reconciler import Reconciler
 from execution.router import OrderRouter
+from risk.earnings_recheck import check_open_positions_for_new_earnings
 from intelligence.anthropic_client import AnthropicClient
 from intelligence.budget import BudgetTracker
 from intelligence.news import make_news_source
@@ -447,9 +448,29 @@ async def main(argv: list[str] | None = None) -> int:
     # detector. dict[position_id, consecutive_failures]. Resets on process
     # restart (acceptable — restart implies someone's looking).
     delta_unavailable_counters: dict[int, int] = {}
+    # TICKET-006: rate-limit state for the mid-cycle earnings recheck. Single
+    # counter incremented on every _post_tick, only does the per-position
+    # work when it crosses risk.earnings_recheck.check_interval_ticks.
+    earnings_recheck_state: dict[str, int] = {"ticks_since_check": 0}
 
     async def _post_tick(_loop: ReconcilerLoop, ks: KillSwitchResult | None):
-        if ks is not None and ks.tripped:
+        kill_switch_tripped = ks is not None and ks.tripped
+        # TICKET-006: earnings recheck runs even when the kill switch is
+        # tripped — for action='flag_manual' it MUST run (state annotation
+        # the operator needs to see), and for action='close' the function
+        # itself logs earnings_recheck_close_skipped_kill_switch and skips.
+        # Always before _propose_and_route so any flag_manual writes are
+        # visible to the proposers (they'd skip MANUAL_INTERVENTION anyway).
+        try:
+            await check_open_positions_for_new_earnings(
+                repos=repos, router=router, config=config,
+                kill_switch_tripped=kill_switch_tripped,
+                recheck_state=earnings_recheck_state,
+            )
+        except Exception as exc:  # defensive — recheck must not block trading
+            log_checkpoint("earnings_recheck_fail", status="fail", error=str(exc))
+
+        if kill_switch_tripped:
             log_checkpoint("bot_skip_kill_switch", status="ok", reason=ks.reason)
             return
         await _propose_and_route(

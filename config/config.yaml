@@ -136,6 +136,32 @@ intelligence:
   #     input_per_mtok: 15.0
   #     output_per_mtok: 75.0
 
+risk:
+  # TICKET-006: mid-cycle earnings recheck. Entry-time earnings blackout fires
+  # at order placement, but companies often confirm earnings dates only 2-3
+  # weeks in advance — a CSP opened cleanly can later have earnings inside its
+  # remaining DTE. This re-runs the blackout check periodically on every open
+  # short-premium position.
+  #
+  # Action 'flag_manual' (recommended testing default) flips the position to
+  # MANUAL_INTERVENTION and notifies Discord — purely a state annotation, runs
+  # even when the kill switch is tripped because the operator needs to see
+  # the signal to act.
+  #
+  # Action 'close' builds a BUY_TO_CLOSE proposal and routes it. SKIPPED when
+  # the kill switch is tripped (logs earnings_recheck_close_skipped_kill_switch
+  # for audit). SPREAD_OPEN positions always fall back to flag_manual under
+  # action='close' until a generic spread-close helper lands with TICKET-014.
+  earnings_recheck:
+    enabled: true
+    check_interval_ticks: 12       # ~1h at 5-min cadence; 30 min at 2.5-min.
+    action: flag_manual            # flag_manual | close
+    # Same window the entry gate (risk/limits.py rule 4) uses by default. The
+    # dashboard /positions earnings_warning badge reads from this block too,
+    # so the badge and the actual recheck behaviour cannot diverge.
+    days_before: 5
+    days_after: 2
+
 notifications:
   # NullNotifier when false (events still logged via core/checkpoint).
   enabled: true

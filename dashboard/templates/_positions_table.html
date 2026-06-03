@@ -7,7 +7,7 @@
   <tbody>
     {% for r in rows %}
     <tr>
-      <td>{{ r.symbol }}</td>
+      <td>{{ r.symbol }}{% if r.earnings_warning %} <span class="warn-earnings" title="Earnings inside remaining DTE: {{ r.earnings_date_iso }}">⚠</span>{% endif %}</td>
       <td><code>{{ r.strategy_id or "—" }}</code></td>
       <td><code>{{ r.state }}</code></td>
       <td>{{ r.days_in_state }}</td>
