@@ -61,11 +61,19 @@ def _today_nyse() -> date:
 
 
 # Finnhub's `/calendar/economic` returns events with names like "FOMC Statement"
-# or "Non Farm Payrolls" — we map case-insensitive substring matches to the
-# canonical bucket the config uses ("FOMC" / "CPI" / "NFP" / ...). Anything
-# that doesn't match becomes "OTHER", which is surfaced on the dashboard so
-# operators notice when Finnhub renames an event and the mapping needs
-# updating. Tested by `test_finnhub_event_name_mapping_canonical`.
+# or "Non Farm Payrolls" — we map them to the canonical bucket the config uses
+# ("FOMC" / "CPI" / "NFP" / ...) by EXACT match on the lowercased event name.
+#
+# Exact (not substring) match is deliberate. Substring matching has an
+# ordering bug: "cpi yoy" is a substring of "core cpi yoy", so a plain CPI key
+# would silently swallow Core CPI events depending on dict iteration order.
+# Same trap with "ppi yoy" inside future "core ppi yoy" variants, or any
+# "Mexico CPI YoY" / "EU CPI YoY" Finnhub might add. Exact match means
+# unknowns fall through to "OTHER" — visible on the /macro page, which is the
+# right failure mode: when Finnhub renames or extends an event, the operator
+# sees it instead of having it silently mis-routed.
+#
+# Keys MUST be lowercased and stripped to match `raw_name.lower().strip()`.
 _FINNHUB_TYPE_MAP: dict[str, str] = {
     "fomc statement": "FOMC",
     "fomc press conference": "FOMC",
@@ -93,15 +101,13 @@ _FINNHUB_TYPE_MAP: dict[str, str] = {
 
 
 def map_finnhub_event_name(raw_name: str) -> str:
-    """Canonicalise a Finnhub event name. Returns 'OTHER' on no match so the
-    operator can see (via the dashboard) when Finnhub renames an event."""
+    """Canonicalise a Finnhub event name via EXACT lowercased match against
+    `_FINNHUB_TYPE_MAP`. Returns 'OTHER' on no match so unknown / renamed
+    Finnhub events surface on the /macro page instead of being silently
+    swallowed by a too-permissive substring rule."""
     if not raw_name:
         return "OTHER"
-    needle = raw_name.lower().strip()
-    for pattern, canonical in _FINNHUB_TYPE_MAP.items():
-        if pattern in needle:
-            return canonical
-    return "OTHER"
+    return _FINNHUB_TYPE_MAP.get(raw_name.lower().strip(), "OTHER")
 
 
 @dataclass(frozen=True, slots=True)

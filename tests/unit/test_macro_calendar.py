@@ -307,6 +307,40 @@ def test_finnhub_event_name_mapping_canonical():
     assert map_finnhub_event_name("") == "OTHER"
 
 
+def test_finnhub_core_cpi_does_not_match_plain_cpi(monkeypatch):
+    """Substring matching would silently route 'Core CPI YoY' to the 'cpi
+    yoy' key depending on dict iteration order; exact matching means an
+    unknown variant correctly routes to OTHER instead of being mis-mapped.
+
+    Proves the fix by removing the 'core cpi yoy' key and asserting the
+    plain 'cpi yoy' key does NOT swallow it via substring fall-through.
+    """
+    monkeypatch.setattr(
+        "data.macro_calendar._FINNHUB_TYPE_MAP",
+        {"cpi yoy": "CPI"},  # only the plain key remains
+    )
+    # Plain CPI still maps correctly.
+    assert map_finnhub_event_name("CPI YoY") == "CPI"
+    # Core CPI must fall to OTHER — NOT be silently swallowed by the
+    # substring "cpi yoy" inside "core cpi yoy".
+    assert map_finnhub_event_name("Core CPI YoY") == "OTHER"
+
+
+def test_finnhub_unknown_variant_falls_to_other():
+    """Anything Finnhub renames or adds that the table doesn't cover routes
+    to OTHER. The /macro page renders OTHER rows so the operator sees the
+    drift and can extend `_FINNHUB_TYPE_MAP` accordingly."""
+    # Geographic variants that share a substring with US series.
+    assert map_finnhub_event_name("Mexico CPI YoY") == "OTHER"
+    assert map_finnhub_event_name("EU Core CPI MoM") == "OTHER"
+    # Brand-new event names Finnhub might add.
+    assert map_finnhub_event_name("Some Brand New Indicator") == "OTHER"
+    # Even a longer Powell-speaks variant doesn't false-positive — exact match.
+    assert map_finnhub_event_name("Fed Chair Powell Speaks at Jackson Hole") == "OTHER"
+    # Whitespace + case still normalize before the exact lookup.
+    assert map_finnhub_event_name("  FOMC Statement  ") == "FOMC"
+
+
 def test_parse_finnhub_events_filters_by_min_impact():
     """`impact_min=high` filters out medium/low events."""
     raw = [
