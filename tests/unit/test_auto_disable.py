@@ -395,6 +395,54 @@ async def test_warning_to_disabled_fires_drawdown_tripped_not_warning(
 
 
 @pytest.mark.asyncio
+async def test_disabled_holds_when_pnl_recovers_to_warning_range(
+    db_repos, monkeypatch,
+):
+    """DISABLED never silently downgrades to WARNING — recovery to the
+    warning range (e.g. -$200 after a -$400 disable) holds DISABLED. Locked
+    in TICKET-008: only the 30d auto-reset or manual reenable clears
+    DISABLED. Pinning to prevent sneaky downgrade regressions."""
+    captured: list[dict] = []
+    async def _stub_notify(event_type, title, **payload):
+        captured.append({"event_type": event_type})
+    monkeypatch.setattr("risk.auto_disable.notify", _stub_notify)
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cfg = {"account": {"id": "test"}}
+    # Tick 1: -$400 loss → DISABLED (one notify).
+    await _insert_closed_cycle(
+        db_repos, strategy_id="put_spread",
+        final_pnl=-400.0, ended_at=now - timedelta(days=2),
+    )
+    first = await check_and_apply(
+        db_repos, _strategy(threshold=-300, warning=-150), cfg, now=now,
+    )
+    assert first is DrawdownState.DISABLED
+    assert [c["event_type"] for c in captured] == ["strategy_auto_disabled"]
+
+    # Tick 2: partial recovery — net rolling P&L drops INTO the warning
+    # band (-$300 < pnl <= -$150). The "sneaky downgrade" would return
+    # WARNING here. Correct behaviour: stay DISABLED.
+    await _insert_closed_cycle(
+        db_repos, strategy_id="put_spread", symbol="GLD",
+        final_pnl=+200.0, ended_at=now - timedelta(days=1),
+    )
+    # rolling = -400 + 200 = -200 (between -300 disable and -150 warning).
+    pnl = await compute_rolling_pnl(
+        db_repos, "put_spread", account_id="test", now=now,
+    )
+    assert pnl == pytest.approx(-200.0)
+    second = await check_and_apply(
+        db_repos, _strategy(threshold=-300, warning=-150), cfg, now=now,
+    )
+    assert second is DrawdownState.DISABLED  # held, NOT WARNING
+    # No additional notify on the held tick.
+    assert [c["event_type"] for c in captured] == ["strategy_auto_disabled"]
+    # current_state agrees — DISABLED persists in the column too.
+    assert await current_state(db_repos, "put_spread", now=now) is DrawdownState.DISABLED
+
+
+@pytest.mark.asyncio
 async def test_drawdown_warning_alert_rate_limited(db_repos, monkeypatch):
     """Second WARNING evaluation within cooldown does not re-fire Discord."""
     captured: list[dict] = []
