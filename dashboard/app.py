@@ -280,6 +280,13 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         bp_used_pct = None
         if account and account.equity:
             bp_used_pct = (1 - account.buying_power / account.equity) * 100.0
+        # TICKET-008: drawdown overview per strategy.
+        from core.strategies import load_strategies
+        from risk import auto_disable as _auto_disable
+        strategies = load_strategies(deps.config)
+        drawdown = await _auto_disable.get_drawdown_overview(
+            deps.repos, strategies, deps.config,
+        )
         return TEMPLATES.TemplateResponse(
             request,
             "risk.html",
@@ -290,6 +297,7 @@ def build_app(deps: DashboardDeps) -> FastAPI:
                 "kill_switch": ks_state,
                 "regime": regime_row,
                 "stop_file": deps.config.get("risk", {}).get("stop_file_path"),
+                "drawdown": drawdown,
             },
         )
 

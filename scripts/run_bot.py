@@ -278,19 +278,27 @@ async def _propose_and_route(
     for strategy in strategies:
         if not strategy.enabled:
             continue
-        # Sprint 13 sub-sprint 1: skip strategies the drawdown circuit breaker
-        # has soft-disabled. Skipping happens BEFORE check_and_apply so a
-        # newly-disabled strategy doesn't propose anything on the same tick it
-        # was paused.
-        disabled, reason = await auto_disable.is_currently_disabled(repos, strategy.id)
-        if disabled:
+        # Sprint 13 sub-sprint 1 + TICKET-008: drawdown circuit breaker is now
+        # tri-state. DISABLED → skip the strategy entirely. WARNING → size
+        # spreads at half (wheels stay at qty=1; the multiplier is a no-op for
+        # them but logged via wheel_warning_size_unhalved). NORMAL → unchanged.
+        drawdown_state = await auto_disable.current_state(repos, strategy.id)
+        if drawdown_state is auto_disable.DrawdownState.DISABLED:
             log_checkpoint(
                 "bot_strategy_runtime_disabled",
                 status="skip",
                 strategy=strategy.id,
-                reason=reason,
+                state=drawdown_state.value,
             )
             continue
+        size_multiplier = drawdown_state.size_multiplier
+        if drawdown_state is auto_disable.DrawdownState.WARNING:
+            log_checkpoint(
+                "bot_strategy_warning_size_halved",
+                status="ok",
+                strategy=strategy.id,
+                size_multiplier=size_multiplier,
+            )
         strategy_universe = universe_for_strategy(strategy, universe)
         if not strategy_universe["tickers"]:
             log_checkpoint(
@@ -301,12 +309,14 @@ async def _propose_and_route(
             continue
         if strategy.type == "wheel":
             # Profit-closes first — free up capital before considering new entries.
+            # Closes are unaffected by drawdown WARNING; only new entries scale.
             close_proposals = await propose_all_wheel_closes(
                 broker, repos, config, strategy=strategy,
                 delta_unavailable_counters=delta_unavailable_counters,
             )
             open_proposals = await propose_all(
                 broker, repos, config, strategy_universe, ivr, strategy=strategy,
+                size_multiplier=size_multiplier,
             )
             proposals = close_proposals + open_proposals
         elif strategy.type == "vertical_spread":
@@ -317,6 +327,7 @@ async def _propose_and_route(
             open_proposals = await propose_all_spreads(
                 broker, repos, config, strategy_universe,
                 strategy=strategy, ivr=ivr,
+                size_multiplier=size_multiplier,
             )
             proposals = close_proposals + open_proposals
         else:

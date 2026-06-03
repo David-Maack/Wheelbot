@@ -232,6 +232,13 @@ strategies:
       # auto-disabled for 30 days (manual re-enable available). Set to 0
       # to disable the feature for this strategy.
       auto_disable_drawdown_usd: -300
+      # TICKET-008: intermediate WARNING tier — when 7d P&L drops below
+      # this (but above auto_disable_drawdown_usd), new spread entries are
+      # placed at HALF size. Wheel proposals stay at qty=1 (single-contract
+      # CSPs can't halve — wheel_warning_size_unhalved logged once per
+      # transition so the limitation is visible in the audit trail).
+      # Set to 0 to disable just the WARNING tier (DISABLED still applies).
+      drawdown_warning_usd: -150
       # Sprint 13 sub-sprint 2: extend the Sprint 12 DTE-21 rule to wheel
       # CSPs and CCs. Same gamma-cliff rationale: bulk of max-loss outcomes
       # cluster in the final 21 days, so exit and rotate to a fresh 45-DTE
@@ -276,6 +283,7 @@ strategies:
       ivr_min: 30
       # Drawdown circuit breaker — see monthly_wheel.
       auto_disable_drawdown_usd: -300
+      drawdown_warning_usd: -150
       # CSP stop-loss — see monthly_wheel.
       csp_stop_loss_mult: 2.0
       # TICKET-005: delta hard stop. Weekly gamma punishes patience — at 0.55
@@ -321,6 +329,7 @@ strategies:
       ivr_min: 30
       # Drawdown circuit breaker — see monthly_wheel.
       auto_disable_drawdown_usd: -300
+      drawdown_warning_usd: -150
 
   - id: bear_call_spread
     display_name: "Bear Call Spread"
@@ -352,3 +361,4 @@ strategies:
       ivr_min: 30
       # Drawdown circuit breaker — see monthly_wheel.
       auto_disable_drawdown_usd: -300
+      drawdown_warning_usd: -150

@@ -218,7 +218,19 @@ async def propose_all(
     *,
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
+    size_multiplier: float = 1.0,
 ) -> list[Proposal]:
+    # TICKET-008: wheels can't halve at qty=1 (single-contract baseline at
+    # this account size). Log once per call so the limitation is visible in
+    # the audit trail without spamming on every position iteration.
+    if size_multiplier < 1.0:
+        log_checkpoint(
+            "wheel_warning_size_unhalved",
+            status="ok",
+            strategy=strategy.id if strategy else "default",
+            size_multiplier=size_multiplier,
+            note="wheel qty=1 cannot halve — entries proceed at full size",
+        )
     out: list[Proposal] = []
     universe_symbols = {t.symbol.upper() for t in universe["tickers"]}
 

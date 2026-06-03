@@ -146,11 +146,20 @@ def _sizing_quantity(
     strategy: StrategyDefinition,
     config: dict[str, Any],
     candidate: SpreadCandidate,
+    *,
+    size_multiplier: float = 1.0,
 ) -> int:
     """Contracts per package given per-strategy capital cap.
 
     Uses `max_capital_per_spread_usd` from strategy.params if present;
     otherwise falls back to a single contract. Defined risk = max_loss_per_spread.
+
+    `size_multiplier` (TICKET-008) scales the effective capital cap. In
+    WARNING state (multiplier=0.5), a spread whose max_loss exceeds half the
+    cap gets qty=0 → skipped. This is the practical mechanism that "halves
+    spread sizes" — for our $500 cap and ~$365 typical max_loss, halving the
+    cap to $250 means no new spreads open at all while in WARNING. That is
+    the intended protection: stop digging.
 
     Returns 0 when a single spread's defined risk already exceeds the cap — the
     caller must SKIP rather than trade one anyway. Flooring at 1 (the old
@@ -161,7 +170,8 @@ def _sizing_quantity(
     if cap <= 0 or candidate.max_loss_per_spread <= 0:
         # No cap configured (or undefined risk) — default to a single contract.
         return 1
-    return int(cap // candidate.max_loss_per_spread)
+    effective_cap = cap * float(size_multiplier)
+    return int(effective_cap // candidate.max_loss_per_spread)
 
 
 async def propose_for_symbol(
@@ -174,6 +184,7 @@ async def propose_for_symbol(
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
     ivr: IVRProvider | None = None,
+    size_multiplier: float = 1.0,
 ) -> MultiLegProposal | None:
     today = today or date.today()
     account_id = config.get("account", {}).get("id", "primary")
@@ -223,7 +234,7 @@ async def propose_for_symbol(
     if candidate is None:
         return None
 
-    quantity = _sizing_quantity(strategy, config, candidate)
+    quantity = _sizing_quantity(strategy, config, candidate, size_multiplier=size_multiplier)
     if quantity <= 0:
         # One spread's defined risk exceeds the per-spread capital cap — skip
         # rather than over-risk the account (or emit a 0-qty order the broker
@@ -269,12 +280,14 @@ async def propose_all(
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
     ivr: IVRProvider | None = None,
+    size_multiplier: float = 1.0,
 ) -> list[MultiLegProposal]:
     out: list[MultiLegProposal] = []
     for entry in universe["tickers"]:
         proposal = await propose_for_symbol(
             broker, repos, entry.symbol, config, universe,
             today=today, strategy=strategy, ivr=ivr,
+            size_multiplier=size_multiplier,
         )
         if proposal is not None:
             out.append(proposal)

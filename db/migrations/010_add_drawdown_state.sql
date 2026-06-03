@@ -1,0 +1,22 @@
+-- Migration 010 — TICKET-008 (gradient drawdown breaker)
+--
+-- Extends the binary "is_disabled?" model (migration 006) to a three-state
+-- per-strategy drawdown gauge:
+--
+--   NORMAL    — rolling 7d P&L above the warning threshold.
+--   WARNING   — between warning_usd and disable_usd. New spread entries are
+--               sized at 50% (wheels stay at qty=1 — can't halve).
+--               No disabled_until — re-evaluated daily by check_and_apply
+--               against the rolling P&L. Recovers silently when P&L crosses
+--               back above the warning threshold.
+--   DISABLED  — at or below disable_usd. 30-day auto-reset window via
+--               disabled_until (existing behaviour, unchanged).
+--
+-- The new column is NULLABLE with no DEFAULT (SQLite caveat: any DEFAULT
+-- value rewrites existing rows; we want existing rows to default-to-NORMAL
+-- semantically without touching their timestamps). Readers treat NULL as
+-- NORMAL when disabled_until is also NULL.
+--
+-- Idempotent — runner skips if 010 is already applied.
+
+ALTER TABLE strategy_runtime_state ADD COLUMN drawdown_state TEXT;

@@ -26,6 +26,33 @@
 </section>
 
 <section class="panel">
+  <h2>Drawdown status</h2>
+  {% if drawdown %}
+    <table class="grid">
+      <thead><tr><th>Strategy</th><th>State</th><th>7d P&amp;L</th><th>Warning</th><th>Disable</th><th>Re-enable</th></tr></thead>
+      <tbody>
+      {% for sid, info in drawdown.items() %}
+        <tr class="row-drawdown-{{ info.state }}">
+          <td><code>{{ sid }}</code></td>
+          <td>
+            {% if info.state == "DISABLED" %}<span class="trigger trigger-drawdown_disabled">🔴 DISABLED</span>
+            {% elif info.state == "WARNING" %}<span class="trigger trigger-drawdown_warning">🟡 WARNING (sizes ×{{ info.size_multiplier }})</span>
+            {% else %}<span class="trigger trigger-drawdown_normal">🟢 NORMAL</span>{% endif %}
+          </td>
+          <td>{{ "%+.2f"|format(info.rolling_pnl) }}</td>
+          <td>{% if info.warning_threshold is not none %}{{ "%.2f"|format(info.warning_threshold) }}{% else %}—{% endif %}</td>
+          <td>{% if info.disable_threshold is not none %}{{ "%.2f"|format(info.disable_threshold) }}{% else %}—{% endif %}</td>
+          <td>{% if info.disabled_until %}{{ info.disabled_until }}{% else %}—{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No strategies loaded.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
   <h2>Regime</h2>
   {% if regime %}
     <dl class="kv">

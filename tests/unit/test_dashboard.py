@@ -614,6 +614,10 @@ async def test_risk_view_renders(app_client):
     resp = await client.get("/risk", headers=_auth_header("wheelbot", "hunter2"))
     assert resp.status_code == 200
     assert "Kill switch" in resp.text
+    # TICKET-008: Drawdown Status section with tri-state badge.
+    assert "Drawdown status" in resp.text
+    # At least one strategy renders → NORMAL badge appears (default state).
+    assert "NORMAL" in resp.text
 
 
 @pytest.mark.asyncio

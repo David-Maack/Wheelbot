@@ -209,7 +209,8 @@ CREATE TABLE IF NOT EXISTS strategy_runtime_state (
     strategy_id      TEXT PRIMARY KEY,
     disabled_at      DATETIME,
     disabled_until   DATETIME,
-    disabled_reason  TEXT
+    disabled_reason  TEXT,
+    drawdown_state   TEXT           -- TICKET-008: NULL/NORMAL/WARNING/DISABLED
 );
 
 -- Macro event blackout (TICKET-007, migration 008). High-impact events

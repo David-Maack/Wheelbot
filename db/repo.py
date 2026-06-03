@@ -596,13 +596,48 @@ class StrategyRuntimeStateRepo(_Repo):
         c = await self.db.connect()
         await c.execute(
             "INSERT INTO strategy_runtime_state "
-            "(strategy_id, disabled_at, disabled_until, disabled_reason) "
-            "VALUES (?, ?, ?, ?) "
+            "(strategy_id, disabled_at, disabled_until, disabled_reason, drawdown_state) "
+            "VALUES (?, ?, ?, ?, 'DISABLED') "
             "ON CONFLICT(strategy_id) DO UPDATE SET "
             "  disabled_at = excluded.disabled_at, "
             "  disabled_until = excluded.disabled_until, "
-            "  disabled_reason = excluded.disabled_reason",
+            "  disabled_reason = excluded.disabled_reason, "
+            "  drawdown_state = excluded.drawdown_state",
             (strategy_id, now.isoformat(), until.isoformat(), reason),
+        )
+        await c.commit()
+
+    async def mark_warning(
+        self,
+        strategy_id: str,
+        *,
+        reason: str,
+        now: datetime | None = None,
+    ) -> None:
+        """TICKET-008: persist a WARNING-tier row. No disabled_until — the
+        state persists until the next check_and_apply observes recovery."""
+        now = now or datetime.now(UTC).replace(tzinfo=None)
+        c = await self.db.connect()
+        await c.execute(
+            "INSERT INTO strategy_runtime_state "
+            "(strategy_id, disabled_at, disabled_until, disabled_reason, drawdown_state) "
+            "VALUES (?, ?, NULL, ?, 'WARNING') "
+            "ON CONFLICT(strategy_id) DO UPDATE SET "
+            "  disabled_at = excluded.disabled_at, "
+            "  disabled_until = NULL, "
+            "  disabled_reason = excluded.disabled_reason, "
+            "  drawdown_state = 'WARNING'",
+            (strategy_id, now.isoformat(), reason),
+        )
+        await c.commit()
+
+    async def set_drawdown_state(self, strategy_id: str, state: str) -> None:
+        """Update just the drawdown_state column. Used after disable() to
+        record the explicit DISABLED tag for the dashboard query."""
+        c = await self.db.connect()
+        await c.execute(
+            "UPDATE strategy_runtime_state SET drawdown_state = ? WHERE strategy_id = ?",
+            (state, strategy_id),
         )
         await c.commit()
 
