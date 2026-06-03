@@ -1,0 +1,34 @@
+# Hand-curated macro event calendar — fallback when Finnhub is unavailable
+# or FINNHUB_API_KEY isn't set.
+#
+# Used by data/macro_calendar.py::load_yaml_calendar(). Same canonical
+# event_type values as the Finnhub adapter writes (FOMC | CPI | NFP | PPI |
+# GDP | JOLTS | OTHER).
+#
+# valid_until — refresh THIS file before this date or the loader logs
+# `macro_yaml_stale_human_attention` (fires when within 30 days of expiry,
+# escalates when past). Source for dates: official US economic releases
+# calendar (BLS, BEA, Federal Reserve).
+#
+# Pulled 2026-06-03 from public release calendars. Cross-check before
+# trusting in production.
+
+valid_until: 2026-09-30
+
+events:
+  # June 2026 — FOMC meeting + CPI/NFP
+  - { date: 2026-06-12, event_type: NFP,  impact: high, description: "Non Farm Payrolls (May 2026 release)" }
+  - { date: 2026-06-11, event_type: CPI,  impact: high, description: "CPI YoY (May 2026 release)" }
+  - { date: 2026-06-17, event_type: FOMC, impact: high, description: "FOMC Statement + Press Conference" }
+
+  # July 2026
+  - { date: 2026-07-02, event_type: NFP,  impact: high, description: "Non Farm Payrolls (June 2026 release)" }
+  - { date: 2026-07-15, event_type: CPI,  impact: high, description: "CPI YoY (June 2026 release)" }
+  - { date: 2026-07-29, event_type: FOMC, impact: high, description: "FOMC Statement + Press Conference" }
+
+  # August 2026
+  - { date: 2026-08-01, event_type: NFP,  impact: high, description: "Non Farm Payrolls (July 2026 release)" }
+  - { date: 2026-08-12, event_type: CPI,  impact: high, description: "CPI YoY (July 2026 release)" }
+
+  # September 2026 — FOMC meeting (no September NFP/CPI added until refresh)
+  - { date: 2026-09-16, event_type: FOMC, impact: high, description: "FOMC Statement + Press Conference + Economic Projections" }

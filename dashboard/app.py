@@ -293,6 +293,67 @@ def build_app(deps: DashboardDeps) -> FastAPI:
             },
         )
 
+    @app.get("/macro", response_class=HTMLResponse)
+    async def macro_view(request: Request, _user: str = Depends(authorize)) -> Any:
+        """TICKET-007: macro event blackout calendar + upcoming events list.
+
+        Renders a flat day-by-day list for the next 30 days (NORMAL or
+        BLACKOUT with reason). Calendar-grid layout deliberately deferred
+        to a future polish ticket — flat list is 10 lines vs 60 and ships
+        the rest of the page.
+        """
+        from data.macro_calendar import MacroCalendar, _today_nyse
+        cfg = (deps.config.get("risk", {}) or {}).get("macro_blackout", {}) or {}
+        calendar = MacroCalendar(deps.repos, deps.config)
+        today = _today_nyse()
+        days_ahead = 30
+        days_before = int(cfg.get("blackout_days_before", 1))
+        days_after = int(cfg.get("blackout_days_after", 0))
+        event_types = list(cfg.get("event_types", []) or [])
+        # Pull events that could affect any day in the window; one DB hit.
+        events = await deps.repos.macro_events.between(
+            today - timedelta(days=days_after),
+            today + timedelta(days=days_ahead + days_before),
+        )
+        events_in_scope = [e for e in events if e.event_type.upper() in {t.upper() for t in event_types}]
+
+        # Build the day-by-day list. Each day shows NORMAL or BLACKOUT with
+        # the triggering event(s) — same predicate the risk gate uses.
+        day_rows: list[dict[str, Any]] = []
+        for offset in range(days_ahead + 1):
+            d = today + timedelta(days=offset)
+            triggering = [
+                e for e in events_in_scope
+                if (e.event_date - timedelta(days=days_before)) <= d <= (e.event_date + timedelta(days=days_after))
+            ]
+            day_rows.append({
+                "day": d,
+                "weekday": d.strftime("%a"),
+                "blackout": bool(triggering),
+                "triggers": triggering,
+            })
+
+        upcoming = [e for e in events_in_scope if e.event_date >= today]
+        last_refresh = await calendar.last_refresh()
+        is_stale = await calendar.is_stale()
+
+        return TEMPLATES.TemplateResponse(
+            request,
+            "macro.html",
+            {
+                "enabled": bool(cfg.get("enabled", False)),
+                "event_types": event_types,
+                "days_before": days_before,
+                "days_after": days_after,
+                "stale_threshold_hours": float(cfg.get("stale_threshold_hours", 48)),
+                "last_refresh": last_refresh,
+                "is_stale": is_stale,
+                "upcoming": upcoming,
+                "day_rows": day_rows,
+                "today": today,
+            },
+        )
+
     @app.post("/risk/manual_stop")
     async def manual_stop(
         action: str = Form(...),

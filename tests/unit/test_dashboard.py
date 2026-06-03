@@ -458,6 +458,61 @@ async def test_positions_table_no_badge_when_earnings_outside_window(app_client,
 
 
 @pytest.mark.asyncio
+async def test_macro_page_renders_empty_when_no_events(app_client):
+    """Empty-state — page renders 200, shows "no upcoming events" copy."""
+    client, deps, _broker = app_client
+    deps.config.setdefault("risk", {})["macro_blackout"] = {
+        "enabled": True, "event_types": ["FOMC", "CPI", "NFP"],
+        "blackout_days_before": 1, "blackout_days_after": 0,
+        "stale_threshold_hours": 48,
+    }
+    resp = await client.get("/macro", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    assert "Macro Event Blackout" in resp.text
+    assert "No upcoming events" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_macro_page_renders_upcoming_events(app_client):
+    """Seed two events; assert both render with their canonical types."""
+    from core.models import MacroEvent
+    client, deps, _broker = app_client
+    deps.config.setdefault("risk", {})["macro_blackout"] = {
+        "enabled": True, "event_types": ["FOMC", "CPI", "NFP"],
+        "blackout_days_before": 1, "blackout_days_after": 0,
+        "stale_threshold_hours": 48,
+    }
+    now = datetime.now(UTC).replace(tzinfo=None)
+    today = now.date()
+    await deps.repos.macro_events.upsert_many([
+        MacroEvent(
+            event_date=today + timedelta(days=5), event_type="FOMC", impact="high",
+            description="FOMC Statement", fetched_at=now, created_at=now,
+        ),
+        MacroEvent(
+            event_date=today + timedelta(days=12), event_type="CPI", impact="high",
+            description="CPI YoY", fetched_at=now, created_at=now,
+        ),
+    ])
+    resp = await client.get("/macro", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    assert "FOMC" in resp.text
+    assert "CPI" in resp.text
+    assert "BLACKOUT" in resp.text   # the FOMC day appears in day_rows
+    # Nav link present from base.html
+    assert 'href="/macro"' in resp.text
+
+
+@pytest.mark.asyncio
+async def test_macro_nav_link_present_on_other_pages(app_client):
+    """The Macro nav link added to base.html shows on every page."""
+    client, _deps, _broker = app_client
+    resp = await client.get("/", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    assert 'href="/macro">Macro</a>' in resp.text
+
+
+@pytest.mark.asyncio
 async def test_positions_table_renders_dash_when_no_close_yet(app_client):
     """A position with no BUY_TO_CLOSE yet renders '—', not 'None'."""
     client, deps, _broker = app_client

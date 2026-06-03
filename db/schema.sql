@@ -211,3 +211,28 @@ CREATE TABLE IF NOT EXISTS strategy_runtime_state (
     disabled_until   DATETIME,
     disabled_reason  TEXT
 );
+
+-- Macro event blackout (TICKET-007, migration 008). High-impact events
+-- (FOMC/CPI/NFP/...) used by risk/limits.py::_rule_macro_blackout to block
+-- new short premium whose lifespan crosses them. Populated by the daily
+-- cron scripts/refresh_macro_calendar.py from Finnhub + YAML fallback.
+CREATE TABLE IF NOT EXISTS macro_events (
+    id           INTEGER PRIMARY KEY,
+    event_date   DATE     NOT NULL,
+    event_type   TEXT     NOT NULL,
+    impact       TEXT     NOT NULL,
+    description  TEXT,
+    fetched_at   DATETIME NOT NULL,
+    created_at   DATETIME NOT NULL,
+    UNIQUE(event_date, event_type)
+);
+CREATE INDEX IF NOT EXISTS idx_macro_events_date ON macro_events(event_date);
+
+-- Reusable Discord/notify rate-limit primitive (TICKET-007, migration 009).
+-- AlertRateLimitsRepo.try_fire(alert_key, cooldown_hours) returns True iff
+-- the alert hasn't fired within the cooldown — and persists the timestamp
+-- so process restarts don't reset it.
+CREATE TABLE IF NOT EXISTS alert_rate_limits (
+    alert_key      TEXT PRIMARY KEY,
+    last_fired_at  DATETIME NOT NULL
+);

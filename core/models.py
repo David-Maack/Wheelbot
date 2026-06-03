@@ -204,6 +204,26 @@ class RegimeSnapshot(_Base):
     notes: str | None = None
 
 
+class MacroEvent(_Base):
+    """One macro economic event in the blackout calendar (TICKET-007).
+
+    `event_type` is the canonical category (FOMC | CPI | NFP | PPI | GDP |
+    JOLTS | OTHER) — Finnhub's raw event names get mapped via
+    `data/macro_calendar._FINNHUB_TYPE_MAP`. Anything that doesn't match is
+    stored as OTHER so the operator notices renames on the dashboard.
+    """
+
+    id: int | None = None
+    event_date: date
+    event_type: str
+    impact: str                      # high | medium | low
+    description: str | None = None
+    fetched_at: datetime
+    created_at: datetime
+    # Not persisted — populated by the YAML loader so callers can show source.
+    source: str | None = None        # "finnhub" | "yaml" | None (DB read)
+
+
 class LlmDecision(_Base):
     id: int | None = None
     decision_type: LlmDecisionType

@@ -137,6 +137,24 @@ intelligence:
   #     output_per_mtok: 75.0
 
 risk:
+  # TICKET-007: macro event blackout. Blocks NEW short premium entries whose
+  # lifespan [today, expiration] would cross a high-impact macro event
+  # (FOMC / CPI / NFP by default). Bypassed for closes — once a position is
+  # open, the rule has nothing useful to say. bear_call_spread is NOT
+  # bypassed (unlike the tier-2 LLM screen): macro events gap both directions.
+  #
+  # Populated by scripts/refresh_macro_calendar.py (daily cron). When Finnhub
+  # is unavailable, falls back to config/macro_calendar.yaml (hand-curated;
+  # refresh quarterly — loader warns when valid_until is within 30 days).
+  macro_blackout:
+    enabled: true
+    event_types: [FOMC, CPI, NFP]
+    blackout_days_before: 1
+    blackout_days_after: 0
+    refresh_interval_hours: 24
+    stale_threshold_hours: 48
+    finnhub_impact_min: "high"
+
   # TICKET-006: mid-cycle earnings recheck. Entry-time earnings blackout fires
   # at order placement, but companies often confirm earnings dates only 2-3
   # weeks in advance — a CSP opened cleanly can later have earnings inside its

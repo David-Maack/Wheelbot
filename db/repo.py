@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -651,6 +651,121 @@ class StrategyRuntimeStateRepo(_Repo):
         return out
 
 
+class MacroEventsRepo(_Repo):
+    """Macro economic events used by the blackout rule (TICKET-007).
+
+    Populated by `scripts.refresh_macro_calendar` (daily cron); consumed by
+    `risk.limits._rule_macro_blackout` and the `/macro` dashboard page.
+    Idempotent inserts via the UNIQUE(event_date, event_type) constraint.
+    """
+
+    table = "macro_events"
+
+    async def upsert_many(self, events: list) -> int:
+        """Upsert a batch. Returns the count of rows written/updated."""
+        if not events:
+            return 0
+        c = await self.db.connect()
+        written = 0
+        for evt in events:
+            await c.execute(
+                "INSERT INTO macro_events "
+                "(event_date, event_type, impact, description, fetched_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(event_date, event_type) DO UPDATE SET "
+                "  impact = excluded.impact, "
+                "  description = excluded.description, "
+                "  fetched_at = excluded.fetched_at",
+                (
+                    evt.event_date.isoformat(),
+                    evt.event_type,
+                    evt.impact,
+                    evt.description,
+                    evt.fetched_at.isoformat(),
+                    evt.created_at.isoformat(),
+                ),
+            )
+            written += 1
+        await c.commit()
+        return written
+
+    async def between(self, start: date, end: date) -> list:
+        """All events with event_date in [start, end] inclusive, sorted ascending."""
+        from core.models import MacroEvent
+        rows = await self._fetch_all(
+            "SELECT * FROM macro_events WHERE event_date >= ? AND event_date <= ? "
+            "ORDER BY event_date, event_type",
+            (start.isoformat(), end.isoformat()),
+        )
+        return [MacroEvent(**r) for r in rows]
+
+    async def count(self) -> int:
+        c = await self.db.connect()
+        async with c.execute("SELECT COUNT(*) AS n FROM macro_events") as cur:
+            row = await cur.fetchone()
+        return int(row["n"]) if row else 0
+
+    async def last_fetched_at(self) -> datetime | None:
+        """Most-recent fetched_at across the table — used by is_stale()."""
+        c = await self.db.connect()
+        async with c.execute(
+            "SELECT MAX(fetched_at) AS last FROM macro_events",
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or row["last"] is None:
+            return None
+        return datetime.fromisoformat(row["last"])
+
+
+class AlertRateLimitsRepo(_Repo):
+    """Reusable rate-limit primitive for Discord/notify alerts (TICKET-007).
+
+    Usage:
+        if await repos.alert_rate_limits.try_fire("macro_calendar_stale", 20.0):
+            await notify(...)
+
+    Persists across process restarts so a flaky cron can't silence itself by
+    restarting; persists across container rebuilds (data dir is bind-mounted)
+    so deploy churn doesn't reset.
+    """
+
+    table = "alert_rate_limits"
+
+    async def try_fire(self, alert_key: str, cooldown_hours: float) -> bool:
+        """Returns True iff the alert hasn't fired within `cooldown_hours`,
+        and atomically records the new firing timestamp. False means the
+        alert is rate-limited — caller should not notify."""
+        now = datetime.now(UTC).replace(tzinfo=None)
+        c = await self.db.connect()
+        async with c.execute(
+            "SELECT last_fired_at FROM alert_rate_limits WHERE alert_key = ?",
+            (alert_key,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is not None:
+            last = datetime.fromisoformat(row["last_fired_at"])
+            if (now - last) < timedelta(hours=cooldown_hours):
+                return False
+        await c.execute(
+            "INSERT INTO alert_rate_limits (alert_key, last_fired_at) VALUES (?, ?) "
+            "ON CONFLICT(alert_key) DO UPDATE SET last_fired_at = excluded.last_fired_at",
+            (alert_key, now.isoformat()),
+        )
+        await c.commit()
+        return True
+
+    async def last_fired(self, alert_key: str) -> datetime | None:
+        c = await self.db.connect()
+        async with c.execute(
+            "SELECT last_fired_at FROM alert_rate_limits WHERE alert_key = ?",
+            (alert_key,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return datetime.fromisoformat(row["last_fired_at"])
+
+
 class Repos:
     """Convenience bundle so callers can pass a single object."""
 
@@ -667,3 +782,5 @@ class Repos:
         self.daily_state = DailyStateRepo(db)
         self.chain_snapshots = ChainSnapshotsRepo(db)
         self.strategy_runtime = StrategyRuntimeStateRepo(db)
+        self.macro_events = MacroEventsRepo(db)
+        self.alert_rate_limits = AlertRateLimitsRepo(db)

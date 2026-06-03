@@ -143,6 +143,7 @@ class RiskGate:
             await self._rule_earnings_multi_leg(result, proposal, params, today)
             await self._rule_regime_multi_leg(result, proposal, params)
             await self._rule_tier2_screen(result, proposal)
+            await self._rule_macro_blackout(result, proposal, today)
         else:
             await self._rule_buying_power(result, proposal, account, params)
             await self._rule_position_cap(result, proposal, account, params)
@@ -153,6 +154,7 @@ class RiskGate:
             self._rule_liquidity(result, proposal, params)
             await self._rule_regime(result, proposal, params)
             await self._rule_tier2_screen(result, proposal)
+            await self._rule_macro_blackout(result, proposal, today)
 
         log_checkpoint(
             "risk_gate",
@@ -591,3 +593,75 @@ class RiskGate:
                 "tier2_screen", "pass",
                 f"LLM score {score:.1f} ≥ {threshold:.1f} for {symbol}",
             )
+
+    # --- Rule N (macro blackout) — TICKET-007 ---------------------------------
+    async def _rule_macro_blackout(
+        self,
+        result: RiskCheckResult,
+        proposal: Proposal | MultiLegProposal,
+        today: date | None,
+    ) -> None:
+        """Block new short premium when the position's lifespan would cross a
+        configured macro event (FOMC / CPI / NFP by default).
+
+        Bypassed for closes. **NOT** bypassed for bear_call_spread — unlike
+        `_rule_tier2_screen` (whose bypass exists because the screener's
+        prompt is bullish-biased), macro events gap BOTH directions, so the
+        bear_call rule needs the same protection as bull_put.
+
+        Fail-open paths (rule passes with a logged checkpoint, never blocks):
+          - macro_blackout.enabled is false in config
+          - `macro_events` table is empty (cron probably not configured)
+          - last refresh > stale_threshold_hours ago (cron probably broken)
+        Each fail-open also fires a rate-limited Discord alert so the
+        operator notices instead of silently flying blind.
+        """
+        if _is_close(proposal):
+            result.add("macro_blackout", "skip", "close — not gated by macro events")
+            return
+        cfg = (self._config.get("risk", {}) or {}).get("macro_blackout", {}) or {}
+        if not bool(cfg.get("enabled", False)):
+            result.add("macro_blackout", "skip", "disabled in config")
+            return
+
+        # Resolve the short-leg expiration. For single-leg that's
+        # proposal.contract.expiration; for multi-leg it's the short leg.
+        if isinstance(proposal, MultiLegProposal):
+            short_exp: date | None = None
+            for leg in proposal.legs:
+                if str(getattr(leg.action, "value", leg.action)) == "SELL_TO_OPEN":
+                    short_exp = leg.expiration
+                    break
+            if short_exp is None and proposal.legs:
+                short_exp = proposal.legs[0].expiration
+        else:
+            short_exp = proposal.contract.expiration
+        if short_exp is None:
+            result.add("macro_blackout", "skip", "no short-leg expiration to evaluate")
+            return
+
+        from data.macro_calendar import MacroCalendar, _today_nyse
+        calendar = MacroCalendar(self._repos, self._config)
+
+        # Empty-table check — fail-open with rate-limited Discord.
+        if (await self._repos.macro_events.count()) == 0:
+            await calendar.maybe_alert_empty()
+            result.add("macro_blackout", "skip", "macro_events table empty — fail-open")
+            return
+
+        # Stale-calendar check — fail-open with rate-limited Discord.
+        if await calendar.is_stale():
+            await calendar.maybe_alert_stale()
+            result.add("macro_blackout", "skip", "macro calendar stale — fail-open")
+            return
+
+        event_types = list(cfg.get("event_types", []) or [])
+        decision = await calendar.is_blackout(
+            today=today or _today_nyse(),
+            short_expiration=short_exp,
+            event_types=event_types,
+        )
+        if decision.in_blackout:
+            result.add("macro_blackout", "fail", decision.reason or "in macro blackout")
+        else:
+            result.add("macro_blackout", "pass")
