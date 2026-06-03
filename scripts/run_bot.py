@@ -78,7 +78,7 @@ from strategies.spreads import (
     propose_all as propose_all_spreads,
     propose_all_closes as propose_all_spread_closes,
 )
-from risk import auto_disable
+from risk import auto_disable, win_rate_floor
 from strategies.wheel import propose_all
 from strategies.wheel_close import propose_all_closes as propose_all_wheel_closes
 
@@ -291,6 +291,22 @@ async def _propose_and_route(
                 state=drawdown_state.value,
             )
             continue
+        # TICKET-009: independent pause gate. Read after drawdown
+        # (cheaper) — and both gates are independent so this can fire
+        # while drawdown is NORMAL or WARNING. PAUSE supersedes WARNING
+        # for the skip decision (more restrictive wins). INFO-level log
+        # only; no Discord forwarding (notify fires once on the
+        # NORMAL→PAUSED transition inside win_rate_floor.check_and_apply,
+        # rate-limited to 24h).
+        pause_state = await win_rate_floor.current_pause_state(repos, strategy.id)
+        if pause_state is win_rate_floor.WinRateState.PAUSED_LOW_WIN_RATE:
+            log_checkpoint(
+                "bot_strategy_runtime_paused_low_win_rate",
+                status="skip",
+                strategy=strategy.id,
+                state=pause_state.value,
+            )
+            continue
         size_multiplier = drawdown_state.size_multiplier
         if drawdown_state is auto_disable.DrawdownState.WARNING:
             log_checkpoint(
@@ -380,6 +396,20 @@ async def _propose_and_route(
         except Exception as exc:  # defensive — never let monitoring break trading
             log_checkpoint(
                 "auto_disable_check_failed",
+                status="fail",
+                strategy=strategy.id,
+                error=str(exc),
+            )
+        # TICKET-009: evaluate the win-rate floor right after drawdown so
+        # both signals are re-derived from the freshest cycle data. Independent
+        # of drawdown — a single tick can trip drawdown WARNING and win-rate
+        # PAUSE in the same iteration if both thresholds breach. Defensive
+        # catch — never let monitoring break trading.
+        try:
+            await win_rate_floor.check_and_apply(repos, strategy, config)
+        except Exception as exc:
+            log_checkpoint(
+                "win_rate_floor_check_failed",
                 status="fail",
                 strategy=strategy.id,
                 error=str(exc),

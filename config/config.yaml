@@ -180,6 +180,28 @@ risk:
     days_before: 5
     days_after: 2
 
+  # TICKET-009: win-rate floor per strategy. Catches the "still net-positive
+  # in dollars but bleeding by frequency" failure mode the drawdown breaker
+  # can't see. Looks at the most-recent N closed cycles; if win rate drops
+  # below the floor, pauses the strategy and requires manual reenable.
+  #
+  # Why manual reenable (not auto-clear like drawdown 30d): low win rate is
+  # evidence of a losing PATTERN, not a transient drawdown. Auto-clearing on
+  # calendar timeout would silently re-arm a broken setup. paused_duration_days
+  # is advisory only — the dashboard shows "eligible for reenable in N days"
+  # so the operator knows when it's reasonable to revisit, but the bot
+  # never auto-clears. Operators can reenable sooner if they have new info.
+  #
+  # Per-strategy override: each strategy can set `win_rate_floor_pct` in its
+  # `params` to override the global `min_win_rate_pct`. Spreads vs wheels
+  # have different intrinsic win rates (deep-OTM CSPs often >80%; tight
+  # spreads ~65%) so one global threshold may be too blunt.
+  win_rate_floor:
+    enabled: true
+    min_closed_cycles: 10
+    min_win_rate_pct: 60
+    pause_duration_days: 14
+
 notifications:
   # NullNotifier when false (events still logged via core/checkpoint).
   enabled: true

@@ -53,6 +53,52 @@
 </section>
 
 <section class="panel">
+  <h2>Win-rate status</h2>
+  {% if win_rate %}
+    <table class="grid">
+      <thead><tr><th>Strategy</th><th>State</th><th>Win rate</th><th>Sample</th><th>Floor</th><th>Paused at</th><th>Eligible reenable</th></tr></thead>
+      <tbody>
+      {% for sid, info in win_rate.items() %}
+        <tr class="row-winrate-{{ info.state }}">
+          <td><code>{{ sid }}</code></td>
+          <td>
+            {% if info.state == "LOW_WIN_RATE" %}
+              <span class="trigger trigger-winrate_paused">🔴 PAUSED</span>
+            {% else %}
+              <span class="trigger trigger-winrate_normal">🟢 NORMAL</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if info.win_rate is not none %}
+              {% if info.win_rate >= 70 %}<span class="ok">{{ "%.1f"|format(info.win_rate) }}%</span>
+              {% elif info.win_rate >= 60 %}<span class="warn">{{ "%.1f"|format(info.win_rate) }}%</span>
+              {% else %}<span class="bad">{{ "%.1f"|format(info.win_rate) }}%</span>{% endif %}
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if info.action == "insufficient_data" %}
+              N/A ({{ info.sample_size }}/10)
+            {% else %}
+              {{ info.sample_size }}
+            {% endif %}
+          </td>
+          <td>{% if info.threshold is not none %}{{ "%.1f"|format(info.threshold) }}%{% else %}—{% endif %}</td>
+          <td>{% if info.paused_at %}{{ info.paused_at }}{% else %}—{% endif %}</td>
+          <td>
+            {% if info.eligible_in_days is not none %}
+              {% if info.eligible_in_days == 0 %}eligible now{% else %}in {{ info.eligible_in_days }}d{% endif %}
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No strategies loaded.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
   <h2>Regime</h2>
   {% if regime %}
     <dl class="kv">

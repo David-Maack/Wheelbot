@@ -382,6 +382,24 @@ class WheelCyclesRepo(_Repo):
         )
         return [WheelCycle(**r) for r in rows]
 
+    async def list_closed_for_strategy(
+        self, account_id: str, strategy_id: str, limit: int = 10,
+    ) -> list[WheelCycle]:
+        """TICKET-009: most-recent closed cycles for a specific strategy,
+        newest first. Used by `risk.win_rate_floor.evaluate` for the
+        last-N-cycles win-rate computation. `final_pnl IS NOT NULL` filter
+        matches the drawdown breaker's `compute_rolling_pnl` filter — open
+        cycles and partially-recorded closes are excluded so unrealized
+        moves don't bias the rate."""
+        rows = await self._fetch_all(
+            "SELECT * FROM wheel_cycles "
+            "WHERE account_id = ? AND strategy_id = ? "
+            "  AND ended_at IS NOT NULL AND final_pnl IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT ?",
+            (account_id, strategy_id, limit),
+        )
+        return [WheelCycle(**r) for r in rows]
+
     async def insert(self, cycle: WheelCycle) -> int:
         return await self._insert(self._serialize(cycle))
 
@@ -642,13 +660,95 @@ class StrategyRuntimeStateRepo(_Repo):
         await c.commit()
 
     async def enable(self, strategy_id: str) -> None:
-        """Manual re-enable. Clears the disable record entirely."""
+        """Manual re-enable. Clears the runtime state row entirely — BOTH the
+        drawdown gate (DISABLED/WARNING) AND the pause gate (LOW_WIN_RATE)
+        in one shot.
+
+        This is the operator-override semantic used by
+        scripts/reenable_strategy.py: a single manual action clears
+        everything. The script prints the prior state before clearing so the
+        operator sees exactly what they're undoing.
+
+        For pause-only or drawdown-only clears, use `clear_pause` /
+        `enable_drawdown_only` (not yet implemented — not needed at v1
+        because the script always clears the whole row).
+        """
         c = await self.db.connect()
         await c.execute(
             "DELETE FROM strategy_runtime_state WHERE strategy_id = ?",
             (strategy_id,),
         )
         await c.commit()
+
+    async def mark_paused(
+        self,
+        strategy_id: str,
+        *,
+        reason: str,
+        now: datetime | None = None,
+        eligible_in_days: int = 14,
+    ) -> None:
+        """TICKET-009: persist a LOW_WIN_RATE pause. Independent of drawdown
+        columns — if a row already exists (e.g. drawdown WARNING was set
+        first), only the pause_* columns are touched. The disabled_* columns
+        and drawdown_state column are NOT modified.
+
+        paused_reenable_eligible_at is advisory (cached `paused_at +
+        eligible_in_days`) — the bot does NOT auto-clear when this passes.
+        Operator must manually reenable.
+        """
+        now = now or datetime.now(UTC).replace(tzinfo=None)
+        eligible_at = now + timedelta(days=eligible_in_days)
+        c = await self.db.connect()
+        await c.execute(
+            "INSERT INTO strategy_runtime_state "
+            "(strategy_id, pause_state, paused_at, paused_reason, "
+            " paused_reenable_eligible_at) "
+            "VALUES (?, 'LOW_WIN_RATE', ?, ?, ?) "
+            "ON CONFLICT(strategy_id) DO UPDATE SET "
+            "  pause_state = 'LOW_WIN_RATE', "
+            "  paused_at = excluded.paused_at, "
+            "  paused_reason = excluded.paused_reason, "
+            "  paused_reenable_eligible_at = excluded.paused_reenable_eligible_at",
+            (strategy_id, now.isoformat(), reason, eligible_at.isoformat()),
+        )
+        await c.commit()
+
+    async def clear_pause(self, strategy_id: str) -> None:
+        """TICKET-009: clear only the pause columns. Leaves drawdown_state /
+        disabled_until / disabled_reason intact. Not used by the bot
+        directly (recovery doesn't auto-clear per locked decision); reserved
+        for a future scripts/reenable_strategy.py --pause-only flag if we
+        ever want finer-grained operator control. v1 always uses enable().
+        """
+        c = await self.db.connect()
+        await c.execute(
+            "UPDATE strategy_runtime_state SET "
+            "  pause_state = NULL, "
+            "  paused_at = NULL, "
+            "  paused_reason = NULL, "
+            "  paused_reenable_eligible_at = NULL "
+            "WHERE strategy_id = ?",
+            (strategy_id,),
+        )
+        # If after the clear the row has no remaining state at all, drop it.
+        await c.execute(
+            "DELETE FROM strategy_runtime_state WHERE strategy_id = ? "
+            "AND disabled_until IS NULL AND drawdown_state IS NULL "
+            "AND pause_state IS NULL",
+            (strategy_id,),
+        )
+        await c.commit()
+
+    async def list_paused(self) -> list[dict]:
+        """TICKET-009: rows currently in LOW_WIN_RATE pause. Independent of
+        list_disabled (which only returns rows with an active disabled_until).
+        A strategy in BOTH drawdown DISABLED and LOW_WIN_RATE pause appears
+        in both lists — by design, so reenable_strategy.py --list surfaces
+        every active gate."""
+        return await self._fetch_all(
+            "SELECT * FROM strategy_runtime_state WHERE pause_state = 'LOW_WIN_RATE'",
+        )
 
     async def is_disabled(
         self,

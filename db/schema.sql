@@ -206,11 +206,18 @@ CREATE INDEX IF NOT EXISTS idx_chain_snapshots_cycle ON chain_snapshots(cycle_id
 -- drawdown circuit breaker. Disabled_until=NULL means active; future date
 -- means paused-until; past date auto-clears on next check.
 CREATE TABLE IF NOT EXISTS strategy_runtime_state (
-    strategy_id      TEXT PRIMARY KEY,
-    disabled_at      DATETIME,
-    disabled_until   DATETIME,
-    disabled_reason  TEXT,
-    drawdown_state   TEXT           -- TICKET-008: NULL/NORMAL/WARNING/DISABLED
+    strategy_id                  TEXT PRIMARY KEY,
+    disabled_at                  DATETIME,
+    disabled_until               DATETIME,
+    disabled_reason              TEXT,
+    drawdown_state               TEXT,        -- TICKET-008: NULL/NORMAL/WARNING/DISABLED
+    -- TICKET-009 (migration 011): independent pause columns. drawdown_state
+    -- and pause_state can both be set on the same row — bot's runtime gate
+    -- applies the more restrictive. Pause never auto-clears.
+    pause_state                  TEXT,        -- NULL | 'LOW_WIN_RATE'
+    paused_at                    DATETIME,
+    paused_reason                TEXT,
+    paused_reenable_eligible_at  DATETIME     -- advisory only; not enforced
 );
 
 -- Macro event blackout (TICKET-007, migration 008). High-impact events

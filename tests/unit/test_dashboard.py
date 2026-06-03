@@ -618,6 +618,10 @@ async def test_risk_view_renders(app_client):
     assert "Drawdown status" in resp.text
     # At least one strategy renders → NORMAL badge appears (default state).
     assert "NORMAL" in resp.text
+    # TICKET-009: Win-rate Status section.
+    assert "Win-rate status" in resp.text
+    # Insufficient-data badge for fresh strategies (no cycles in test DB).
+    assert "N/A (0/10)" in resp.text
 
 
 @pytest.mark.asyncio

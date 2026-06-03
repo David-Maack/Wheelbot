@@ -60,6 +60,16 @@
         <dd>
           {% if s.win_rate_pct is not none %}{{ "%.1f"|format(s.win_rate_pct) }}%{% else %}—{% endif %}
         </dd>
+        <dt>Win rate (last 10)</dt>
+        <dd>
+          {% if s.win_rate_last10_pct is not none %}
+            {% if s.win_rate_last10_pct >= 70 %}<span class="pos">{{ "%.1f"|format(s.win_rate_last10_pct) }}%</span>
+            {% elif s.win_rate_last10_pct >= 60 %}<span class="warn">{{ "%.1f"|format(s.win_rate_last10_pct) }}%</span>
+            {% else %}<span class="neg">{{ "%.1f"|format(s.win_rate_last10_pct) }}%</span>{% endif %}
+          {% else %}
+            N/A ({{ s.win_rate_last10_sample }}/10)
+          {% endif %}
+        </dd>
         <dt>Closed cycles</dt>
         <dd>{{ s.n_closed }}</dd>
         <dt>Open cycles</dt>

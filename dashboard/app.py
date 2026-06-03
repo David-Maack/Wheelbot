@@ -280,11 +280,15 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         bp_used_pct = None
         if account and account.equity:
             bp_used_pct = (1 - account.buying_power / account.equity) * 100.0
-        # TICKET-008: drawdown overview per strategy.
+        # TICKET-008 + TICKET-009: per-strategy drawdown + win-rate panels.
         from core.strategies import load_strategies
         from risk import auto_disable as _auto_disable
+        from risk import win_rate_floor as _win_rate_floor
         strategies = load_strategies(deps.config)
         drawdown = await _auto_disable.get_drawdown_overview(
+            deps.repos, strategies, deps.config,
+        )
+        win_rate = await _win_rate_floor.get_win_rate_overview(
             deps.repos, strategies, deps.config,
         )
         return TEMPLATES.TemplateResponse(
@@ -298,6 +302,7 @@ def build_app(deps: DashboardDeps) -> FastAPI:
                 "regime": regime_row,
                 "stop_file": deps.config.get("risk", {}).get("stop_file_path"),
                 "drawdown": drawdown,
+                "win_rate": win_rate,
             },
         )
 
@@ -769,6 +774,16 @@ def _per_strategy_breakdown(
                     "running": running,
                 }
             )
+        # TICKET-009: "win rate (last 10)" — separate from the all-time
+        # win_rate_pct above. Most-recent 10 by ended_at desc, computed
+        # from the already-loaded rows to avoid a second SQL hit. None
+        # when fewer than 10 closed cycles exist (insufficient data).
+        last10_rows = sorted(rows, key=lambda r: r["ended_at"] or "", reverse=True)[:10]
+        if len(last10_rows) >= 10:
+            last10_wins = sum(1 for r in last10_rows if (r["final_pnl"] or 0) > 0)
+            win_rate_last10_pct: float | None = last10_wins / len(last10_rows) * 100.0
+        else:
+            win_rate_last10_pct = None
         out.append(
             {
                 "id": sid,
@@ -778,6 +793,8 @@ def _per_strategy_breakdown(
                 "losses": losses,
                 "n_closed": len(rows),
                 "win_rate_pct": win_rate,
+                "win_rate_last10_pct": win_rate_last10_pct,
+                "win_rate_last10_sample": len(last10_rows),
                 "open_cycles": int(open_count_by_strategy.get(sid, 0)),
                 "avg_days_held": avg_days,
                 "cumulative": cumulative,
