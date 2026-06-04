@@ -29,6 +29,7 @@ dashboard = [
     "uvicorn[standard]>=0.27",
     "jinja2>=3.1",
     "python-multipart>=0.0.12",
+    "mistune>=3.0",
 ]
 intelligence = [
     "anthropic>=0.40",

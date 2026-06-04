@@ -1,47 +1,70 @@
 # Local overrides — copy to config.local.yaml (gitignored).
 #
 # This file is loaded AFTER config.yaml and overlays per top-level section.
-# Use it for environment-specific tweaks (paper vs live, tighter limits during
-# the §12 phased rollout, dry-run during smoke testing).
+# Use it for environment-specific tweaks (paper vs live, tighter limits
+# during the go-live ramp documented in docs/GO_LIVE_RUNBOOK.md, dry-run
+# during smoke testing).
 #
-# Recommended starting point for §12 Phase 1 (single ticker, Alpaca paper):
+# The values below are the live host's Stage 0 overrides (Alpaca paper).
+# Each top-level section comment names the runbook stage that changes it.
+# Update both this file and docs/GO_LIVE_RUNBOOK.md in the same commit when
+# the canonical Stage 0 overrides change — see CLAUDE.md "Live-deployment
+# authority".
 
 account:
+  # Pin explicit so a future config.yaml edit cannot silently change the
+  # live broker. Flips to `tastytrade` at Stage 3 (see runbook §7).
   broker: alpaca_paper
 
 wheel:
-  max_concurrent_positions: 4
-  # Alpaca paper feed returns no OI/volume — drop those gates and rely on
-  # bid_ask_spread_max_pct as the liquidity proxy. Restore real thresholds
-  # when you switch to Tastytrade.
+  # Alpaca paper feed returns null for open_interest / volume on the
+  # OptionContract serialized by platforms/alpaca_broker.py — the base
+  # filter (500/100) starves the wheel of CSP candidates on less-liquid
+  # underlyings (F, T, VZ, KMI). Drop both gates here and rely on
+  # bid_ask_spread_max_pct (5%) as the liquidity proxy. RESTORE to base
+  # at Stage 3 broker swap.
   open_interest_min: 0
   volume_min: 0
 
 risk:
-  daily_loss_kill_switch_pct: 3   # tighter while learning
+  # Pin at 5% so a future config.yaml edit cannot silently change the kill
+  # switch. Base value is also 5%; this is a defensive pin, not a tighten.
+  daily_loss_kill_switch_pct: 5
+
+  # Raise from base config (3). Three consecutive losses is too tight for
+  # the paper bring-up window; 5 is the floor that catches broken strategies
+  # without tripping on normal variance. Layered with drawdown breaker
+  # (auto_disable.py, -$300 7d) and win-rate floor (win_rate_floor.py, 60%
+  # over 10 cycles), this is the third-line defense.
+  consecutive_losses_pause: 5
 
 intelligence:
-  llm_screener_enabled: false       # off in Phase 1
-  llm_news_check_enabled: true      # on — Haiku catches catalysts cheaply
-  llm_roll_advisor_enabled: false   # on after ~3 months of cycle data
+  # Pin enabled to match the actual live state. The screener (Opus, daily
+  # cron) runs in Phase 1 too — the data value during paper-bring-up
+  # dominates the ~$0.40/day cost.
+  llm_screener_enabled: true
+  # llm_news_check_enabled and llm_roll_advisor_enabled inherit from base
+  # config.yaml (true and false respectively); do not duplicate here unless
+  # you intend to override.
 
-# Disable specific strategies without editing config.yaml. Strategies in
-# this list are skipped at load time even if enabled=true in config.yaml.
-disabled_strategies:
-  - put_spread     # comes online when multi-leg orders ship in sub-sprint 3
-
-# When you're ready to flip to Tastytrade sandbox:
-# account:
-#   broker: tastytrade_sandbox
+# Stage 1 — flip news_check from advisory (paper) to enforcing.
+# Uncomment when entering Stage 1 per runbook:
 #
-# When you're ready to go live:
+# intelligence:
+#   news_check_advisory: false
+
+# Stage 3 — Tastytrade live with 1/4 capital. Apply the diff in one deploy:
+#
 # account:
 #   broker: tastytrade
+#   max_concurrent_total: 4
 # wheel:
-#   max_concurrent_positions: 4         # back to default
-#   max_position_pct_of_account: 30
-# risk:
-#   daily_loss_kill_switch_pct: 5
-# intelligence:
-#   llm_screener_enabled: true
-#   llm_news_check_enabled: true
+#   open_interest_min: 500      # restore — Tastytrade populates OI/volume
+#   volume_min: 100
+# # per-strategy max_position_pct_of_account: 5 (in strategies block)
+
+# Stage 4 — full size. Restore caps:
+#
+# account:
+#   max_concurrent_total: 14
+# # per-strategy max_position_pct_of_account back to base (30)

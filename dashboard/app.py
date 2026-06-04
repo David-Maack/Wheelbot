@@ -367,6 +367,27 @@ def build_app(deps: DashboardDeps) -> FastAPI:
             },
         )
 
+    @app.get("/runbook", response_class=HTMLResponse)
+    async def runbook_view(request: Request, _user: str = Depends(authorize)) -> Any:
+        """TICKET-023: render docs/GO_LIVE_RUNBOOK.md as HTML.
+
+        Reads the markdown file from disk on each request (no caching — the
+        doc is small and operators occasionally need to see edits without a
+        bot restart). Authority for the file's location and update rules
+        lives in CLAUDE.md "Live-deployment authority"."""
+        import mistune
+        from pathlib import Path as _Path
+        runbook_path = _Path(__file__).resolve().parent.parent / "docs" / "GO_LIVE_RUNBOOK.md"
+        if not runbook_path.exists():
+            raise HTTPException(404, f"runbook not found at {runbook_path}")
+        markdown = runbook_path.read_text(encoding="utf-8")
+        rendered_html = mistune.html(markdown)
+        return TEMPLATES.TemplateResponse(
+            request,
+            "runbook.html",
+            {"rendered_html": rendered_html},
+        )
+
     @app.post("/risk/manual_stop")
     async def manual_stop(
         action: str = Form(...),

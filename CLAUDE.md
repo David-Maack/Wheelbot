@@ -93,3 +93,14 @@ assume UTC; if you re-host on a non-UTC machine, adjust the crontab.
   of paper data.
 - `account.max_concurrent_total`: `14` during testing (= sum of per-strategy
   caps so the per-strategy limits actually bind). Tighten to ~4 before live.
+
+## Live-deployment authority
+
+`docs/GO_LIVE_RUNBOOK.md` is the authoritative sequence for taking WheelBot
+live; any change to `account.broker`, position caps (`max_concurrent_total`,
+per-strategy `max_position_pct_of_account`), or risk thresholds
+(`daily_loss_kill_switch_pct`, `consecutive_losses_pause`,
+`auto_disable_drawdown_usd`, `drawdown_warning_usd`) that affects
+live-trading readiness must update the runbook in the same commit. The
+runbook is rendered at `/runbook` on the dashboard; the markdown file in
+`docs/` is the source of truth.

@@ -625,6 +625,34 @@ async def test_risk_view_renders(app_client):
 
 
 @pytest.mark.asyncio
+async def test_runbook_view_renders(app_client):
+    """TICKET-023: GET /runbook returns 200 + the markdown rendered to HTML.
+
+    Locks the route against silent breakage (renderer missing, file path
+    moved, mistune uninstalled). Asserts known strings from the markdown
+    that survive rendering — section headings always do."""
+    client, _deps, _broker = app_client
+    resp = await client.get("/runbook", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    # H1 from the doc — confirms file was found and rendered.
+    assert "WheelBot Go-Live Runbook" in body
+    # H2 from §3 — confirms downstream rendering didn't truncate.
+    assert "Stop conditions" in body
+    # Confirms it went through a markdown renderer (mistune emits <h2>)
+    # rather than being dumped as raw text.
+    assert "<h2>" in body
+
+
+@pytest.mark.asyncio
+async def test_runbook_view_requires_auth(app_client):
+    """Same authorize gate as the rest of the dashboard."""
+    client, _deps, _broker = app_client
+    resp = await client.get("/runbook")
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_manual_stop_engage_creates_file(app_client):
     client, deps, _broker = app_client
     stop = Path(deps.config["risk"]["stop_file_path"])
