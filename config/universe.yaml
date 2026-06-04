@@ -4,12 +4,22 @@
 # Tier enforcement:
 #   tier 1 — auto-traded if all risk gates pass
 #   tier 2 — requires LLM screener + risk gates
-#   tier 3 — requires manual human approval per cycle
+#   tier 3 — banned — never tradable by any strategy
+#
+# Tier 2 admission criteria (ALL must pass):
+#   - Would I be happy owning 200 shares for 6 months at the strike I'd sell?
+#   - Median daily volume > 5M
+#   - No going-concern / dilution risk in next 12 months
+#   - Not crypto-beta or single-product story
+#   - Per-contract capital commitment fits within strategy max_position_pct_of_account
 #
 # `strategies:` lists which strategies (from config.yaml strategies block)
 # are allowed to trade this ticker. A ticker can belong to multiple
 # strategies — but in practice we keep the universes separate so each
-# strategy is comparable in isolation.
+# strategy is comparable in isolation. An empty `strategies: []` means
+# the ticker is parked — kept on file with rationale for future revival.
+#
+# Last reviewed: 2026-06-03 (TICKET-020 — weekly_wheel prune)
 
 tickers:
   # ============================================================
@@ -75,15 +85,17 @@ tickers:
 
   - symbol: PLTR
     name: "Palantir"
-    tier: 2
-    strategies: [weekly_wheel]
-    notes: "Heavy retail flow, weeklies trade actively."
+    tier: 3   # demoted 2026-06-03 (TICKET-020): ~$27K/contract capital req incompatible
+              # with weekly_wheel sizing; momentum-driven, not premium-decay friendly.
+    strategies: []
+    notes: "Heavy retail flow, weeklies trade actively. PARKED."
 
   - symbol: PLUG
     name: "Plug Power"
-    tier: 2
-    strategies: [weekly_wheel]
-    notes: "Volatile, weekly options trade."
+    tier: 3   # demoted 2026-06-03 (TICKET-020): 49% YoY share dilution, -$1.68B TTM,
+              # going-concern risk; fails the 200-share-for-6-months gate.
+    strategies: []
+    notes: "Volatile, weekly options trade. PARKED — going-concern risk."
 
   - symbol: RIVN
     name: "Rivian"
@@ -94,9 +106,10 @@ tickers:
 
   - symbol: MARA
     name: "Marathon Digital"
-    tier: 2
-    strategies: [weekly_wheel]
-    notes: "BTC-correlated, high IV."
+    tier: 3   # demoted 2026-06-03 (TICKET-020): pure crypto-beta (Bitcoin miner),
+              # fails the "not crypto-beta or single-product story" gate.
+    strategies: []
+    notes: "BTC-correlated, high IV. PARKED — crypto-beta."
 
   - symbol: AAL
     name: "American Airlines"
@@ -161,14 +174,14 @@ tickers:
   - symbol: COIN
     name: "Coinbase Global"
     tier: 2
-    # 2026-05-23: weekly_wheel TEMPORARILY re-added so the wheel orchestrator
-    # can sell covered calls against the 100 shares we got assigned (cycle 15,
-    # cost basis $184.63). Remove `weekly_wheel` once the shares are called
-    # away or sold. Better long-term fix: ship the orphan-management feature
-    # so the orchestrator manages existing positions regardless of universe
-    # membership, then we never have to do this dance.
-    strategies: [weekly_wheel, put_spread]
-    notes: "~$300 crypto-correlated. Too rich for weekly CSP; spreads cap exposure. Currently SHARES_HELD on weekly_wheel — wheeling out via CCs."
+    # 2026-06-03 (TICKET-020): removed weekly_wheel. The 2026-05-23 band-aid
+    # has been retired now that wheel.propose_all manages SHARES_HELD orphans
+    # (wheel_orphan_managed, locked by test_propose_all_manages_orphan_shares_held_outside_universe).
+    # Retained in put_spread for defined-risk crypto exposure — the
+    # capital-req / beta concerns that disqualify weekly_wheel naked-put sizing
+    # don't apply to a $500-cap bull put spread.
+    strategies: [put_spread]
+    notes: "~$300 crypto-correlated. Defined-risk only. Any SHARES_HELD from prior weekly_wheel cycles continues to wheel out via the orphan-management path."
 
   # ============================================================
   # bear_call_spread — 30-45 DTE bear call credit spreads, defined risk
