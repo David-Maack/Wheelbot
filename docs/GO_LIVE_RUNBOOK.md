@@ -82,9 +82,13 @@ Generic stop conditions (kill-switch trip, consecutive losses, STOP file, MANUAL
 
 **Purpose.** Confirm Tastytrade sandbox quotes and (where the sandbox supports it) fills track Alpaca paper closely enough to trust the broker swap planned at Stage 3. This stage runs in parallel with Stage 1 — Alpaca paper continues to be the live execution path; Tastytrade is read-only/sandbox during this window.
 
-**Depends on.** TICKET-022 (parity diff harness) must be shipped and running. If TICKET-022 has not landed, do not enter Stage 2.
+**Depends on.** TICKET-022 (parity diff harness) is shipped as of 2026-06-04. The cron line below must be installed on the LXC. If Tastytrade sandbox credentials have not been provisioned (see §5 Part A), the harness exits with an actionable error message and writes no rows.
 
-**Operating procedure.** See TICKET-022 and the `/parity` dashboard page. The runbook does not duplicate the script's internals — operate the harness as documented there, review the daily report in `/mnt/wheelbot-storage/parity_reports/YYYY-MM-DD.md`, and watch `/parity` for the rolling 7-day view.
+**Operating procedure.**
+- Install the cron: `35 14-19 * * 1-5 cd /opt/wheelbot && docker exec wheelbot python -m scripts.parity_run` (six samples/day during NYSE hours).
+- Each run fetches option chains for every ticker with a non-empty `strategies:` list in `universe.yaml`, joins by canonical OCC symbol on both sides, computes per-contract mid-price diff, and writes rows to `broker_parity_log`.
+- Review the daily markdown report at `/mnt/wheelbot-storage/parity_reports/YYYY-MM-DD.md` — header, per-symbol summary, acceptance check, top-10 outliers.
+- Watch the `/parity` dashboard page for the rolling 7-day trend chart + per-symbol summary table + Stage 2 acceptance pass/fail.
 
 **Acceptance criteria (all must hold across the 30-day window).**
 

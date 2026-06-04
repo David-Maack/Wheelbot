@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Parity{% endblock %}
+{% block content %}
+<h1>Broker pricing parity</h1>
+<p class="caption">
+  Alpaca paper vs Tastytrade sandbox. Populated by <code>scripts/parity_run.py</code>
+  six times daily during NYSE hours. Stage 2 acceptance criteria
+  (<a href="/runbook">runbook §2</a>): mean |Δmid|% &lt; 2%, worst &lt; 5%, zero asymmetric-liquidity rows.
+</p>
+
+{% if not summary.has_data %}
+<section class="panel">
+  <p class="empty">
+    No parity data in the last 7 days. Either the cron isn't installed yet
+    or Tastytrade sandbox credentials haven't been provisioned. See
+    <a href="/runbook">runbook §5 Part A</a> for the credential setup path.
+  </p>
+</section>
+{% else %}
+
+<section class="panel">
+  <h2>7-day trend — mean |Δmid|% across all symbols</h2>
+  <canvas id="trendChart" height="120"></canvas>
+</section>
+
+<section class="panel">
+  <h2>Per-symbol summary ({{ summary.window_label }})</h2>
+  <table class="grid">
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Samples</th>
+        <th>Avg |Δmid|%</th>
+        <th>Worst |Δmid|%</th>
+        <th>Asymmetric Liquidity</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.symbol_rows %}
+      <tr>
+        <td><code>{{ row.symbol }}</code></td>
+        <td>{{ row.samples }}</td>
+        <td>
+          {% if row.avg_abs_diff_pct < 2.0 %}<span class="ok">{{ "%.2f"|format(row.avg_abs_diff_pct) }}%</span>
+          {% else %}<span class="bad">{{ "%.2f"|format(row.avg_abs_diff_pct) }}%</span>{% endif %}
+        </td>
+        <td>
+          {% if row.worst_abs_diff_pct < 5.0 %}<span class="ok">{{ "%.2f"|format(row.worst_abs_diff_pct) }}%</span>
+          {% else %}<span class="bad">{{ "%.2f"|format(row.worst_abs_diff_pct) }}%</span>{% endif %}
+        </td>
+        <td>
+          {% if (row.asymmetric_count or 0) == 0 %}<span class="ok">0</span>
+          {% else %}<span class="bad">{{ row.asymmetric_count }}</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>Stage 2 acceptance — last 7 days</h2>
+  <dl class="kv">
+    <dt>Mean |Δmid|% &lt; 2% on every symbol</dt>
+    <dd>{% if summary.avg_ok %}<span class="ok">PASS</span>{% else %}<span class="bad">FAIL</span>{% endif %}</dd>
+    <dt>Worst |Δmid|% &lt; 5% on every symbol</dt>
+    <dd>{% if summary.worst_ok %}<span class="ok">PASS</span>{% else %}<span class="bad">FAIL</span>{% endif %}</dd>
+    <dt>Zero asymmetric-liquidity rows</dt>
+    <dd>{% if summary.asym_ok %}<span class="ok">PASS</span>{% else %}<span class="bad">FAIL</span>{% endif %}</dd>
+  </dl>
+  {% if not (summary.avg_ok and summary.worst_ok and summary.asym_ok) %}
+  <p class="caption">⚠ Stage 2 acceptance not currently met — do not advance to Stage 3 (live capital).</p>
+  {% endif %}
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+  const TREND = {{ summary.trend | tojson }};
+  const ctx = document.getElementById("trendChart").getContext("2d");
+  new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: TREND.map(p => p.day),
+      datasets: [{
+        label: "Mean |Δmid|%",
+        data: TREND.map(p => p.avg_abs_diff_pct),
+        borderColor: "#0a6",
+        backgroundColor: "rgba(10, 102, 0.2)",
+        tension: 0.2,
+        pointRadius: 4
+      }]
+    },
+    options: {
+      scales: {
+        y: { beginAtZero: true, ticks: { callback: v => v + "%" } }
+      },
+      plugins: {
+        legend: { display: false },
+        annotation: {}
+      }
+    }
+  });
+</script>
+
+{% endif %}
+{% endblock %}

@@ -910,6 +910,97 @@ class AlertRateLimitsRepo(_Repo):
         return datetime.fromisoformat(row["last_fired_at"])
 
 
+class BrokerParityLogRepo(_Repo):
+    """TICKET-022: per-contract pricing-parity rows.
+
+    Writer: scripts/parity_run.py (6x/day cron during NYSE hours).
+    Readers: dashboard /parity view + daily markdown report generator.
+
+    contract_symbol is canonical OCC dense form on both sides — both
+    feeds normalize through scripts.parity_run._normalize_occ before
+    insert, so the join between brokers is deterministic.
+    """
+
+    table = "broker_parity_log"
+
+    async def insert_many(self, rows: list[dict[str, Any]]) -> int:
+        """Bulk insert. Returns count of rows inserted."""
+        if not rows:
+            return 0
+        c = await self.db.connect()
+        await c.executemany(
+            "INSERT INTO broker_parity_log "
+            "(fetched_at, symbol, contract_symbol, alpaca_mid, tasty_mid, "
+            " mid_diff_pct, alpaca_bid, alpaca_ask, tasty_bid, tasty_ask, "
+            " asymmetric_liquidity) "
+            "VALUES (:fetched_at, :symbol, :contract_symbol, :alpaca_mid, "
+            " :tasty_mid, :mid_diff_pct, :alpaca_bid, :alpaca_ask, :tasty_bid, "
+            " :tasty_ask, :asymmetric_liquidity)",
+            rows,
+        )
+        await c.commit()
+        return len(rows)
+
+    async def stats_by_symbol(
+        self, since: datetime, *, until: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Per-symbol summary over [since, until]: sample count, avg / worst
+        mid_diff_pct, asymmetric-liquidity count.
+
+        Worst is absolute value (operator cares about magnitude regardless of
+        direction). Asymmetric counts only rows flagged at insert time."""
+        until_str = until.isoformat() if until is not None else datetime.now(UTC).replace(tzinfo=None).isoformat()
+        c = await self.db.connect()
+        async with c.execute(
+            "SELECT symbol, "
+            "       COUNT(*) AS samples, "
+            "       AVG(ABS(mid_diff_pct)) AS avg_abs_diff_pct, "
+            "       MAX(ABS(mid_diff_pct)) AS worst_abs_diff_pct, "
+            "       SUM(asymmetric_liquidity) AS asymmetric_count "
+            "FROM broker_parity_log "
+            "WHERE fetched_at >= ? AND fetched_at <= ? AND mid_diff_pct IS NOT NULL "
+            "GROUP BY symbol "
+            "ORDER BY worst_abs_diff_pct DESC",
+            (since.isoformat(), until_str),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def daily_trend(
+        self, since: datetime, *, until: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Mean-of-means per day across all symbols in [since, until].
+        Drives the /parity trend chart."""
+        until_str = until.isoformat() if until is not None else datetime.now(UTC).replace(tzinfo=None).isoformat()
+        c = await self.db.connect()
+        async with c.execute(
+            "SELECT DATE(fetched_at) AS day, "
+            "       AVG(ABS(mid_diff_pct)) AS avg_abs_diff_pct, "
+            "       COUNT(*) AS samples "
+            "FROM broker_parity_log "
+            "WHERE fetched_at >= ? AND fetched_at <= ? AND mid_diff_pct IS NOT NULL "
+            "GROUP BY DATE(fetched_at) "
+            "ORDER BY day",
+            (since.isoformat(), until_str),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def top_outliers(
+        self, since: datetime, *, limit: int = 10, until: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Largest absolute mid_diff_pct rows in window. Used for the
+        daily report's worst-N section."""
+        until_str = until.isoformat() if until is not None else datetime.now(UTC).replace(tzinfo=None).isoformat()
+        c = await self.db.connect()
+        async with c.execute(
+            "SELECT fetched_at, symbol, contract_symbol, alpaca_mid, tasty_mid, mid_diff_pct "
+            "FROM broker_parity_log "
+            "WHERE fetched_at >= ? AND fetched_at <= ? AND mid_diff_pct IS NOT NULL "
+            "ORDER BY ABS(mid_diff_pct) DESC LIMIT ?",
+            (since.isoformat(), until_str, int(limit)),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
 class Repos:
     """Convenience bundle so callers can pass a single object."""
 
@@ -928,3 +1019,4 @@ class Repos:
         self.strategy_runtime = StrategyRuntimeStateRepo(db)
         self.macro_events = MacroEventsRepo(db)
         self.alert_rate_limits = AlertRateLimitsRepo(db)
+        self.broker_parity_log = BrokerParityLogRepo(db)

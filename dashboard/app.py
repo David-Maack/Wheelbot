@@ -367,6 +367,36 @@ def build_app(deps: DashboardDeps) -> FastAPI:
             },
         )
 
+    @app.get("/parity", response_class=HTMLResponse)
+    async def parity_view(request: Request, _user: str = Depends(authorize)) -> Any:
+        """TICKET-022: Alpaca paper vs Tastytrade sandbox option-pricing parity.
+
+        Trailing-7-day rollup: aggregate trend line + per-symbol summary
+        table + Stage-2 acceptance pass/fail. Populated by
+        scripts/parity_run.py on a cron schedule."""
+        from datetime import timedelta as _td
+        now = datetime.now(UTC).replace(tzinfo=None)
+        since = now - _td(days=7)
+        symbol_rows = await deps.repos.broker_parity_log.stats_by_symbol(since, until=now)
+        trend = await deps.repos.broker_parity_log.daily_trend(since, until=now)
+        avg_ok = all((float(r["avg_abs_diff_pct"] or 0.0) < 2.0) for r in symbol_rows) if symbol_rows else False
+        worst_ok = all((float(r["worst_abs_diff_pct"] or 0.0) < 5.0) for r in symbol_rows) if symbol_rows else False
+        asym_ok = all((int(r["asymmetric_count"] or 0) == 0) for r in symbol_rows) if symbol_rows else False
+        summary = {
+            "has_data": bool(symbol_rows),
+            "window_label": "last 7 days",
+            "symbol_rows": symbol_rows,
+            "trend": trend,
+            "avg_ok": avg_ok,
+            "worst_ok": worst_ok,
+            "asym_ok": asym_ok,
+        }
+        return TEMPLATES.TemplateResponse(
+            request,
+            "parity.html",
+            {"summary": summary},
+        )
+
     @app.get("/runbook", response_class=HTMLResponse)
     async def runbook_view(request: Request, _user: str = Depends(authorize)) -> Any:
         """TICKET-023: render docs/GO_LIVE_RUNBOOK.md as HTML.

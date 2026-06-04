@@ -220,6 +220,31 @@ CREATE TABLE IF NOT EXISTS strategy_runtime_state (
     paused_reenable_eligible_at  DATETIME     -- advisory only; not enforced
 );
 
+-- TICKET-022 (migration 012): per-contract pricing-parity log between
+-- Alpaca paper and Tastytrade sandbox. Populated by scripts/parity_run.py
+-- on a cron schedule; consumed by /parity dashboard + daily markdown
+-- report. contract_symbol is canonical OCC dense form on both sides.
+CREATE TABLE IF NOT EXISTS broker_parity_log (
+    id                       INTEGER PRIMARY KEY,
+    fetched_at               DATETIME NOT NULL,
+    symbol                   TEXT NOT NULL,
+    contract_symbol          TEXT NOT NULL,
+    alpaca_mid               REAL,
+    tasty_mid                REAL,
+    mid_diff_pct             REAL,
+    alpaca_bid               REAL,
+    alpaca_ask               REAL,
+    tasty_bid                REAL,
+    tasty_ask                REAL,
+    asymmetric_liquidity     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_broker_parity_log_fetched_at
+    ON broker_parity_log(fetched_at);
+
+CREATE INDEX IF NOT EXISTS idx_broker_parity_log_symbol_fetched
+    ON broker_parity_log(symbol, fetched_at);
+
 -- Macro event blackout (TICKET-007, migration 008). High-impact events
 -- (FOMC/CPI/NFP/...) used by risk/limits.py::_rule_macro_blackout to block
 -- new short premium whose lifespan crosses them. Populated by the daily

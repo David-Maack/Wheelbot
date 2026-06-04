@@ -653,6 +653,44 @@ async def test_runbook_view_requires_auth(app_client):
 
 
 @pytest.mark.asyncio
+async def test_parity_view_empty(app_client):
+    """TICKET-022: /parity renders the empty state when no parity_log rows
+    exist (which is the case until the cron has run at least once)."""
+    client, _deps, _broker = app_client
+    resp = await client.get("/parity", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    # Empty-state copy.
+    assert "No parity data" in body or "no parity data" in body
+    # Header still renders.
+    assert "Broker pricing parity" in body
+
+
+@pytest.mark.asyncio
+async def test_parity_view_with_data(app_client):
+    """When parity_log has rows, the summary table and trend chart render."""
+    client, deps, _broker = app_client
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await deps.repos.broker_parity_log.insert_many([
+        {
+            "fetched_at": (now - timedelta(hours=1)).isoformat(),
+            "symbol": "F",
+            "contract_symbol": "F250620P00010000",
+            "alpaca_mid": 1.0, "tasty_mid": 1.01, "mid_diff_pct": 1.0,
+            "alpaca_bid": 0.99, "alpaca_ask": 1.01,
+            "tasty_bid": 1.00, "tasty_ask": 1.02,
+            "asymmetric_liquidity": 0,
+        },
+    ])
+    resp = await client.get("/parity", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    assert "F" in body
+    assert "1.00%" in body  # avg matches
+    assert "PASS" in body
+
+
+@pytest.mark.asyncio
 async def test_manual_stop_engage_creates_file(app_client):
     client, deps, _broker = app_client
     stop = Path(deps.config["risk"]["stop_file_path"])
