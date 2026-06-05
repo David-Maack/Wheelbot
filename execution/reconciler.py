@@ -107,6 +107,48 @@ def _spread_expired_outcome(strategy_id: str | None) -> CycleOutcome:
     return CycleOutcome.SPREAD_EXPIRED_PROFIT
 
 
+# TICKET-014.5: PositionStates that _diff_one INTENTIONALLY does not act on —
+# either terminal (CSP_CLOSED, CALLED_AWAY, ...), operator-owned
+# (MANUAL_INTERVENTION, KILLED), transient between fills (IDLE, SCANNING,
+# ROLL_EVAL, ASSIGNED), or driven by _on_fill rather than position-shape
+# (the *_PENDING states are handled explicitly above; SHARES_HELD has no
+# shape-only transition today). The complement of this set and the states
+# _diff_one explicitly branches on must cover EVERY PositionState — enforced
+# by test_diff_one_covers_every_position_state. When a new state is added
+# (e.g. PMCC_* in TICKET-015) it must be categorized here or given a branch,
+# otherwise the test fails AND _diff_one flags it MANUAL_INTERVENTION at
+# runtime rather than silently skipping it.
+_DIFF_ONE_NO_TRANSITION_STATES: frozenset[PositionState] = frozenset({
+    PositionState.IDLE,
+    PositionState.SCANNING,
+    PositionState.ROLL_EVAL,
+    PositionState.CSP_CLOSED,
+    PositionState.ASSIGNED,
+    PositionState.SHARES_HELD,
+    PositionState.CC_CLOSED,
+    PositionState.CALLED_AWAY,
+    PositionState.SPREAD_CLOSED,
+    PositionState.SPREAD_ASSIGNED,
+    PositionState.BROKER_DOWN,
+    PositionState.MANUAL_INTERVENTION,
+    PositionState.KILLED,
+})
+
+# TICKET-014.5: order types whose P&L multiplier _compute_cycle_pnl knows.
+# Options trade at 100×; the synthetic stock legs written by assignment /
+# called-away (BUY_TO_OPEN / SELL_TO_CLOSE with option_type=None) trade at 1×.
+# A BUY_TO_OPEN / SELL_TO_CLOSE that DOES carry an option_type is an option
+# leg (PMCC's long call is the first such case) — priced at 100× and logged.
+_PNL_OPTION_ORDER_TYPES: frozenset[OrderType] = frozenset({
+    OrderType.SELL_TO_OPEN,
+    OrderType.BUY_TO_CLOSE,
+})
+_PNL_STOCK_OR_OPTION_ORDER_TYPES: frozenset[OrderType] = frozenset({
+    OrderType.BUY_TO_OPEN,
+    OrderType.SELL_TO_CLOSE,
+})
+
+
 @dataclass(slots=True)
 class ReconcileSummary:
     fills_processed: int = 0
@@ -274,23 +316,63 @@ class Reconciler:
             now_cancelled = broker_view.status in (
                 OrderStatus.CANCELLED, OrderStatus.REJECTED,
             )
-            if local_was_pending and now_filled:
-                await self._on_fill(local, broker_view, summary)
-            elif local_was_pending and now_cancelled:
-                # A DAY order that partially filled and then cancelled (or got
-                # cancelled at EOD with some contracts/legs already executed)
-                # leaves REAL filled quantity live at the broker. _on_cancel
-                # would reset the position as if nothing filled, orphaning those
-                # contracts. Hand it to a human instead of corrupting state.
-                if _observed_partial_fill(local, broker_view):
-                    await self._flag_manual_intervention(
-                        local.symbol,
-                        f"order {local.broker_order_id} {broker_view.status.value} "
-                        f"after partial fill — manual reconcile",
-                        summary,
-                    )
-                else:
-                    await self._on_cancel(local, broker_view, summary)
+            # TICKET-014.5: per-order isolation. An exception in _on_fill /
+            # _on_cancel (a forgotten branch that raises, a KeyError deep in a
+            # handler) previously propagated up through reconcile_once and
+            # aborted the ENTIRE tick — halting reconciliation for every other
+            # healthy position. Wrap each order's dispatch so one bad order
+            # flags MANUAL_INTERVENTION and the tick continues. Combined with
+            # the explicit unhandled-type guard in _on_fill, this makes the
+            # reconcile loop fail loud-but-isolated rather than silent-or-total.
+            try:
+                await self._dispatch_order_transition(
+                    local, broker_view, local_was_pending, now_filled,
+                    now_cancelled, summary,
+                )
+            except Exception as exc:  # noqa: BLE001 — deliberate catch-all
+                log_checkpoint(
+                    "reconcile_order_dispatch_error",
+                    status="fail",
+                    symbol=broker_view.symbol,
+                    client_order_id=local.client_order_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                await self._flag_manual_intervention(
+                    broker_view.symbol,
+                    f"reconcile error on order {local.client_order_id}: "
+                    f"{type(exc).__name__}: {exc}",
+                    summary,
+                )
+
+    async def _dispatch_order_transition(
+        self,
+        local: Order,
+        broker_view: Order,
+        local_was_pending: bool,
+        now_filled: bool,
+        now_cancelled: bool,
+        summary: ReconcileSummary,
+    ) -> None:
+        """Route one order's terminal-status transition. Extracted from
+        _process_orders so the per-order try/except (TICKET-014.5) wraps a
+        single call site."""
+        if local_was_pending and now_filled:
+            await self._on_fill(local, broker_view, summary)
+        elif local_was_pending and now_cancelled:
+            # A DAY order that partially filled and then cancelled (or got
+            # cancelled at EOD with some contracts/legs already executed)
+            # leaves REAL filled quantity live at the broker. _on_cancel
+            # would reset the position as if nothing filled, orphaning those
+            # contracts. Hand it to a human instead of corrupting state.
+            if _observed_partial_fill(local, broker_view):
+                await self._flag_manual_intervention(
+                    local.symbol,
+                    f"order {local.broker_order_id} {broker_view.status.value} "
+                    f"after partial fill — manual reconcile",
+                    summary,
+                )
+            else:
+                await self._on_cancel(local, broker_view, summary)
 
     async def _on_fill(
         self,
@@ -407,6 +489,31 @@ class Reconciler:
                     CycleOutcome.CSP_CLOSED_PROFIT,
                     summary,
                 )
+
+        else:
+            # TICKET-014.5: explicit unhandled-order-type guard. Before this,
+            # a filled BUY_TO_OPEN / SELL_TO_CLOSE (or any future order type)
+            # fell through silently — no state set, no cycle opened, invisible.
+            # PMCC's long-call BUY_TO_OPEN is the next such case; surfacing it
+            # loudly (flag + checkpoint) means the omission in TICKET-015 can't
+            # corrupt state quietly. Flag rather than raise so one unhandled
+            # order doesn't abort reconciliation for healthy positions (the
+            # per-item isolation in _process_orders is the second backstop).
+            log_checkpoint(
+                "reconcile_unhandled_order_type",
+                status="fail",
+                symbol=symbol,
+                strategy=local.strategy_id,
+                order_type=local.order_type.value if hasattr(local.order_type, "value") else str(local.order_type),
+                client_order_id=local.client_order_id,
+                note="_on_fill has no branch for this order type — add one",
+            )
+            await self._flag_manual_intervention(
+                symbol,
+                f"_on_fill: no handler for filled order_type "
+                f"{local.order_type} ({local.client_order_id})",
+                summary,
+            )
 
     async def _on_cancel(
         self,
@@ -580,8 +687,24 @@ class Reconciler:
 
         # Detect transitions implied purely by *position state* that fills alone
         # don't surface — assignments and worthless expirations.
+        # TICKET-014.5: per-symbol isolation — same rationale as the per-order
+        # wrap in _process_orders. One symbol's _diff_one raising must not abort
+        # reconciliation for every other position.
         for symbol, local in local_by_symbol.items():
-            await self._diff_one(symbol, local, rows_by_symbol.get(symbol, []), summary)
+            try:
+                await self._diff_one(symbol, local, rows_by_symbol.get(symbol, []), summary)
+            except Exception as exc:  # noqa: BLE001 — deliberate catch-all
+                log_checkpoint(
+                    "reconcile_diff_error",
+                    status="fail",
+                    symbol=symbol,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                await self._flag_manual_intervention(
+                    symbol,
+                    f"reconcile error diffing {symbol}: {type(exc).__name__}: {exc}",
+                    summary,
+                )
 
         # Symbols at broker we don't track at all.
         for symbol, rows in rows_by_symbol.items():
@@ -671,8 +794,31 @@ class Reconciler:
             # No state-shape transition; _on_fill drives PENDING → OPEN.
             return
 
-        # Anything else: no implied transition from position-shape alone.
-        return
+        # TICKET-014.5: explicit exhaustive guard. States that intentionally
+        # imply no position-shape transition are enumerated in
+        # _DIFF_ONE_NO_TRANSITION_STATES. Anything that is neither handled
+        # above nor in that set is an UNCATEGORIZED state — almost certainly a
+        # new PositionState added without wiring it into reconciliation (the
+        # PMCC_* states in TICKET-015 are the next such case). Flag it loudly
+        # instead of silently skipping, so the gap surfaces as a
+        # MANUAL_INTERVENTION + checkpoint rather than a position that never
+        # reconciles its expirations/assignments.
+        if local.state in _DIFF_ONE_NO_TRANSITION_STATES:
+            return
+        log_checkpoint(
+            "reconcile_uncategorized_state",
+            status="fail",
+            symbol=symbol,
+            strategy=local.strategy_id,
+            state=local.state.value if hasattr(local.state, "value") else str(local.state),
+            note="_diff_one has no handler and state not in no-transition set — categorize it",
+        )
+        await self._flag_manual_intervention(
+            local.symbol,
+            f"_diff_one: uncategorized state {local.state} for {local.symbol} "
+            "— reconciliation cannot infer transitions",
+            summary,
+        )
 
     async def _on_spread_expiration(
         self, local: Position, summary: ReconcileSummary
@@ -1044,7 +1190,7 @@ class Reconciler:
     async def _compute_cycle_pnl(self, cycle_id: int) -> float:
         c = await self._repos.db.connect()
         async with c.execute(
-            "SELECT order_type, quantity, fill_price FROM orders "
+            "SELECT order_type, quantity, fill_price, option_type FROM orders "
             "WHERE cycle_id = ? AND status = ? AND fill_price IS NOT NULL",
             (cycle_id, OrderStatus.FILLED.value),
         ) as cur:
@@ -1054,6 +1200,7 @@ class Reconciler:
             qty = row["quantity"] or 0
             price = row["fill_price"] or 0
             ot = row["order_type"]
+            option_type = row["option_type"]  # None for stock legs / packages
             if ot in (OrderType.MULTI_LEG_OPEN.value, OrderType.MULTI_LEG_CLOSE.value):
                 # fill_price is signed net per share (positive = credit). The
                 # qty here is the package quantity; each package is 100 shares
@@ -1062,12 +1209,42 @@ class Reconciler:
                 continue
             # SELL credits; BUY debits. Options multiplier 100; stock 1.
             sign = 1 if ot in (OrderType.SELL_TO_OPEN.value, OrderType.SELL_TO_CLOSE.value) else -1
-            # SELL_TO_OPEN/BUY_TO_CLOSE are option trades (100x); BUY_TO_OPEN/
-            # SELL_TO_CLOSE in this codebase are synthetic stock legs (1x)
-            # written by assignment / called-away.
-            if ot in (OrderType.SELL_TO_OPEN.value, OrderType.BUY_TO_CLOSE.value):
+            # TICKET-014.5: explicit multiplier map (was a silent `else: 1`).
+            if ot in _PNL_OPTION_ORDER_TYPES:
+                # SELL_TO_OPEN / BUY_TO_CLOSE — always option trades (100x).
                 multiplier = 100
+            elif ot in _PNL_STOCK_OR_OPTION_ORDER_TYPES:
+                # BUY_TO_OPEN / SELL_TO_CLOSE. Synthetic stock legs from
+                # assignment / called-away carry option_type=None → 1x. A leg
+                # that DOES carry an option_type is a real option leg (PMCC's
+                # long call is the first such case) → 100x. This guard means
+                # PMCC's long-call P&L is booked correctly the moment it lands,
+                # and the loud log flags it for verification.
+                if option_type:
+                    multiplier = 100
+                    log_checkpoint(
+                        "cycle_pnl_option_via_open_close",
+                        status="ok",
+                        cycle_id=cycle_id,
+                        order_type=str(ot),
+                        option_type=str(option_type),
+                        note="option leg via BUY_TO_OPEN/SELL_TO_CLOSE priced 100x (PMCC long?)",
+                    )
+                else:
+                    multiplier = 1
             else:
+                # Unrecognized order type in a cycle's fills. D1: log loudly +
+                # safe default (1x under-count, recoverable + visible in
+                # /performance) rather than raise — raising here could wedge a
+                # cycle close. A new strategy added an order type without
+                # teaching the P&L computer its multiplier.
                 multiplier = 1
+                log_checkpoint(
+                    "cycle_pnl_unknown_order_type",
+                    status="fail",
+                    cycle_id=cycle_id,
+                    order_type=str(ot),
+                    note="defaulted to 1x multiplier — add this order type to the P&L map",
+                )
             pnl += sign * price * qty * multiplier
         return pnl

@@ -789,3 +789,182 @@ async def test_cc_fill_links_order_to_existing_cycle(db_repos):
     # The CC order is now tagged with the cycle (was NULL before the fix).
     cc_after = await db_repos.orders.get(cc_id)
     assert cc_after.cycle_id == cycle_id
+
+
+# -- TICKET-014.5: exhaustive-dispatch guards ------------------------------
+
+from execution.reconciler import _DIFF_ONE_NO_TRANSITION_STATES  # noqa: E402
+
+
+# Mirror of the if/elif chain in _diff_one — the states it has an explicit
+# handling branch for. Keep in sync when adding a branch. The partition test
+# fails if a new PositionState is added without putting it here OR in
+# _DIFF_ONE_NO_TRANSITION_STATES.
+_DIFF_ONE_HANDLED_STATES = frozenset({
+    PositionState.CSP_OPEN,
+    PositionState.CC_OPEN,
+    PositionState.CSP_PENDING,
+    PositionState.CC_PENDING,
+    PositionState.SPREAD_OPEN,
+    PositionState.SPREAD_PENDING,
+})
+
+
+def test_diff_one_partition_is_exhaustive():
+    """Every PositionState is either handled by a _diff_one branch or
+    explicitly declared no-transition. A new state (PMCC_* in TICKET-015)
+    forces a categorization decision or this test fails — the tripwire that
+    makes the silent-fall-through bug PF-2 found impossible to reintroduce."""
+    handled = _DIFF_ONE_HANDLED_STATES
+    noop = _DIFF_ONE_NO_TRANSITION_STATES
+    assert handled.isdisjoint(noop), "a state is both handled and declared no-op"
+    missing = set(PositionState) - (handled | noop)
+    assert not missing, f"uncategorized PositionState(s): {missing}"
+
+
+@pytest.mark.asyncio
+async def test_diff_one_uncategorized_state_flags_manual(db_repos, monkeypatch):
+    """A state that is neither handled nor in the no-op set flags
+    MANUAL_INTERVENTION instead of silently skipping. Simulated by removing a
+    normally-no-op state (ROLL_EVAL) from the set."""
+    import execution.reconciler as rec_mod
+    reduced = frozenset(
+        s for s in rec_mod._DIFF_ONE_NO_TRANSITION_STATES
+        if s != PositionState.ROLL_EVAL
+    )
+    monkeypatch.setattr(rec_mod, "_DIFF_ONE_NO_TRANSITION_STATES", reduced)
+
+    await db_repos.positions.insert(
+        Position(
+            account_id="test", symbol="F",
+            state=PositionState.ROLL_EVAL, shares=0, state_changed_at=_utc(),
+        )
+    )
+    rec = Reconciler(PaperBroker(), db_repos, _config())
+    summary = ReconcileSummary()
+    local = await db_repos.positions.get_by_symbol("test", "F")
+    await rec._diff_one("F", local, [], summary)
+    assert summary.manual_interventions == 1
+    pos = await db_repos.positions.get_by_symbol("test", "F")
+    assert pos.state == PositionState.MANUAL_INTERVENTION
+
+
+@pytest.mark.asyncio
+async def test_on_fill_unhandled_order_type_flags_manual(db_repos):
+    """A filled order whose type _on_fill has no branch for (PMCC's long-call
+    BUY_TO_OPEN before TICKET-015 wires it) flags MANUAL_INTERVENTION instead
+    of silently no-op'ing."""
+    broker = PaperBroker(cash=20_000)
+    await db_repos.positions.insert(
+        Position(account_id="test", symbol="F", state=PositionState.IDLE,
+                 shares=0, state_changed_at=_utc())
+    )
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    order = Order(
+        account_id="test", symbol="F", order_type=OrderType.BUY_TO_OPEN,
+        contract_symbol="F250706C00012000", strike=12.0,
+        expiration=date(2025, 7, 6), option_type=OptionType.CALL,
+        quantity=1, fill_price=2.50, status=OrderStatus.FILLED,
+        placed_at=_utc(), client_order_id="wb-pmcc-long-1",
+    )
+    await rec._on_fill(order, order, summary)
+    assert summary.manual_interventions == 1
+    pos = await db_repos.positions.get_by_symbol("test", "F")
+    assert pos.state == PositionState.MANUAL_INTERVENTION
+
+
+@pytest.mark.asyncio
+async def test_process_orders_isolates_failing_order(db_repos, monkeypatch):
+    """Part A: an exception inside _on_fill flags MANUAL_INTERVENTION and the
+    reconcile tick does NOT abort — one bad order can't halt reconciliation
+    for healthy positions."""
+    broker = PaperBroker(cash=20_000)
+    _pos, broker_order = await _seed_csp_pending(db_repos, broker)
+    await broker.fill_order(broker_order.broker_order_id, fill_price=0.50)
+    rec = Reconciler(broker, db_repos, _config())
+
+    async def _boom(*a, **k):
+        raise RuntimeError("simulated handler bug")
+    monkeypatch.setattr(rec, "_on_fill", _boom)
+
+    # Must return normally — the per-order try/except catches the RuntimeError.
+    summary = await rec.reconcile_once()
+    assert summary.manual_interventions >= 1
+    flagged = await db_repos.positions.get_by_symbol("test", "F")
+    assert flagged.state == PositionState.MANUAL_INTERVENTION
+
+
+@pytest.mark.asyncio
+async def test_reconcile_positions_isolates_failing_symbol(db_repos, monkeypatch):
+    """Part A: an exception in _diff_one for one symbol doesn't abort the
+    per-symbol loop for the others."""
+    broker = PaperBroker(cash=20_000)
+    await db_repos.positions.insert(
+        Position(account_id="test", symbol="F", state=PositionState.CSP_OPEN,
+                 shares=0, state_changed_at=_utc())
+    )
+    await db_repos.positions.insert(
+        Position(account_id="test", symbol="BAC", state=PositionState.SHARES_HELD,
+                 shares=100, cost_basis=30.0, state_changed_at=_utc())
+    )
+    rec = Reconciler(broker, db_repos, _config())
+    orig = rec._diff_one
+
+    async def _maybe_boom(symbol, local, rows, summary):
+        if symbol == "F":
+            raise RuntimeError("simulated diff bug")
+        return await orig(symbol, local, rows, summary)
+    monkeypatch.setattr(rec, "_diff_one", _maybe_boom)
+
+    # The mere fact this returns (rather than propagating the RuntimeError)
+    # proves the loop isolated F's failure.
+    summary = await rec.reconcile_once()
+    f = await db_repos.positions.get_by_symbol("test", "F")
+    assert f.state == PositionState.MANUAL_INTERVENTION
+    # BAC (SHARES_HELD, a no-op state) was reached and left untouched.
+    bac = await db_repos.positions.get_by_symbol("test", "BAC")
+    assert bac.state == PositionState.SHARES_HELD
+
+
+@pytest.mark.asyncio
+async def test_compute_cycle_pnl_option_leg_via_buy_to_open_priced_100x(db_repos):
+    """A BUY_TO_OPEN carrying an option_type (PMCC long call) is priced at
+    100x — the is_option guard discriminates it from synthetic stock legs.
+    This means PMCC's long-call P&L is booked correctly the moment it lands,
+    without TICKET-015 touching _compute_cycle_pnl."""
+    rec = Reconciler(PaperBroker(), db_repos, _config())
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", started_at=_utc(), n_orders=1)
+    )
+    await db_repos.orders.insert(
+        Order(account_id="test", symbol="AAPL", cycle_id=cycle_id,
+              order_type=OrderType.BUY_TO_OPEN,
+              contract_symbol="AAPL260116C00150000", strike=150.0,
+              expiration=date(2026, 1, 16), option_type=OptionType.CALL,
+              quantity=1, fill_price=5.00, status=OrderStatus.FILLED,
+              placed_at=_utc(), client_order_id="wb-long")
+    )
+    pnl = await rec._compute_cycle_pnl(cycle_id)
+    # BUY (debit), option 100x: -1 * 5.00 * 1 * 100 = -500
+    assert pnl == pytest.approx(-500.0)
+
+
+@pytest.mark.asyncio
+async def test_compute_cycle_pnl_synthetic_stock_leg_priced_1x(db_repos):
+    """A BUY_TO_OPEN with option_type=None (assignment synthetic stock leg)
+    stays at 1x — existing assignment/called-away P&L behavior preserved."""
+    rec = Reconciler(PaperBroker(), db_repos, _config())
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="F", started_at=_utc(), n_orders=1)
+    )
+    await db_repos.orders.insert(
+        Order(account_id="test", symbol="F", cycle_id=cycle_id,
+              order_type=OrderType.BUY_TO_OPEN,
+              contract_symbol=None, strike=None, expiration=None, option_type=None,
+              quantity=100, fill_price=9.0, status=OrderStatus.FILLED,
+              placed_at=_utc(), client_order_id="wb-synth")
+    )
+    pnl = await rec._compute_cycle_pnl(cycle_id)
+    # BUY (debit), stock 1x: -1 * 9.0 * 100 * 1 = -900
+    assert pnl == pytest.approx(-900.0)
