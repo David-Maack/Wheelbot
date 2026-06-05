@@ -73,6 +73,7 @@ from intelligence.news import make_news_source
 from intelligence.news_check import news_check as run_news_check
 from strategies import roll_orchestrator
 from strategies.roll_advisor import RollAction, RollContext
+from strategies.iron_condor import propose_all as propose_all_iron_condor
 from strategies.spreads import (
     MultiLegProposal,
     propose_all as propose_all_spreads,
@@ -88,15 +89,24 @@ def _utcnow() -> datetime:
 
 
 async def _make_news_check_callable(news, anthropic, config):
-    """Returns the callable the OrderRouter expects, or None when disabled."""
+    """Returns the callable the OrderRouter expects, or None when disabled.
+
+    TICKET-014: the inner closure now accepts an optional `profile` kwarg so
+    the router can dispatch per-strategy prompts (bullish_csp / bullish_long
+    / neutral_range / neutral_pin). Default = bullish_csp preserves the
+    wheel CSP path's existing prompt byte-for-byte (locked by
+    test_wheel_csp_*_unchanged regression tests)."""
     intel = config.get("intelligence", {}) or {}
     if not bool(intel.get("llm_news_check_enabled", True)):
         return None
     if anthropic is None or news is None:
         return None
 
-    async def _check(symbol: str):
-        return await run_news_check(symbol=symbol, news=news, anthropic=anthropic, config=config)
+    async def _check(symbol: str, profile: str = "bullish_csp"):
+        return await run_news_check(
+            symbol=symbol, news=news, anthropic=anthropic, config=config,
+            profile=profile,
+        )
 
     return _check
 
@@ -341,6 +351,20 @@ async def _propose_and_route(
                 broker, repos, config, strategy=strategy,
             )
             open_proposals = await propose_all_spreads(
+                broker, repos, config, strategy_universe,
+                strategy=strategy, ivr=ivr,
+                size_multiplier=size_multiplier,
+            )
+            proposals = close_proposals + open_proposals
+        elif strategy.type == "iron_condor":
+            # TICKET-014: closes reuse propose_all_spread_closes — the close
+            # orchestrator detects iron_condor by strategy.id and tags
+            # rationale + direction correctly (precursor fix #3). Opens go
+            # through the dedicated iron_condor selector.
+            close_proposals = await propose_all_spread_closes(
+                broker, repos, config, strategy=strategy,
+            )
+            open_proposals = await propose_all_iron_condor(
                 broker, repos, config, strategy_universe,
                 strategy=strategy, ivr=ivr,
                 size_multiplier=size_multiplier,

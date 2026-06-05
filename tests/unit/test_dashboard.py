@@ -667,6 +667,20 @@ async def test_parity_view_empty(app_client):
 
 
 @pytest.mark.asyncio
+async def test_cycles_view_includes_iron_condor_outcome_options(app_client):
+    """TICKET-014: /cycles outcome dropdown is now driven from the
+    CycleOutcome enum, so the three new IRON_CONDOR_* outcomes appear
+    automatically without a template edit."""
+    client, _deps, _broker = app_client
+    resp = await client.get("/cycles", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    assert "IRON_CONDOR_EXPIRED_PROFIT" in body
+    assert "IRON_CONDOR_CLOSED_PROFIT" in body
+    assert "IRON_CONDOR_CLOSED_LOSS" in body
+
+
+@pytest.mark.asyncio
 async def test_parity_view_with_data(app_client):
     """When parity_log has rows, the summary table and trend chart render."""
     client, deps, _broker = app_client

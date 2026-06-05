@@ -402,7 +402,40 @@ class RiskGate:
             result.add("regime", "skip", "regime gating disabled in config")
             return
 
-        # Which column to read depends on direction.
+        # Which column(s) to read depends on direction. For iron_condor we
+        # AND-combine csps_allowed + bear_calls_allowed (both wings must be
+        # independently allowed by the regime). This fallback is semantically
+        # correct for the current 4-bucket regime: BULL_TREND fails the call
+        # wing, BEAR_TREND fails the put wing, NEUTRAL allows both, HIGH_VOL
+        # fails both. When TICKET-013's 6-bucket regime adds an explicit
+        # `iron_condor_allowed` column (matrix can diverge from AND in
+        # NEUTRAL_HIGH_IV etc.), swap this branch to read that column.
+        if proposal.direction == "iron_condor":
+            c = await self._repos.db.connect()
+            async with c.execute(
+                "SELECT csps_allowed, bear_calls_allowed FROM regime_snapshots "
+                "ORDER BY snapshot_date DESC LIMIT 1"
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                result.add("regime", "skip", "no regime snapshots yet")
+                return
+            csps_ok = bool(row["csps_allowed"]) if row["csps_allowed"] is not None else True
+            bear_ok = bool(row["bear_calls_allowed"]) if row["bear_calls_allowed"] is not None else True
+            if csps_ok and bear_ok:
+                result.add("regime", "pass")
+            else:
+                missing = []
+                if not csps_ok:
+                    missing.append("put wing (csps_allowed=False)")
+                if not bear_ok:
+                    missing.append("call wing (bear_calls_allowed=False)")
+                result.add(
+                    "regime", "fail",
+                    f"iron_condor requires both wings allowed; blocked: {', '.join(missing)}",
+                )
+            return
+
         if proposal.direction == "bear_call":
             flag_column = "bear_calls_allowed"
             fail_detail = "current regime snapshot disallows new bearish-premium trades"

@@ -169,6 +169,11 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         if strategy:
             cycles = [c for c in cycles if (c.strategy_id or "") == strategy]
         cycles.sort(key=lambda c: (c.final_pnl is None, -(c.final_pnl or 0)))
+        # TICKET-014: drive the outcome filter dropdown from the CycleOutcome
+        # enum so new outcomes (iron_condor + future strategies) appear
+        # automatically without template edits.
+        from core.models import CycleOutcome
+        outcome_options = [o.value for o in CycleOutcome]
         return TEMPLATES.TemplateResponse(
             request,
             "cycles.html",
@@ -178,6 +183,7 @@ def build_app(deps: DashboardDeps) -> FastAPI:
                 "filter_outcome": outcome or "",
                 "filter_strategy": strategy or "",
                 "strategies": _known_strategies(deps),
+                "outcome_options": outcome_options,
             },
         )
 

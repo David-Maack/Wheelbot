@@ -7,12 +7,9 @@
   <label>Outcome
     <select name="outcome">
       <option value="">any</option>
-      <option value="CSP_EXPIRED" {% if filter_outcome == 'CSP_EXPIRED' %}selected{% endif %}>CSP_EXPIRED</option>
-      <option value="CSP_CLOSED_PROFIT" {% if filter_outcome == 'CSP_CLOSED_PROFIT' %}selected{% endif %}>CSP_CLOSED_PROFIT</option>
-      <option value="CC_EXPIRED" {% if filter_outcome == 'CC_EXPIRED' %}selected{% endif %}>CC_EXPIRED</option>
-      <option value="CC_CLOSED_PROFIT" {% if filter_outcome == 'CC_CLOSED_PROFIT' %}selected{% endif %}>CC_CLOSED_PROFIT</option>
-      <option value="CC_CALLED_AWAY" {% if filter_outcome == 'CC_CALLED_AWAY' %}selected{% endif %}>CC_CALLED_AWAY</option>
-      <option value="MANUAL_CLOSE" {% if filter_outcome == 'MANUAL_CLOSE' %}selected{% endif %}>MANUAL_CLOSE</option>
+      {% for o in outcome_options %}
+      <option value="{{ o }}" {% if filter_outcome == o %}selected{% endif %}>{{ o }}</option>
+      {% endfor %}
     </select>
   </label>
   <label>Strategy

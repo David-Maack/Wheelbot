@@ -84,7 +84,27 @@ _PROFIT_TO_LOSS_OUTCOME = {
     CycleOutcome.CSP_CLOSED_PROFIT: CycleOutcome.CSP_CLOSED_LOSS,
     CycleOutcome.CC_CLOSED_PROFIT: CycleOutcome.CC_CLOSED_LOSS,
     CycleOutcome.SPREAD_CLOSED_PROFIT: CycleOutcome.SPREAD_CLOSED_LOSS,
+    # TICKET-014: iron condor uses its own outcome family so post-hoc
+    # filtering on /cycles can split iron_condor results from vanilla
+    # vertical spreads.
+    CycleOutcome.IRON_CONDOR_CLOSED_PROFIT: CycleOutcome.IRON_CONDOR_CLOSED_LOSS,
 }
+
+
+def _spread_close_outcome(strategy_id: str | None) -> CycleOutcome:
+    """Pick the right CycleOutcome at MULTI_LEG_CLOSE. iron_condor cycles
+    get tagged distinctly from vanilla spreads so the /cycles filter and
+    /performance breakdown can separate them."""
+    if strategy_id == "iron_condor":
+        return CycleOutcome.IRON_CONDOR_CLOSED_PROFIT
+    return CycleOutcome.SPREAD_CLOSED_PROFIT
+
+
+def _spread_expired_outcome(strategy_id: str | None) -> CycleOutcome:
+    """Same dispatch for MULTI_LEG_OPEN expiration paths (all legs OTM)."""
+    if strategy_id == "iron_condor":
+        return CycleOutcome.IRON_CONDOR_EXPIRED_PROFIT
+    return CycleOutcome.SPREAD_EXPIRED_PROFIT
 
 
 @dataclass(slots=True)
@@ -315,7 +335,7 @@ class Reconciler:
                     await self._repos.orders.update(local.id, cycle_id=position.current_cycle_id)
                 await self._close_cycle(
                     position.current_cycle_id,
-                    CycleOutcome.SPREAD_CLOSED_PROFIT,
+                    _spread_close_outcome(local.strategy_id),
                     summary,
                 )
                 # Clear the cycle pointer — the spread is closed and the
@@ -506,10 +526,23 @@ class Reconciler:
         """
         if order.order_type != OrderType.MULTI_LEG_OPEN:
             return None
-        legs = (order.raw_request or {}).get("legs") or []
-        # Determine width = (max strike) - (min strike) across legs of the same option_type.
-        strikes = [leg.get("strike") for leg in legs if leg.get("strike") is not None]
-        width = (max(strikes) - min(strikes)) if len(strikes) >= 2 else 0.0
+        raw = order.raw_request or {}
+        legs = raw.get("legs") or []
+        # TICKET-014 precursor #1: prefer the explicit width_dollars stamped
+        # by the router when present. For a 4-leg iron condor (90/95P + 105/110C),
+        # the legs-only formula (max-strike − min-strike) returns the OUTER
+        # span 20 instead of the wing width 5, overstating capital_at_risk ~4×.
+        # Verticals stamp the same width so the explicit-vs-derived numbers
+        # agree; iron_condor proposals carry the wing width verbatim.
+        explicit_width = raw.get("width_dollars")
+        if explicit_width is not None:
+            width = float(explicit_width)
+        else:
+            # Fallback for orders placed before the router started stamping
+            # width_dollars (defensive — should always be present after the
+            # TICKET-014 deploy lands).
+            strikes = [leg.get("strike") for leg in legs if leg.get("strike") is not None]
+            width = (max(strikes) - min(strikes)) if len(strikes) >= 2 else 0.0
         net_credit_per_share = fill_price  # signed; positive = credit received
         capital_at_risk = max((width - net_credit_per_share) * 100 * order.quantity, 0.0)
         cycle = WheelCycle(
@@ -648,7 +681,9 @@ class Reconciler:
         summary.expirations_processed += 1
         if local.current_cycle_id:
             await self._close_cycle(
-                local.current_cycle_id, CycleOutcome.SPREAD_EXPIRED_PROFIT, summary
+                local.current_cycle_id,
+                _spread_expired_outcome(local.strategy_id),
+                summary,
             )
         if local.id is not None:
             await self._repos.positions.update(

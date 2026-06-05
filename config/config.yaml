@@ -384,3 +384,33 @@ strategies:
       # Drawdown circuit breaker — see monthly_wheel.
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150
+
+  # TICKET-014: Iron Condor — defined-risk neutral-range structure on
+  # liquid indices. enabled: false by design — the operator turns this
+  # on AFTER paper-validating the strategy on SPY/QQQ/IWM. Sized via
+  # max_capital_per_condor_usd; news_check fires the neutral_range
+  # profile (block on FOMC/CPI/major data inside the holding window).
+  # Universe membership is in config/universe.yaml — SPY/QQQ/IWM have
+  # iron_condor added to their strategies: lists.
+  - id: iron_condor
+    display_name: "Iron Condor"
+    type: iron_condor
+    enabled: false
+    max_concurrent: 2
+    params:
+      dte_min: 30
+      dte_max: 45
+      short_put_delta_target: 0.16     # ~1 SD on the put side
+      short_call_delta_target: 0.16    # ~1 SD on the call side
+      wing_width: 5.0                  # $5 wings — same as the vertical strategies
+      min_credit_pct: 30               # total credit ≥ 30% of wing width
+      profit_close_pct: 25             # tighter than verticals (50%) — short gamma both sides
+      time_close_dte: 21               # close when either short ≤ 21 DTE
+      max_capital_per_condor_usd: 1000 # 2× the per-spread cap (4 legs)
+      ivr_min: 30
+      # Regime gate uses AND-combine of csps_allowed + bear_calls_allowed —
+      # see risk/limits.py::_rule_regime_multi_leg. Both wings must be
+      # independently allowed by the current regime snapshot.
+      # Drawdown circuit breaker — see monthly_wheel.
+      auto_disable_drawdown_usd: -300
+      drawdown_warning_usd: -150

@@ -661,3 +661,213 @@ async def test_compute_cycle_pnl_handles_multi_leg_credit_and_debit(db_repos):
     reconciler = Reconciler(PaperBroker(), db_repos, _config())
     pnl = await reconciler._compute_cycle_pnl(cycle_id)
     assert pnl == pytest.approx(75.0)
+
+
+# -- TICKET-014 precursor fixes -------------------------------------------
+
+
+def _condor_legs() -> list[OrderLeg]:
+    """Symmetric iron condor on F with $5 wings: 90/95P + 105/110C @ 35 DTE."""
+    today = date(2025, 6, 1)
+    exp = today + timedelta(days=35)
+    return [
+        OrderLeg(
+            contract_symbol="F250706P00090000",
+            underlying="F", option_type=OptionType.PUT, strike=90.0,
+            expiration=exp, action=OrderType.BUY_TO_OPEN,    # long put
+        ),
+        OrderLeg(
+            contract_symbol="F250706P00095000",
+            underlying="F", option_type=OptionType.PUT, strike=95.0,
+            expiration=exp, action=OrderType.SELL_TO_OPEN,   # short put
+        ),
+        OrderLeg(
+            contract_symbol="F250706C00105000",
+            underlying="F", option_type=OptionType.CALL, strike=105.0,
+            expiration=exp, action=OrderType.SELL_TO_OPEN,   # short call
+        ),
+        OrderLeg(
+            contract_symbol="F250706C00110000",
+            underlying="F", option_type=OptionType.CALL, strike=110.0,
+            expiration=exp, action=OrderType.BUY_TO_OPEN,    # long call
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_open_cycle_for_spread_uses_explicit_width_dollars(db_repos):
+    """Precursor #1: when raw_request['width_dollars'] is present, reconciler
+    uses it verbatim instead of computing max(strikes)-min(strikes).
+
+    For a 4-leg iron condor 90/95P + 105/110C the legs-derived width is
+    20 (outer span), but the wing width is 5. capital_at_risk should be
+    (5 - 0.30) * 100 * 1 = 470.0, not (20 - 0.30) * 100 * 1 = 1970.0."""
+    legs = _condor_legs()
+    raw_request = {
+        "underlying": "F",
+        "legs": [leg.model_dump(mode="json") for leg in legs],
+        "quantity": 1,
+        "limit_price": 0.30,
+        "width_dollars": 5.0,    # the precursor-fix field
+    }
+    placed_at = datetime.now(UTC).replace(tzinfo=None)
+    order = await db_repos.orders.insert(
+        Order(
+            account_id="test",
+            symbol="F",
+            strategy_id="iron_condor",
+            order_type=OrderType.MULTI_LEG_OPEN,
+            contract_symbol=legs[1].contract_symbol,  # short put as canonical
+            strike=95.0,
+            expiration=legs[0].expiration,
+            option_type=OptionType.PUT,
+            quantity=1,
+            limit_price=0.30,
+            fill_price=-0.30,
+            status=OrderStatus.FILLED,
+            placed_at=placed_at,
+            filled_at=placed_at,
+            raw_request=raw_request,
+        )
+    )
+    reconciler = Reconciler(PaperBroker(), db_repos, _config())
+    full_order = await db_repos.orders.get(order)
+    cycle_id = await reconciler._open_cycle_for_spread(
+        full_order, fill_price=0.30, summary=type("S", (), {"cycles_opened": 0})(),
+    )
+    cycle = await db_repos.cycles.get(cycle_id)
+    # Explicit width 5: (5.0 - 0.30) * 100 * 1 = 470.0
+    assert cycle.initial_capital_at_risk == pytest.approx(470.0)
+
+
+@pytest.mark.asyncio
+async def test_open_cycle_for_spread_falls_back_to_legs_when_no_width(db_repos):
+    """Backwards-compat: orders placed before the router started stamping
+    width_dollars still produce a cycle (using the legs-derived width).
+    This locks the fallback path so old orders don't crash."""
+    legs = _spread_legs()
+    raw_request = {
+        "underlying": "F",
+        "legs": [leg.model_dump(mode="json") for leg in legs],
+        "quantity": 1,
+        "limit_price": 0.30,
+        # NO width_dollars key.
+    }
+    placed_at = datetime.now(UTC).replace(tzinfo=None)
+    order_id = await db_repos.orders.insert(
+        Order(
+            account_id="test",
+            symbol="F",
+            strategy_id="put_spread",
+            order_type=OrderType.MULTI_LEG_OPEN,
+            contract_symbol=legs[0].contract_symbol,
+            strike=10.0,
+            expiration=legs[0].expiration,
+            option_type=OptionType.PUT,
+            quantity=1,
+            limit_price=0.30,
+            fill_price=-0.30,
+            status=OrderStatus.FILLED,
+            placed_at=placed_at,
+            filled_at=placed_at,
+            raw_request=raw_request,
+        )
+    )
+    reconciler = Reconciler(PaperBroker(), db_repos, _config())
+    full_order = await db_repos.orders.get(order_id)
+    cycle_id = await reconciler._open_cycle_for_spread(
+        full_order, fill_price=0.30, summary=type("S", (), {"cycles_opened": 0})(),
+    )
+    cycle = await db_repos.cycles.get(cycle_id)
+    # Legs-derived width: max(10, 9) - min(10, 9) = 1; (1 - 0.30) * 100 * 1 = 70
+    assert cycle.initial_capital_at_risk == pytest.approx(70.0)
+
+
+@pytest.mark.asyncio
+async def test_close_direction_set_by_strategy_id_for_iron_condor(db_repos):
+    """Precursor #3: propose_close_for_symbol should set direction=iron_condor
+    when strategy.id == 'iron_condor', NOT bear_call (which is what the old
+    leg-type inference produced as soon as any call leg was seen).
+
+    Closes bypass the regime gate so this is a label bug, not a fill bug,
+    but the rationale string and downstream display would show the wrong
+    direction. Locks the fix."""
+    from strategies.spreads import DIRECTION_IRON_CONDOR
+
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    condor_proposal = MultiLegProposal(
+        symbol="F",
+        legs=_condor_legs(),
+        net_credit_per_spread=0.50,
+        max_loss_per_spread=450.0,
+        width_dollars=5.0,
+        quantity=1,
+        rationale="iron condor test",
+        strategy_id="iron_condor",
+        direction=DIRECTION_IRON_CONDOR,
+    )
+    open_result = await router.place_multi_leg(
+        condor_proposal, sleep=_noop_sleep, today=date(2025, 6, 1),
+    )
+    await broker.fill_multi_leg(open_result.placed.broker_order_id, fill_price=0.50)
+    reconciler = Reconciler(broker, db_repos, _config())
+    await reconciler.reconcile_once()
+
+    # Seed mids that trigger profit close (debit-to-close < 75% of 0.50).
+    for occ, bid, ask in [
+        ("F250706P00090000", 0.04, 0.06),    # long put cheap
+        ("F250706P00095000", 0.08, 0.10),    # short put cheap
+        ("F250706C00105000", 0.08, 0.10),    # short call cheap
+        ("F250706C00110000", 0.04, 0.06),    # long call cheap
+    ]:
+        broker.seed_quote(Quote(symbol=occ, bid=bid, ask=ask))
+
+    condor_strategy = StrategyDefinition(
+        id="iron_condor",
+        display_name="Iron Condor",
+        type="iron_condor",
+        enabled=True,
+        max_concurrent=2,
+        params={
+            "profit_close_pct": 25,
+            "time_close_dte": 21,
+            "spread_width_dollars": 5.0,
+            "min_credit_pct_of_width": 30.0,
+            "dte_min": 30, "dte_max": 45,
+            "short_delta_min": 0.10, "short_delta_max": 0.20,
+        },
+    )
+    close_proposal = await propose_close_for_symbol(
+        broker, db_repos, "F", _config(),
+        today=date(2025, 6, 10), strategy=condor_strategy,
+    )
+    assert close_proposal is not None
+    # The fix: direction comes from strategy.id, not leg-type inference.
+    assert close_proposal.direction == DIRECTION_IRON_CONDOR
+
+
+@pytest.mark.asyncio
+async def test_router_stamps_width_dollars_onto_raw_request(db_repos):
+    """Precursor #1 end-to-end: routing a MultiLegProposal results in an
+    Order whose raw_request carries the proposal's width_dollars."""
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    proposal = MultiLegProposal(
+        symbol="F",
+        legs=_spread_legs(),
+        net_credit_per_spread=0.30,
+        max_loss_per_spread=70.0,
+        width_dollars=1.0,
+        quantity=1,
+        rationale="test",
+        strategy_id="put_spread",
+    )
+    result = await router.place_multi_leg(
+        proposal, sleep=_noop_sleep, today=date(2025, 6, 1),
+    )
+    assert result.placed is not None
+    persisted = await db_repos.orders.get_by_client_id(result.placed.client_order_id)
+    assert persisted is not None
+    assert persisted.raw_request is not None
+    assert persisted.raw_request.get("width_dollars") == pytest.approx(1.0)

@@ -45,6 +45,10 @@ from strategies.spread_selector import SpreadCandidate, select_bull_put_spread
 # Direction labels — match the values used in config.yaml strategy.params.direction.
 DIRECTION_BULL_PUT = "bull_put"
 DIRECTION_BEAR_CALL = "bear_call"
+# TICKET-014 precursor: iron condor combines bull put + bear call wings on the
+# same expiration. The regime gate AND-combines csps_allowed + bear_calls_allowed
+# for this value — see risk/limits.py::_rule_regime_multi_leg.
+DIRECTION_IRON_CONDOR = "iron_condor"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +75,13 @@ class MultiLegProposal:
     # Spread direction — drives regime-gate flag selection in risk/limits.py.
     # Defaults to bull_put for backwards-compat with existing put_spread proposals.
     direction: str = DIRECTION_BULL_PUT
+    # TICKET-014: per-strategy news_check prompt profile. When None, the router
+    # does NOT fire news_check on this proposal — preserves existing put_spread
+    # and bear_call_spread behavior (no news_check on their opens). When set
+    # to one of the PROFILE_PROMPTS keys (bullish_csp, bullish_long, neutral_range,
+    # neutral_pin), the router fires news_check with that prompt and applies the
+    # standard caution/block handling.
+    news_check_profile: str | None = None
 
 
 def _tier_flags(symbol: str, universe: dict[str, Any]) -> tuple[bool, bool]:
@@ -384,9 +395,20 @@ async def propose_close_for_symbol(
     # Reconstruct OrderLegs in CLOSE direction. Infer spread direction from
     # the option_type on any leg (puts → bull_put, calls → bear_call) so the
     # risk gate picks the right regime flag.
+    #
+    # TICKET-014 precursor #3: detect iron_condor by strategy_id rather than
+    # leg-type inference. The old behavior set direction=bear_call as soon
+    # as any call leg was seen, which mislabeled condor closes (4 legs:
+    # long put + short put + short call + long call). Closes bypass the
+    # regime gate anyway (limits.py:398), so this was a label bug, not a
+    # fill bug — but the rationale string and downstream display showed
+    # the wrong direction.
     close_legs: list[OrderLeg] = []
     short_leg: OrderLeg | None = None
-    direction = DIRECTION_BULL_PUT
+    if strategy.id == "iron_condor":
+        direction = DIRECTION_IRON_CONDOR
+    else:
+        direction = DIRECTION_BULL_PUT
     for leg in legs_raw:
         # Each leg dict mirrors OrderLeg.model_dump(mode="json").
         ol = OrderLeg(
@@ -401,7 +423,12 @@ async def propose_close_for_symbol(
         close_legs.append(ol)
         if str(leg["action"]) == OrderType.SELL_TO_OPEN.value:
             short_leg = ol  # remember for DTE check
-        if str(leg["option_type"]) == OptionType.CALL.value:
+        # Leg-type inference for verticals only — iron_condor was already
+        # set above by strategy_id.
+        if (
+            strategy.id != "iron_condor"
+            and str(leg["option_type"]) == OptionType.CALL.value
+        ):
             direction = DIRECTION_BEAR_CALL
 
     # Re-quote each leg to compute current debit to close.

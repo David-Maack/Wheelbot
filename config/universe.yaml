@@ -156,14 +156,22 @@ tickers:
   - symbol: SPY
     name: "S&P 500 ETF"
     tier: 1
-    strategies: [put_spread]
-    notes: "Broad-market hedge candidate too."
+    # TICKET-014: SPY is in BOTH put_spread (directional) and iron_condor
+    # (neutral-range, defined risk on both sides). Overlap is intentional:
+    # the disjoint-universes comment elsewhere was about avoiding accidental
+    # short strangles from put_spread + bear_call_spread on the same ticker.
+    # That accident does NOT happen with iron_condor since the condor is
+    # itself a defined-risk structure with both wings — there's no implicit
+    # leftover from one strategy that could combine with another.
+    strategies: [put_spread, iron_condor]
+    notes: "Broad-market hedge candidate too. Iron condor target — deepest liquidity."
 
   - symbol: QQQ
     name: "NASDAQ-100 ETF"
     tier: 1
-    strategies: [put_spread]
-    notes: "Tech-heavy ETF with deep options chain."
+    # TICKET-014: see SPY for the overlap rationale.
+    strategies: [put_spread, iron_condor]
+    notes: "Tech-heavy ETF with deep options chain. Iron condor target."
 
   - symbol: AMD
     name: "Advanced Micro Devices"
@@ -192,8 +200,11 @@ tickers:
   - symbol: IWM
     name: "iShares Russell 2000 ETF"
     tier: 1
-    strategies: [bear_call_spread]
-    notes: "Small caps — chronically weaker than SPY, ETF diversification."
+    # TICKET-014: IWM gets iron_condor added alongside bear_call_spread.
+    # Same rationale as SPY/QQQ — condor wings are defined-risk on both
+    # sides, so the cross-strategy interaction is bounded.
+    strategies: [bear_call_spread, iron_condor]
+    notes: "Small caps — chronically weaker than SPY, ETF diversification. Iron condor target."
 
   - symbol: DIA
     name: "SPDR Dow Jones Industrial Average ETF"

@@ -442,6 +442,71 @@ async def test_regime_gate_passes_bear_call_when_bear_calls_allowed(
 
 
 @pytest.mark.asyncio
+async def test_regime_gate_iron_condor_passes_when_both_wings_allowed(
+    db_repos, monkeypatch
+):
+    """TICKET-014 precursor #2: iron_condor AND-combines csps_allowed +
+    bear_calls_allowed. Both True → pass. Locked semantic: a condor only
+    runs in a regime where BOTH directional wings are independently
+    allowed (NEUTRAL in the current 4-bucket scheme)."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=1)
+
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(
+        _multi_leg_proposal(direction="iron_condor"),
+        today=date(2025, 6, 1),
+        raise_on_fail=False,
+    )
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["regime"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_regime_gate_iron_condor_blocked_when_put_wing_disallowed(
+    db_repos, monkeypatch
+):
+    """csps_allowed=0 (put wing blocked) → condor fails even if bear_calls=1."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_regime(db_repos, csps_allowed=0, bear_calls_allowed=1)
+
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(
+        _multi_leg_proposal(direction="iron_condor"),
+        today=date(2025, 6, 1),
+        raise_on_fail=False,
+    )
+    rule_results = {r.rule: r for r in res.results}
+    assert rule_results["regime"].status == "fail"
+    assert "put wing" in rule_results["regime"].detail
+
+
+@pytest.mark.asyncio
+async def test_regime_gate_iron_condor_blocked_when_call_wing_disallowed(
+    db_repos, monkeypatch
+):
+    """bear_calls_allowed=0 (call wing blocked) → condor fails even if csps=1."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=0)
+
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(
+        _multi_leg_proposal(direction="iron_condor"),
+        today=date(2025, 6, 1),
+        raise_on_fail=False,
+    )
+    rule_results = {r.rule: r for r in res.results}
+    assert rule_results["regime"].status == "fail"
+    assert "call wing" in rule_results["regime"].detail
+
+
+@pytest.mark.asyncio
 async def test_regime_gate_skips_close_proposals(db_repos, monkeypatch):
     """Closes always bypass the regime gate so we never get stuck holding a position."""
     monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)

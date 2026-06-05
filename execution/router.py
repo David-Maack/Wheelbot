@@ -424,8 +424,12 @@ class OrderRouter:
         """Place a defined-risk multi-leg package atomically.
 
         Differences vs `place(Proposal)`:
-          - News check is skipped: a credit-spread sizing decision factors
-            risk-vs-reward differently from "should I take naked exposure".
+          - News check is OPT-IN per strategy via `proposal.news_check_profile`.
+            When None (default for put_spread/bear_call_spread — preserves
+            existing behavior), the gate is skipped. When set (iron_condor uses
+            `neutral_range`), news_check fires with that profile's prompt and
+            applies the standard block/caution handling. PMCC long-call opens
+            and calendar opens will follow the same pattern.
           - Limit price is the proposal's net credit, snapped to a $0.01 tick.
           - Position state goes to SPREAD_PENDING; reconciler upgrades to
             SPREAD_OPEN on observed fill.
@@ -463,6 +467,80 @@ class OrderRouter:
                 risk_failure_rule=exc.rule,
                 risk_failure_detail=exc.detail,
             )
+
+        # TICKET-014: per-strategy news_check on MULTI_LEG_OPEN. Opt-in via
+        # proposal.news_check_profile. Mirrors the single-leg path's
+        # block/caution/advisory handling. Caution + qty=1 → skip (can't half
+        # a structured package). Closes (MULTI_LEG_CLOSE) bypass.
+        news_decision: str | None = None
+        news_rationale: str | None = None
+        if (
+            self._news_checker is not None
+            and proposal.order_type == OrderType.MULTI_LEG_OPEN
+            and proposal.news_check_profile is not None
+        ):
+            check = await self._news_checker(
+                proposal.symbol, proposal.news_check_profile,
+            )
+            news_decision = getattr(check, "decision", None)
+            news_rationale = getattr(check, "rationale", None)
+            log_checkpoint(
+                "router_news_check",
+                status="ok",
+                symbol=proposal.symbol,
+                strategy=proposal.strategy_id,
+                profile=proposal.news_check_profile,
+                decision=news_decision,
+            )
+            if news_decision == "block":
+                log_checkpoint(
+                    "router_news_block",
+                    status="skip",
+                    symbol=proposal.symbol,
+                    strategy=proposal.strategy_id,
+                    rationale=news_rationale,
+                )
+                return RouteResult(
+                    proposal=proposal,
+                    placed=None,
+                    news_decision="block",
+                    news_rationale=news_rationale,
+                )
+            if news_decision == "caution" and self._cfg.news_check_advisory:
+                log_checkpoint(
+                    "router_news_caution_advisory",
+                    status="ok",
+                    symbol=proposal.symbol,
+                    strategy=proposal.strategy_id,
+                    note="advisory mode — proceeding at full size",
+                    rationale=news_rationale,
+                )
+            elif news_decision == "caution":
+                halved = proposal.quantity // 2
+                if halved == 0:
+                    # qty=1 caution → skip. Halving a structured package
+                    # below 1 contract isn't meaningful; the conservative
+                    # call is to not enter.
+                    log_checkpoint(
+                        "router_news_caution_block",
+                        status="skip",
+                        symbol=proposal.symbol,
+                        strategy=proposal.strategy_id,
+                        original_qty=proposal.quantity,
+                        note="qty=1 cannot be halved — treated as block",
+                    )
+                    return RouteResult(
+                        proposal=proposal,
+                        placed=None,
+                        news_decision="caution",
+                        news_rationale=(news_rationale or "")
+                        + " | qty=1 cannot be halved — treated as block",
+                    )
+                proposal = replace(
+                    proposal,
+                    quantity=halved,
+                    rationale=proposal.rationale + " (size halved by news_check)",
+                )
 
         if self._cfg.dry_run:
             log_checkpoint(
@@ -536,9 +614,25 @@ class OrderRouter:
         if placed is None:
             raise BrokerUnavailable(str(last_exc) if last_exc else "exhausted retries")
 
+        # TICKET-014 precursor #1: stamp the proposal's authoritative
+        # width_dollars onto raw_request so the reconciler can read it
+        # verbatim (see _open_cycle_for_spread). The old computed-from-legs
+        # path (max-strike − min-strike) returns the outer span for a 4-leg
+        # iron condor — e.g. 20 instead of 5 for a 90/95P + 105/110C — and
+        # overstates initial_capital_at_risk ~4×. Verticals still produce
+        # the same number from both paths, so the reconciler falls back
+        # to the leg-derived width when this field is absent.
+        if placed.raw_request is not None and proposal.width_dollars:
+            placed.raw_request["width_dollars"] = float(proposal.width_dollars)
+
         await self._persist_order(placed)
         await self._upsert_position_spread_pending(proposal, placed)
-        return RouteResult(proposal=proposal, placed=placed)
+        return RouteResult(
+            proposal=proposal,
+            placed=placed,
+            news_decision=news_decision,
+            news_rationale=news_rationale,
+        )
 
     # -- Internals ------------------------------------------------------------
 

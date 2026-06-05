@@ -31,7 +31,20 @@ from intelligence.news import Headline, NewsSource, NewsSourceUnavailable
 
 VALID_DECISIONS = {"proceed", "caution", "block"}
 
-SYSTEM_PROMPT = """You are a risk reviewer. Given the last 48 hours of news
+# TICKET-014: per-strategy news_check prompts. Each profile asks the LLM
+# the question that matches the position's risk shape. The wheel CSP path
+# uses `bullish_csp` — that prompt is preserved BYTE-FOR-BYTE from the
+# original (locked by test_wheel_csp_system_prompt_locked) because it's
+# been running in paper for months. The other three profiles ship with
+# this ticket and get exercised by iron_condor (and later PMCC / calendar).
+#
+# Decision schema is identical across all profiles so the parser stays one
+# code path. Decision semantics per the runbook §6 / scope doc:
+#   proceed → no fresh material catalyst, place at full size
+#   caution → non-trivial signal — halve size, or skip if qty=1
+#   block   → clear catalyst — cancel the order
+
+BULLISH_CSP_PROMPT = """You are a risk reviewer. Given the last 48 hours of news
 headlines for one stock ticker, decide whether selling a 30-day cash-secured put
 on that ticker tomorrow morning is a reasonable idea.
 
@@ -50,6 +63,86 @@ Reply with exactly one JSON object, no markdown:
              event, leadership crisis, etc.).
 Be conservative — when in doubt, "caution".
 """
+
+# Backwards-compat alias. External code (and the wheel-CSP regression test)
+# imports SYSTEM_PROMPT. Keep it pointing at the bullish_csp content.
+SYSTEM_PROMPT = BULLISH_CSP_PROMPT
+
+BULLISH_LONG_PROMPT = """You are a risk reviewer. Given the last 48 hours of news
+headlines for one stock ticker, decide whether opening a bullish long-dated call
+position on that ticker tomorrow morning is a reasonable idea.
+
+Reply with exactly one JSON object, no markdown:
+
+{
+  "decision": "proceed" | "caution" | "block",
+  "rationale": "<= 240 chars",
+  "confidence": 0.0-1.0
+}
+
+"proceed"  — nothing in these headlines threatens a multi-month bullish thesis.
+"caution"  — there is a non-trivial signal worth halving the position size for.
+"block"    — there is a clear catalyst that makes a long bullish position unwise
+             (impending earnings tail risk, FDA/regulatory action, dilution
+             event, leadership crisis, criminal probe, etc.).
+Be conservative — when in doubt, "caution".
+"""
+
+NEUTRAL_RANGE_PROMPT = """You are a risk reviewer. Given the last 48 hours of news
+headlines for one ticker, decide whether opening a neutral-range options position
+(iron condor: short put spread + short call spread, defined risk) on that ticker
+tomorrow morning is a reasonable idea. A neutral-range position loses if the
+underlying moves SHARPLY in EITHER direction within 30-45 days.
+
+For broad-market indices (SPY, QQQ, IWM, DIA), single-name news is less relevant;
+focus on macro catalysts (FOMC decisions, CPI/NFP releases, major geopolitical
+events, sovereign-rating actions).
+
+Reply with exactly one JSON object, no markdown:
+
+{
+  "decision": "proceed" | "caution" | "block",
+  "rationale": "<= 240 chars",
+  "confidence": 0.0-1.0
+}
+
+"proceed"  — no catalyst likely to drive a sharp move in either direction.
+"caution"  — there is a non-trivial signal worth halving the position size for.
+"block"    — there is a clear catalyst likely to cause a large directional move
+             (FOMC surprise, major data release inside the holding period,
+             geopolitical shock, earnings inside the window for single names).
+Be conservative — when in doubt, "caution".
+"""
+
+NEUTRAL_PIN_PROMPT = """You are a risk reviewer. Given the last 48 hours of news
+headlines for one ticker, decide whether opening a calendar spread (short
+front-month, long back-month, same strike) on that ticker tomorrow morning is a
+reasonable idea. A calendar spread profits when the underlying stays NEAR the
+strike through front-month expiration; it loses if the underlying moves
+significantly away from the strike before the front leg expires.
+
+Reply with exactly one JSON object, no markdown:
+
+{
+  "decision": "proceed" | "caution" | "block",
+  "rationale": "<= 240 chars",
+  "confidence": 0.0-1.0
+}
+
+"proceed"  — no catalyst likely to drive a significant move away from current price.
+"caution"  — there is a non-trivial signal worth halving the position size for.
+"block"    — there is a clear catalyst likely to move the underlying meaningfully
+             away from current price before front-month expiration (FOMC, major
+             data, earnings inside the front-month, geopolitical shock).
+Be conservative — when in doubt, "caution".
+"""
+
+PROFILE_PROMPTS: dict[str, str] = {
+    "bullish_csp": BULLISH_CSP_PROMPT,
+    "bullish_long": BULLISH_LONG_PROMPT,
+    "neutral_range": NEUTRAL_RANGE_PROMPT,
+    "neutral_pin": NEUTRAL_PIN_PROMPT,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,8 +164,14 @@ async def news_check(
     news: NewsSource | None,
     anthropic: AnthropicClient,
     config: dict[str, Any],
+    profile: str = "bullish_csp",
 ) -> NewsCheckResult:
-    """Run the pre-trade check. Always returns a result — never raises."""
+    """Run the pre-trade check. Always returns a result — never raises.
+
+    `profile` selects which prompt to use; defaults to `bullish_csp` for
+    backwards-compat with the wheel CSP path. Unknown profiles fall back
+    to bullish_csp (defensive — surface as a warning instead of crashing
+    if a new profile is referenced before its prompt is added)."""
     intel = config.get("intelligence", {}) or {}
     if not bool(intel.get("llm_news_check_enabled", True)):
         return NewsCheckResult("proceed", "news_check disabled in config", "skipped:disabled")
@@ -104,14 +203,24 @@ async def news_check(
         ],
     }
     model = intel.get("news_check_model", "claude-haiku-4-5")
+    system_prompt = PROFILE_PROMPTS.get(profile)
+    if system_prompt is None:
+        log_checkpoint(
+            "news_check_unknown_profile",
+            status="fail",
+            symbol=symbol,
+            profile=profile,
+            note="falling back to bullish_csp",
+        )
+        system_prompt = BULLISH_CSP_PROMPT
     try:
         result = await anthropic.call(
             decision_type=LlmDecisionType.NEWS_CHECK,
             model=model,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             user_payload=payload,
             max_output_tokens=int(intel.get("news_check_max_tokens", 256)),
-            context={"symbol": symbol, "n_headlines": len(headlines)},
+            context={"symbol": symbol, "n_headlines": len(headlines), "profile": profile},
         )
     except BudgetExceeded as exc:
         log_checkpoint("news_check_budget_skip", status="skip", symbol=symbol, error=str(exc))

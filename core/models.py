@@ -75,6 +75,11 @@ class CycleOutcome(StrEnum):
     SPREAD_CLOSED_PROFIT = "SPREAD_CLOSED_PROFIT"     # closed at profit_close_pct
     SPREAD_CLOSED_LOSS = "SPREAD_CLOSED_LOSS"         # closed at a loss (stop/time)
     SPREAD_MAX_LOSS = "SPREAD_MAX_LOSS"               # both legs ITM at expiry
+    # TICKET-014: iron condor outcomes. The reconciler tags by strategy_id
+    # when closing a cycle whose strategy is iron_condor.
+    IRON_CONDOR_EXPIRED_PROFIT = "IRON_CONDOR_EXPIRED_PROFIT"   # all 4 legs OTM at expiry, full credit kept
+    IRON_CONDOR_CLOSED_PROFIT = "IRON_CONDOR_CLOSED_PROFIT"     # closed at profit_close_pct
+    IRON_CONDOR_CLOSED_LOSS = "IRON_CONDOR_CLOSED_LOSS"         # closed at a loss (stop/time)
     MANUAL_CLOSE = "MANUAL_CLOSE"
 
 
