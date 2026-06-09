@@ -36,7 +36,7 @@ from typing import Any
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.config import effective_wheel_params
-from core.models import OptionType, OrderType, PositionState
+from core.models import OptionType, OrderStatus, OrderType, PositionState
 from data.earnings import in_blackout
 from db.repo import Repos
 from strategies.spreads import MultiLegProposal
@@ -155,6 +155,9 @@ class RiskGate:
             await self._rule_regime(result, proposal, params)
             await self._rule_tier2_screen(result, proposal)
             await self._rule_macro_blackout(result, proposal, today)
+            # TICKET-015: PMCC-specific gates (no-op for non-pmcc proposals).
+            self._rule_pmcc_position_cap(result, proposal, params)
+            await self._rule_pmcc_short_above_breakeven(result, proposal)
 
         log_checkpoint(
             "risk_gate",
@@ -524,8 +527,16 @@ class RiskGate:
             return
         # CCs are about closing existing exposure — regime gate applies only to
         # new CSPs (spec §8 rule 7).
-        if proposal.contract.option_type != OptionType.PUT:
-            result.add("regime", "skip", "not a CSP")
+        # TICKET-015: a PMCC long (BUY_TO_OPEN call) IS a new bullish directional
+        # bet — gate it on csps_allowed (the same bullish-premium flag a CSP
+        # uses). A PMCC short (SELL_TO_OPEN call) is covered premium against the
+        # long, so it falls through to the non-PUT skip below like a wheel CC.
+        is_pmcc_long = (
+            getattr(proposal, "strategy_id", None) == "pmcc"
+            and proposal.order_type == OrderType.BUY_TO_OPEN
+        )
+        if proposal.contract.option_type != OptionType.PUT and not is_pmcc_long:
+            result.add("regime", "skip", "not a CSP / PMCC long")
             return
         # `RegimeSnapshotsRepo` doesn't expose a "latest" query yet — Sprint 7
         # ticket 33 adds it. For now: try a thin direct read; if no rows, skip.
@@ -542,6 +553,105 @@ class RiskGate:
             result.add("regime", "fail", "current regime snapshot disallows new CSPs")
         else:
             result.add("regime", "pass")
+
+    # --- TICKET-015: PMCC rules ------------------------------------------------
+    def _pmcc_param(self, key: str, default: Any = None) -> Any:
+        """Read a value from the pmcc strategy's params block. The gate's
+        `params` arg is effective_wheel_params (wheel-centric) and does NOT
+        carry per-strategy params, so PMCC rules read straight from the
+        strategies registry in config."""
+        for s in self._config.get("strategies", []) or []:
+            if s.get("id") == "pmcc":
+                return (s.get("params", {}) or {}).get(key, default)
+        return default
+
+    def _rule_pmcc_position_cap(
+        self,
+        result: RiskCheckResult,
+        proposal: Proposal,
+        params: dict[str, Any],
+    ) -> None:
+        """The long-LEAP debit must fit max_capital_per_position_usd. Only
+        applies to the PMCC long entry (BUY_TO_OPEN). Belt-and-suspenders with
+        the selector's own cap check. Reads the cap from the strategies
+        registry (see _pmcc_param)."""
+        if getattr(proposal, "strategy_id", None) != "pmcc":
+            result.add("pmcc_position_cap", "skip", "not a PMCC proposal")
+            return
+        if proposal.order_type != OrderType.BUY_TO_OPEN:
+            result.add("pmcc_position_cap", "skip", "not a PMCC long entry")
+            return
+        cap = float(self._pmcc_param("max_capital_per_position_usd", 0) or 0)
+        if cap <= 0:
+            result.add("pmcc_position_cap", "skip", "no cap configured")
+            return
+        c = proposal.contract
+        if c.bid is None or c.ask is None:
+            result.add("pmcc_position_cap", "skip", "no quote for debit estimate")
+            return
+        debit = ((c.bid + c.ask) / 2) * 100 * proposal.quantity
+        if debit > cap:
+            result.add(
+                "pmcc_position_cap", "fail",
+                f"long debit ${debit:.0f} exceeds cap ${cap:.0f}",
+            )
+        else:
+            result.add("pmcc_position_cap", "pass")
+
+    async def _rule_pmcc_short_above_breakeven(
+        self,
+        result: RiskCheckResult,
+        proposal: Proposal,
+    ) -> None:
+        """A PMCC short call must sit STRICTLY above the long's breakeven so an
+        assigned short is covered at a profit. Only applies to the PMCC short
+        entry (SELL_TO_OPEN call). Belt-and-suspenders with the selector."""
+        if getattr(proposal, "strategy_id", None) != "pmcc":
+            result.add("pmcc_short_above_breakeven", "skip", "not a PMCC proposal")
+            return
+        if proposal.order_type != OrderType.SELL_TO_OPEN or proposal.contract.option_type != OptionType.CALL:
+            result.add("pmcc_short_above_breakeven", "skip", "not a PMCC short entry")
+            return
+        account_id = self._config.get("account", {}).get("id", "primary")
+        position = await self._repos.positions.get_by_symbol(
+            account_id, proposal.symbol, strategy_id="pmcc"
+        )
+        if position is None or position.current_cycle_id is None:
+            # No open long to cover — selector shouldn't have produced this;
+            # fail closed.
+            result.add(
+                "pmcc_short_above_breakeven", "fail",
+                "no open PMCC long position to cover the short",
+            )
+            return
+        c = await self._repos.db.connect()
+        async with c.execute(
+            "SELECT strike, fill_price FROM orders WHERE cycle_id = ? "
+            "AND order_type = ? AND option_type = ? AND status = ? "
+            "ORDER BY placed_at DESC LIMIT 1",
+            (
+                position.current_cycle_id,
+                OrderType.BUY_TO_OPEN.value,
+                OptionType.CALL.value,
+                OrderStatus.FILLED.value,
+            ),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or row["strike"] is None or row["fill_price"] is None:
+            result.add(
+                "pmcc_short_above_breakeven", "fail",
+                "cannot recover long breakeven (no filled long order)",
+            )
+            return
+        breakeven = float(row["strike"]) + abs(float(row["fill_price"]))
+        if proposal.contract.strike > breakeven:
+            result.add("pmcc_short_above_breakeven", "pass")
+        else:
+            result.add(
+                "pmcc_short_above_breakeven", "fail",
+                f"short strike {proposal.contract.strike} not above long "
+                f"breakeven {breakeven:.2f}",
+            )
 
     # --- Rule 8 (Sprint 14) — Tier-2 LLM screen --------------------------------
     async def _rule_tier2_screen(

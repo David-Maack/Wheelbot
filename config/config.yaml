@@ -414,3 +414,38 @@ strategies:
       # Drawdown circuit breaker — see monthly_wheel.
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150
+
+  # TICKET-015: Poor Man's Covered Call. A deep-ITM LEAP long (stock
+  # substitute) with OTM short calls sold against it for income. Defined
+  # risk = the long debit. The wheel substitute for quality names the cash-
+  # secured account can't afford outright. enabled: false until paper-
+  # validated. Sized at 1 long + 1 short per position (max_concurrent caps
+  # the number of concurrent PMCC positions). NOTE: with this strategy on,
+  # the sum of per-strategy max_concurrent (2+4+4+4+2+3=19) exceeds the
+  # account.max_concurrent_total ceiling (14) — that global cap will bind
+  # if every strategy is enabled at once; tune allocation at go-live.
+  - id: pmcc
+    display_name: "Poor Man's Covered Call"
+    type: pmcc
+    enabled: false
+    max_concurrent: 3
+    params:
+      long_dte_min: 90
+      long_dte_max: 180
+      long_delta_target: 0.80          # deep ITM stock substitute
+      short_dte_min: 7
+      short_dte_max: 30
+      short_delta_target: 0.27         # OTM income
+      # HARD RULE: short strike must be strictly above the long breakeven
+      # (long.strike + long_debit/share). Enforced in the selector AND the
+      # risk gate (_rule_pmcc_short_above_breakeven).
+      profit_close_pct_short: 50       # close short at 50% of premium captured
+      short_time_close_dte: 1          # close/roll short when it reaches 1 DTE
+      long_roll_dte: 30                # roll the long forward when DTE < this
+      max_capital_per_position_usd: 10000
+      ivr_min: 25                      # lower than the wheel — PMCC tolerates flatter IV
+      # Regime: PMCC long is a bullish bet, gated on csps_allowed (same flag a
+      # CSP uses). PMCC short is covered premium → not regime-gated.
+      # Drawdown circuit breaker — see monthly_wheel.
+      auto_disable_drawdown_usd: -300
+      drawdown_warning_usd: -150

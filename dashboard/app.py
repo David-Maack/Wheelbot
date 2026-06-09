@@ -547,6 +547,14 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                     earnings_warning = True
                     earnings_date_iso = e_date.isoformat()
 
+        # TICKET-015: PMCC two-leg summary (long + optional short, DIFFERENT
+        # expirations) + breakeven. None for non-PMCC rows.
+        pmcc = None
+        if p.strategy_id == "pmcc" and p.state in (
+            PositionState.PMCC_LONG_OPEN, PositionState.PMCC_BOTH_OPEN,
+        ):
+            pmcc = await _pmcc_leg_summary(deps, p, today)
+
         out.append(
             {
                 "symbol": p.symbol,
@@ -561,9 +569,53 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 "last_close_trigger": last_close_trigger,
                 "earnings_warning": earnings_warning,
                 "earnings_date_iso": earnings_date_iso,
+                "pmcc": pmcc,
             }
         )
     return out
+
+
+async def _pmcc_leg_summary(
+    deps: DashboardDeps, position: Any, today: datetime,
+) -> dict[str, Any] | None:
+    """Long + (optional) short leg summary for a PMCC position. The legs have
+    DIFFERENT expirations, so we surface both DTEs distinctly. Breakeven =
+    long strike + per-share debit (the floor the short must clear)."""
+    from core.models import OptionType as _OptionType
+    from strategies.pmcc import latest_filled_order, long_breakeven
+    if position.current_cycle_id is None:
+        return None
+    long_order = await latest_filled_order(
+        deps.repos, position.current_cycle_id, OrderType.BUY_TO_OPEN,
+        option_type=_OptionType.CALL,
+    )
+    if long_order is None:
+        return None
+    long_dte = (
+        (long_order.expiration - today.date()).days
+        if long_order.expiration else None
+    )
+    summary: dict[str, Any] = {
+        "long_strike": long_order.strike,
+        "long_dte": long_dte,
+        "breakeven": long_breakeven(long_order),
+        "short_strike": None,
+        "short_dte": None,
+        "has_short": False,
+    }
+    if position.state == PositionState.PMCC_BOTH_OPEN:
+        short_order = await latest_filled_order(
+            deps.repos, position.current_cycle_id, OrderType.SELL_TO_OPEN,
+            option_type=_OptionType.CALL,
+        )
+        if short_order is not None:
+            summary["short_strike"] = short_order.strike
+            summary["short_dte"] = (
+                (short_order.expiration - today.date()).days
+                if short_order.expiration else None
+            )
+            summary["has_short"] = True
+    return summary
 
 
 async def _multi_leg_dte_and_unrealized(

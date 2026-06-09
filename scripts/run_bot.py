@@ -74,6 +74,8 @@ from intelligence.news_check import news_check as run_news_check
 from strategies import roll_orchestrator
 from strategies.roll_advisor import RollAction, RollContext
 from strategies.iron_condor import propose_all as propose_all_iron_condor
+from strategies.pmcc import propose_all as propose_all_pmcc
+from strategies.pmcc_close import propose_all_closes as propose_all_pmcc_closes
 from strategies.spreads import (
     MultiLegProposal,
     propose_all as propose_all_spreads,
@@ -368,6 +370,19 @@ async def _propose_and_route(
                 broker, repos, config, strategy_universe,
                 strategy=strategy, ivr=ivr,
                 size_multiplier=size_multiplier,
+            )
+            proposals = close_proposals + open_proposals
+        elif strategy.type == "pmcc":
+            # TICKET-015: PMCC. Closes first (short profit/time, long roll),
+            # then opens (long when IDLE, short when LONG_OPEN). All single-leg
+            # Proposals routed via place(). size_multiplier does not apply —
+            # PMCC is sized at 1 long + 1 short per position.
+            close_proposals = await propose_all_pmcc_closes(
+                broker, repos, config, strategy=strategy,
+            )
+            open_proposals = await propose_all_pmcc(
+                broker, repos, config, strategy_universe,
+                strategy=strategy, ivr=ivr,
             )
             proposals = close_proposals + open_proposals
         else:

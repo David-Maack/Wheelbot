@@ -13,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 
 from core.models import (
     DailyState,
+    OptionType,
     Order,
     OrderStatus,
     OrderType,
@@ -81,6 +82,74 @@ async def test_positions_view_renders(app_client):
     assert resp.status_code == 200
     assert "F" in resp.text
     assert "SHARES_HELD" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_positions_renders_pmcc_both_legs(app_client):
+    """TICKET-015: a PMCC_BOTH_OPEN position shows both legs (long + short,
+    different expirations) and the breakeven."""
+    client, deps, _broker = app_client
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await deps.repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                   started_at=now, n_orders=2)
+    )
+    await deps.repos.orders.insert(
+        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
+              order_type=OrderType.BUY_TO_OPEN, contract_symbol="AAPL260116C00140000",
+              strike=140.0, expiration=date(2026, 1, 16), option_type=OptionType.CALL,
+              quantity=1, fill_price=16.0, status=OrderStatus.FILLED,
+              placed_at=now, client_order_id="pl")
+    )
+    await deps.repos.orders.insert(
+        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
+              order_type=OrderType.SELL_TO_OPEN, contract_symbol="AAPL250620C00160000",
+              strike=160.0, expiration=date(2025, 6, 20), option_type=OptionType.CALL,
+              quantity=1, fill_price=1.20, status=OrderStatus.FILLED,
+              placed_at=now, client_order_id="ps")
+    )
+    await deps.repos.positions.insert(
+        Position(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                 state=PositionState.PMCC_BOTH_OPEN, shares=0,
+                 current_cycle_id=cycle_id, state_changed_at=now)
+    )
+    resp = await client.get("/", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    assert "PMCC_BOTH_OPEN" in body
+    assert "L 140.0c" in body          # long leg
+    assert "S 160.0c" in body          # short leg
+    assert "be 156.00" in body         # breakeven = 140 + 16
+
+
+@pytest.mark.asyncio
+async def test_positions_renders_pmcc_long_only(app_client):
+    """A PMCC_LONG_OPEN position (no short yet) shows the long + a 'no short'
+    indicator."""
+    client, deps, _broker = app_client
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await deps.repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                   started_at=now, n_orders=1)
+    )
+    await deps.repos.orders.insert(
+        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
+              order_type=OrderType.BUY_TO_OPEN, contract_symbol="AAPL260116C00140000",
+              strike=140.0, expiration=date(2026, 1, 16), option_type=OptionType.CALL,
+              quantity=1, fill_price=16.0, status=OrderStatus.FILLED,
+              placed_at=now, client_order_id="pl")
+    )
+    await deps.repos.positions.insert(
+        Position(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                 state=PositionState.PMCC_LONG_OPEN, shares=0,
+                 current_cycle_id=cycle_id, state_changed_at=now)
+    )
+    resp = await client.get("/", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    assert "PMCC_LONG_OPEN" in body
+    assert "L 140.0c" in body
+    assert "no short" in body
 
 
 @pytest.mark.asyncio

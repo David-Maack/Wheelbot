@@ -10,9 +10,13 @@ import pytest
 from core.models import (
     OptionContract,
     OptionType,
+    Order,
+    OrderStatus,
     OrderType,
+    Position,
     PositionState,
     UniverseEntry,
+    WheelCycle,
 )
 from execution.router import OrderRouter
 from platforms.paper_broker import PaperBroker
@@ -402,3 +406,96 @@ async def test_multi_leg_news_caution_advisory_proceeds_full_size(db_repos):
     assert news.calls == 1
     assert result.placed is not None
     assert result.placed.quantity == 2  # full size preserved
+
+
+# -- TICKET-015: PMCC single-leg news_check (bullish_long on the long only) -
+
+
+def _pmcc_long_proposal() -> Proposal:
+    """PMCC long = BUY_TO_OPEN call carrying news_check_profile=bullish_long."""
+    today = date(2025, 6, 1)
+    contract = OptionContract(
+        underlying="F", occ_symbol="F260116C00009000", strike=9.0,
+        expiration=today + timedelta(days=120), option_type=OptionType.CALL,
+        bid=1.95, ask=2.05, delta=0.80, open_interest=1000, volume=200,
+    )
+    return Proposal(
+        symbol="F", contract=contract, order_type=OrderType.BUY_TO_OPEN,
+        quantity=1, rationale="pmcc long", strategy_id="pmcc",
+        news_check_profile="bullish_long",
+    )
+
+
+def _pmcc_short_proposal() -> Proposal:
+    """PMCC short = SELL_TO_OPEN call, NO news_check_profile (covered premium)."""
+    today = date(2025, 6, 1)
+    contract = OptionContract(
+        underlying="F", occ_symbol="F250620C00012000", strike=12.0,
+        expiration=today + timedelta(days=14), option_type=OptionType.CALL,
+        bid=0.28, ask=0.32, delta=0.27, open_interest=1000, volume=200,
+    )
+    return Proposal(
+        symbol="F", contract=contract, order_type=OrderType.SELL_TO_OPEN,
+        quantity=1, rationale="pmcc short", strategy_id="pmcc",
+        news_check_profile=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pmcc_long_fires_bullish_long_news(db_repos):
+    """The PMCC long BUY_TO_OPEN is news-checked with the bullish_long profile."""
+    broker = PaperBroker(cash=50_000)
+    news = _NewsStub("proceed")
+    router = OrderRouter(broker, db_repos, _config(), _universe(), news_checker=news)
+    result = await router.place(_pmcc_long_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert news.calls == 1
+    assert news.profiles_seen == ["bullish_long"]
+    assert result.placed is not None
+
+
+@pytest.mark.asyncio
+async def test_pmcc_long_news_block_skips_entry(db_repos):
+    broker = PaperBroker(cash=50_000)
+    news = _NewsStub("block", "earnings tail risk")
+    router = OrderRouter(broker, db_repos, _config(), _universe(), news_checker=news)
+    result = await router.place(_pmcc_long_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert news.calls == 1
+    assert result.placed is None
+    assert result.news_decision == "block"
+
+
+@pytest.mark.asyncio
+async def test_pmcc_short_sell_not_news_checked(db_repos):
+    """The PMCC short SELL_TO_OPEN (covered premium) is NOT news-checked —
+    profile is None and the order isn't SELL_TO_OPEN+PUT. Locks the
+    'don't news_check covered shorts' decision. Seed a covering long so the
+    short passes the risk gate and reaches the (skipped) news step."""
+    from datetime import UTC, datetime
+    _OT = OrderType
+    _now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="F", strategy_id="pmcc",
+                   started_at=_now, n_orders=1)
+    )
+    await db_repos.orders.insert(
+        Order(account_id="test", symbol="F", strategy_id="pmcc", cycle_id=cycle_id,
+              order_type=_OT.BUY_TO_OPEN, contract_symbol="F260116C00009000",
+              strike=9.0, expiration=date(2026, 1, 16), option_type=OptionType.CALL,
+              quantity=1, fill_price=2.0, status=OrderStatus.FILLED,
+              placed_at=_now, client_order_id="pmcc-l")
+    )
+    await db_repos.positions.insert(
+        Position(account_id="test", symbol="F", strategy_id="pmcc",
+                 state=PositionState.PMCC_LONG_OPEN, shares=0,
+                 current_cycle_id=cycle_id, state_changed_at=_now)
+    )
+    cfg = _config()
+    cfg["wheel"]["bid_ask_spread_max_pct"] = 100.0  # loosen liquidity for the test
+    broker = PaperBroker(cash=50_000)
+    news = _NewsStub("block", "would block if asked")
+    router = OrderRouter(broker, db_repos, cfg, _universe(), news_checker=news)
+    # Short strike 12.0 > long breakeven 11.0 → passes the breakeven rule.
+    result = await router.place(_pmcc_short_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert news.calls == 0          # the covered short is NOT news-checked
+    assert result.placed is not None
+    assert result.news_decision is None

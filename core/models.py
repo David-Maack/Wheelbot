@@ -33,6 +33,16 @@ class PositionState(StrEnum):
     SPREAD_CLOSED = "SPREAD_CLOSED"
     # Both legs ITM at expiry — defined max loss already realized.
     SPREAD_ASSIGNED = "SPREAD_ASSIGNED"
+    # TICKET-015: Poor Man's Covered Call. A long deep-ITM LEAP call persists
+    # across MANY short calls within one cycle. The long is bought first
+    # (LONG_PENDING → LONG_OPEN), then shorts are sold against it
+    # (SHORT_PENDING → BOTH_OPEN); each short close returns to LONG_OPEN with
+    # the cycle still open. CLOSING is the transient full-unwind state.
+    PMCC_LONG_PENDING = "PMCC_LONG_PENDING"
+    PMCC_LONG_OPEN = "PMCC_LONG_OPEN"
+    PMCC_SHORT_PENDING = "PMCC_SHORT_PENDING"
+    PMCC_BOTH_OPEN = "PMCC_BOTH_OPEN"
+    PMCC_CLOSING = "PMCC_CLOSING"
     BROKER_DOWN = "BROKER_DOWN"
     MANUAL_INTERVENTION = "MANUAL_INTERVENTION"
     KILLED = "KILLED"
@@ -80,6 +90,12 @@ class CycleOutcome(StrEnum):
     IRON_CONDOR_EXPIRED_PROFIT = "IRON_CONDOR_EXPIRED_PROFIT"   # all 4 legs OTM at expiry, full credit kept
     IRON_CONDOR_CLOSED_PROFIT = "IRON_CONDOR_CLOSED_PROFIT"     # closed at profit_close_pct
     IRON_CONDOR_CLOSED_LOSS = "IRON_CONDOR_CLOSED_LOSS"         # closed at a loss (stop/time)
+    # TICKET-015: PMCC. One cycle = one long call's lifetime (many shorts).
+    PMCC_SHORT_EXPIRED_PROFIT = "PMCC_SHORT_EXPIRED_PROFIT"     # a short call expired OTM (cycle continues)
+    PMCC_SHORT_CLOSED_PROFIT = "PMCC_SHORT_CLOSED_PROFIT"       # a short bought back at profit (cycle continues)
+    PMCC_SHORT_CLOSED_LOSS = "PMCC_SHORT_CLOSED_LOSS"           # a short bought back at a loss (cycle continues)
+    PMCC_LONG_ROLLED = "PMCC_LONG_ROLLED"                       # long closed + rolled forward → cycle ends, new cycle opens
+    PMCC_FULL_CLOSED = "PMCC_FULL_CLOSED"                       # full unwind → cycle ends
     MANUAL_CLOSE = "MANUAL_CLOSE"
 
 

@@ -8,7 +8,24 @@
     {% for r in rows %}
     <tr>
       <td>{{ r.symbol }}{% if r.earnings_warning %} <span class="warn-earnings" title="Earnings inside remaining DTE: {{ r.earnings_date_iso }}">⚠</span>{% endif %}</td>
-      <td><code>{{ r.strategy_id or "—" }}</code></td>
+      <td>
+        <code>{{ r.strategy_id or "—" }}</code>
+        {% if r.pmcc %}
+          <div class="pmcc-legs">
+            <span title="Long LEAP">L {{ r.pmcc.long_strike }}c
+              {% if r.pmcc.long_dte is not none %}({{ r.pmcc.long_dte }}d){% endif %}</span>
+            {% if r.pmcc.has_short %}
+              <span title="Short call">/ S {{ r.pmcc.short_strike }}c
+                {% if r.pmcc.short_dte is not none %}({{ r.pmcc.short_dte }}d){% endif %}</span>
+            {% else %}
+              <span class="caption">/ no short</span>
+            {% endif %}
+            {% if r.pmcc.breakeven is not none %}
+              <span class="caption">be {{ "%.2f"|format(r.pmcc.breakeven) }}</span>
+            {% endif %}
+          </div>
+        {% endif %}
+      </td>
       <td><code>{{ r.state }}</code></td>
       <td>{{ r.days_in_state }}</td>
       <td>{% if r.last_close_trigger %}<span class="trigger trigger-{{ r.last_close_trigger }}">{{ r.last_close_trigger }}</span>{% else %}—{% endif %}</td>

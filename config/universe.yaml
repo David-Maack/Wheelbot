@@ -123,13 +123,15 @@ tickers:
   - symbol: AAPL
     name: "Apple"
     tier: 1
-    strategies: [put_spread]
-    notes: "Mega-cap, tight option spreads."
+    # TICKET-015: pmcc added — quality mega-cap the cash-secured account can't
+    # wheel outright (200 shares ≈ $40k); the LEAP-based PMCC substitutes.
+    strategies: [put_spread, pmcc]
+    notes: "Mega-cap, tight option spreads. PMCC long-LEAP target."
 
   - symbol: MSFT
     name: "Microsoft"
     tier: 1
-    strategies: [put_spread]
+    strategies: [put_spread, pmcc]
 
   - symbol: META
     name: "Meta Platforms"
@@ -139,7 +141,7 @@ tickers:
   - symbol: GOOGL
     name: "Alphabet"
     tier: 1
-    strategies: [put_spread]
+    strategies: [put_spread, pmcc]
 
   - symbol: TSLA
     name: "Tesla"
@@ -163,15 +165,17 @@ tickers:
     # That accident does NOT happen with iron_condor since the condor is
     # itself a defined-risk structure with both wings — there's no implicit
     # leftover from one strategy that could combine with another.
-    strategies: [put_spread, iron_condor]
-    notes: "Broad-market hedge candidate too. Iron condor target — deepest liquidity."
+    # TICKET-015: pmcc added — index LEAP substitute. Each strategy on SPY
+    # holds independent, separately-keyed positions.
+    strategies: [put_spread, iron_condor, pmcc]
+    notes: "Broad-market hedge candidate too. Iron condor + PMCC target — deepest liquidity."
 
   - symbol: QQQ
     name: "NASDAQ-100 ETF"
     tier: 1
-    # TICKET-014: see SPY for the overlap rationale.
-    strategies: [put_spread, iron_condor]
-    notes: "Tech-heavy ETF with deep options chain. Iron condor target."
+    # TICKET-014/015: see SPY for the overlap rationale.
+    strategies: [put_spread, iron_condor, pmcc]
+    notes: "Tech-heavy ETF with deep options chain. Iron condor + PMCC target."
 
   - symbol: AMD
     name: "Advanced Micro Devices"

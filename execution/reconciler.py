@@ -129,6 +129,13 @@ _DIFF_ONE_NO_TRANSITION_STATES: frozenset[PositionState] = frozenset({
     PositionState.CALLED_AWAY,
     PositionState.SPREAD_CLOSED,
     PositionState.SPREAD_ASSIGNED,
+    # TICKET-015 PMCC: the two *_PENDING states are driven by _on_fill
+    # (PENDING → OPEN on observed fill); CLOSING is the transient full-unwind
+    # state driven by _on_fill of the long SELL_TO_CLOSE. The two ACTIVE PMCC
+    # states (PMCC_LONG_OPEN, PMCC_BOTH_OPEN) get explicit _diff_one branches.
+    PositionState.PMCC_LONG_PENDING,
+    PositionState.PMCC_SHORT_PENDING,
+    PositionState.PMCC_CLOSING,
     PositionState.BROKER_DOWN,
     PositionState.MANUAL_INTERVENTION,
     PositionState.KILLED,
@@ -389,6 +396,14 @@ class Reconciler:
         )
         fill_price = broker_view.fill_price if broker_view.fill_price is not None else (local.limit_price or 0.0)
 
+        # TICKET-015: PMCC fills follow their own lifecycle — the long LEAP
+        # persists across many short calls within ONE cycle. Dispatch them
+        # before the wheel/spread order-type chain so the wheel CSP/CC path
+        # below stays byte-identical (the strategy_id guard is the firewall).
+        if local.strategy_id == "pmcc":
+            await self._on_pmcc_fill(local, position, fill_price, summary)
+            return
+
         if local.order_type == OrderType.MULTI_LEG_OPEN:
             cycle_id = await self._open_cycle_for_spread(local, fill_price, summary)
             await self._set_position_state(
@@ -514,6 +529,147 @@ class Reconciler:
                 f"{local.order_type} ({local.client_order_id})",
                 summary,
             )
+
+    # -- PMCC fill dispatch (TICKET-015) --------------------------------------
+
+    async def _on_pmcc_fill(
+        self,
+        local: Order,
+        position: Position | None,
+        fill_price: float,
+        summary: ReconcileSummary,
+    ) -> None:
+        """Route a PMCC fill. The long LEAP is bought first (BUY_TO_OPEN call)
+        and persists across many short calls (SELL_TO_OPEN / BUY_TO_CLOSE)
+        within ONE cycle. Closing the long (SELL_TO_CLOSE call) ends the cycle.
+
+        Every leg here is an option (option_type set), so _compute_cycle_pnl
+        prices them all at 100x via the TICKET-014.5 is_option discriminator —
+        PMCC P&L needs no special handling in the P&L computer.
+        """
+        symbol = local.symbol
+        ot = local.order_type
+        is_call = local.option_type == OptionType.CALL
+        existing_cycle = position.current_cycle_id if position else None
+
+        if ot == OrderType.BUY_TO_OPEN and is_call:
+            # Long LEAP opened → open a PMCC cycle → PMCC_LONG_OPEN.
+            cycle_id = await self._open_cycle_for_pmcc_long(local, fill_price, summary)
+            await self._set_position_state(
+                position, symbol, PositionState.PMCC_LONG_OPEN,
+                f"fill:{local.client_order_id}",
+                cycle_id=cycle_id or existing_cycle,
+                strategy_id=local.strategy_id,
+            )
+            if cycle_id is not None and local.id is not None:
+                await self._repos.orders.update(local.id, cycle_id=cycle_id)
+            return
+
+        if ot == OrderType.SELL_TO_OPEN and is_call:
+            # Short call sold against the long → PMCC_BOTH_OPEN, SAME cycle.
+            await self._set_position_state(
+                position, symbol, PositionState.PMCC_BOTH_OPEN,
+                f"fill:{local.client_order_id}",
+                cycle_id=existing_cycle,
+                strategy_id=local.strategy_id,
+            )
+            if existing_cycle is not None and local.id is not None:
+                await self._repos.orders.update(local.id, cycle_id=existing_cycle)
+            return
+
+        if ot == OrderType.BUY_TO_CLOSE and is_call:
+            # Short bought back → PMCC_LONG_OPEN, cycle CONTINUES (the long
+            # persists; many shorts per cycle). Tag the buyback so its debit
+            # is captured in cycle P&L (mirrors the CC-buyback pattern).
+            if existing_cycle is not None and local.id is not None and local.cycle_id is None:
+                await self._repos.orders.update(local.id, cycle_id=existing_cycle)
+            await self._set_position_state(
+                position, symbol, PositionState.PMCC_LONG_OPEN,
+                f"close:{local.client_order_id}",
+                cycle_id=existing_cycle,
+                strategy_id=local.strategy_id,
+            )
+            return
+
+        if ot == OrderType.SELL_TO_CLOSE and is_call:
+            # Long LEAP closed → the cycle ENDS. trigger_reason distinguishes a
+            # roll (PMCC_LONG_ROLLED — a new long opens a fresh cycle next) from
+            # a full unwind (PMCC_FULL_CLOSED). NOTE: if a roll's new-long open
+            # later fails to fill, the cycle is still correctly closed/labelled
+            # "rolled" — a cosmetic inaccuracy, not a state bug (you are flat).
+            if existing_cycle is not None and local.id is not None and local.cycle_id is None:
+                await self._repos.orders.update(local.id, cycle_id=existing_cycle)
+            outcome = (
+                CycleOutcome.PMCC_LONG_ROLLED
+                if (local.trigger_reason or "").startswith("pmcc_roll")
+                else CycleOutcome.PMCC_FULL_CLOSED
+            )
+            await self._set_position_state(
+                position, symbol, PositionState.IDLE,
+                f"close:{local.client_order_id}",
+                strategy_id=local.strategy_id,
+            )
+            if existing_cycle is not None:
+                await self._close_cycle(existing_cycle, outcome, summary)
+                if position is not None and position.id is not None:
+                    await self._repos.positions.update(position.id, current_cycle_id=None)
+            return
+
+        # Unhandled PMCC fill shape (e.g. a PUT, or option_type missing) —
+        # flag rather than silently skip.
+        log_checkpoint(
+            "reconcile_pmcc_unhandled_fill",
+            status="fail",
+            symbol=symbol,
+            order_type=ot.value if hasattr(ot, "value") else str(ot),
+            option_type=str(local.option_type),
+            client_order_id=local.client_order_id,
+        )
+        await self._flag_manual_intervention(
+            symbol,
+            f"_on_pmcc_fill: unhandled fill {ot}/{local.option_type} "
+            f"({local.client_order_id})",
+            summary,
+        )
+
+    async def _open_cycle_for_pmcc_long(
+        self, order: Order, fill_price: float, summary: ReconcileSummary,
+    ) -> int | None:
+        """Open a PMCC cycle on the long-LEAP fill. `fill_price` is the
+        per-share debit paid; defined max loss = the debit. Reuses the
+        WheelCycle fields (initial_csp_strike = long strike, initial_csp_premium
+        = debit paid as a negative cash flow, initial_capital_at_risk = debit)."""
+        if order.order_type != OrderType.BUY_TO_OPEN:
+            return None
+        debit = abs(fill_price)
+        qty = order.quantity or 1
+        cycle = WheelCycle(
+            account_id=self._account_id,
+            symbol=order.symbol,
+            strategy_id=order.strategy_id,
+            started_at=_utcnow(),
+            initial_csp_strike=order.strike,
+            initial_csp_premium=-debit * 100 * qty,
+            initial_capital_at_risk=debit * 100 * qty,
+            n_orders=1,
+        )
+        cycle_id = await self._repos.cycles.insert(cycle)
+        summary.cycles_opened += 1
+        return cycle_id
+
+    async def _on_pmcc_short_expiration(
+        self, local: Position, summary: ReconcileSummary,
+    ) -> None:
+        """A PMCC short call expired OTM — keep the full premium, return to
+        PMCC_LONG_OPEN. The cycle CONTINUES (the long persists); we do NOT
+        close it. The short's premium is already captured by its SELL_TO_OPEN
+        fill in the cycle's order set, so no synthetic order is needed."""
+        summary.expirations_processed += 1
+        await self._set_position_state(
+            local, local.symbol, PositionState.PMCC_LONG_OPEN,
+            "pmcc_short_expired_otm",
+            strategy_id=local.strategy_id,
+        )
 
     async def _on_cancel(
         self,
@@ -792,6 +948,44 @@ class Reconciler:
 
         if local.state == PositionState.SPREAD_PENDING:
             # No state-shape transition; _on_fill drives PENDING → OPEN.
+            return
+
+        # TICKET-015 PMCC. The long LEAP is invisible at the broker on
+        # PaperBroker (only short legs are surfaced as rows; real brokers do
+        # report longs but never as CC_OPEN/SHARES_HELD). So these branches
+        # key on has_short_call / has_shares — robust whether or not the long
+        # row is present.
+        if local.state == PositionState.PMCC_LONG_OPEN:
+            # Expected shape: long alive (invisible) + no short + no shares.
+            # Shares appearing here means the long was exercised/assigned or
+            # something unexpected happened — hand to a human. A short call
+            # row appearing is the short-sale fill, which _on_fill drives.
+            if has_shares:
+                await self._flag_manual_intervention(
+                    local.symbol,
+                    f"PMCC {local.symbol} shows shares={total_shares} in "
+                    "PMCC_LONG_OPEN — long exercised/assigned? review",
+                    summary,
+                )
+            return
+
+        if local.state == PositionState.PMCC_BOTH_OPEN:
+            # Short assignment surfaces as stock at the broker. Rare (the short
+            # strike sits above the long's breakeven) and profitable, but the
+            # covered-exercise math is NOT auto-reconciled in v1 — flag it (D3).
+            if has_shares:
+                await self._flag_manual_intervention(
+                    local.symbol,
+                    f"PMCC {local.symbol} shows shares={total_shares} — short "
+                    "call likely assigned; exercise long to cover (manual)",
+                    summary,
+                )
+                return
+            if has_short_call:
+                return  # short still alive — both legs open
+            # No short, no shares → the short call expired worthless. Keep the
+            # premium, return to PMCC_LONG_OPEN; the cycle CONTINUES.
+            await self._on_pmcc_short_expiration(local, summary)
             return
 
         # TICKET-014.5: explicit exhaustive guard. States that intentionally

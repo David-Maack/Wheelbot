@@ -807,6 +807,9 @@ _DIFF_ONE_HANDLED_STATES = frozenset({
     PositionState.CC_PENDING,
     PositionState.SPREAD_OPEN,
     PositionState.SPREAD_PENDING,
+    # TICKET-015 PMCC active states with explicit _diff_one branches.
+    PositionState.PMCC_LONG_OPEN,
+    PositionState.PMCC_BOTH_OPEN,
 })
 
 
@@ -968,3 +971,243 @@ async def test_compute_cycle_pnl_synthetic_stock_leg_priced_1x(db_repos):
     pnl = await rec._compute_cycle_pnl(cycle_id)
     # BUY (debit), stock 1x: -1 * 9.0 * 100 * 1 = -900
     assert pnl == pytest.approx(-900.0)
+
+
+# -- TICKET-015 PMCC: Phase A reconciler lifecycle -------------------------
+
+
+def _pmcc_order(
+    order_type: OrderType,
+    option_type: OptionType,
+    strike: float,
+    *,
+    fill_price: float,
+    client_id: str,
+    trigger_reason: str | None = None,
+    quantity: int = 1,
+    cycle_id: int | None = None,
+) -> Order:
+    return Order(
+        account_id="test", symbol="AAPL", strategy_id="pmcc",
+        cycle_id=cycle_id,
+        order_type=order_type,
+        contract_symbol=f"AAPL260116{'C' if option_type == OptionType.CALL else 'P'}{int(strike*1000):08d}",
+        strike=strike, expiration=date(2026, 1, 16), option_type=option_type,
+        quantity=quantity, fill_price=fill_price,
+        status=OrderStatus.FILLED, placed_at=_utc(),
+        client_order_id=client_id, trigger_reason=trigger_reason,
+    )
+
+
+async def _seed_pmcc_position(db_repos, state: PositionState, cycle_id: int | None = None):
+    await db_repos.positions.insert(
+        Position(
+            account_id="test", symbol="AAPL", strategy_id="pmcc",
+            state=state, shares=0, current_cycle_id=cycle_id,
+            state_changed_at=_utc(),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_pmcc_long_fill_opens_cycle_and_long_open(db_repos):
+    """BUY_TO_OPEN call (pmcc) → PMCC_LONG_OPEN + a new cycle, with the long
+    debit recorded as capital-at-risk."""
+    broker = PaperBroker()
+    await _seed_pmcc_position(db_repos, PositionState.IDLE)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    order = _pmcc_order(OrderType.BUY_TO_OPEN, OptionType.CALL, 150.0,
+                        fill_price=5.00, client_id="pmcc-long-1")
+    await rec._on_fill(order, order, summary)
+
+    pos = await db_repos.positions.get_by_symbol("test", "AAPL", strategy_id="pmcc")
+    assert pos.state == PositionState.PMCC_LONG_OPEN
+    assert pos.current_cycle_id is not None
+    assert summary.cycles_opened == 1
+    cyc = await db_repos.cycles.get(pos.current_cycle_id)
+    assert cyc.initial_csp_strike == 150.0
+    # debit 5.00 * 100 * 1 = 500 at risk; premium recorded as -500 (paid out).
+    assert cyc.initial_capital_at_risk == pytest.approx(500.0)
+    assert cyc.initial_csp_premium == pytest.approx(-500.0)
+
+
+@pytest.mark.asyncio
+async def test_pmcc_short_sell_transitions_to_both_open(db_repos):
+    """From PMCC_LONG_OPEN, a SELL_TO_OPEN call → PMCC_BOTH_OPEN, same cycle."""
+    broker = PaperBroker()
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                   started_at=_utc(), n_orders=1)
+    )
+    await _seed_pmcc_position(db_repos, PositionState.PMCC_LONG_OPEN, cycle_id)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    order = _pmcc_order(OrderType.SELL_TO_OPEN, OptionType.CALL, 165.0,
+                        fill_price=1.20, client_id="pmcc-short-1")
+    await rec._on_fill(order, order, summary)
+
+    pos = await db_repos.positions.get_by_symbol("test", "AAPL", strategy_id="pmcc")
+    assert pos.state == PositionState.PMCC_BOTH_OPEN
+    assert pos.current_cycle_id == cycle_id  # same cycle
+
+
+@pytest.mark.asyncio
+async def test_pmcc_short_close_returns_to_long_open_same_cycle(db_repos):
+    """From PMCC_BOTH_OPEN, a BUY_TO_CLOSE call → PMCC_LONG_OPEN; the cycle
+    persists (the long lives on)."""
+    broker = PaperBroker()
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                   started_at=_utc(), n_orders=2)
+    )
+    await _seed_pmcc_position(db_repos, PositionState.PMCC_BOTH_OPEN, cycle_id)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    order = _pmcc_order(OrderType.BUY_TO_CLOSE, OptionType.CALL, 165.0,
+                        fill_price=0.40, client_id="pmcc-short-close-1")
+    await rec._on_fill(order, order, summary)
+
+    pos = await db_repos.positions.get_by_symbol("test", "AAPL", strategy_id="pmcc")
+    assert pos.state == PositionState.PMCC_LONG_OPEN
+    assert pos.current_cycle_id == cycle_id  # cycle NOT closed
+    assert summary.cycles_closed == 0
+
+
+@pytest.mark.asyncio
+async def test_pmcc_multiple_shorts_one_cycle(db_repos):
+    """Long open → sell short → buy back → sell another short. All one cycle —
+    proves the long-persists-across-shorts invariant."""
+    broker = PaperBroker()
+    await _seed_pmcc_position(db_repos, PositionState.IDLE)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+
+    long = _pmcc_order(OrderType.BUY_TO_OPEN, OptionType.CALL, 150.0,
+                       fill_price=5.00, client_id="pmcc-long")
+    await rec._on_fill(long, long, summary)
+    pos = await db_repos.positions.get_by_symbol("test", "AAPL", strategy_id="pmcc")
+    cycle_id = pos.current_cycle_id
+
+    short1 = _pmcc_order(OrderType.SELL_TO_OPEN, OptionType.CALL, 165.0,
+                         fill_price=1.20, client_id="pmcc-s1")
+    await rec._on_fill(short1, short1, summary)
+    close1 = _pmcc_order(OrderType.BUY_TO_CLOSE, OptionType.CALL, 165.0,
+                         fill_price=0.40, client_id="pmcc-c1")
+    await rec._on_fill(close1, close1, summary)
+    short2 = _pmcc_order(OrderType.SELL_TO_OPEN, OptionType.CALL, 167.0,
+                         fill_price=1.10, client_id="pmcc-s2")
+    await rec._on_fill(short2, short2, summary)
+
+    pos = await db_repos.positions.get_by_symbol("test", "AAPL", strategy_id="pmcc")
+    assert pos.state == PositionState.PMCC_BOTH_OPEN
+    assert pos.current_cycle_id == cycle_id   # still the original cycle
+    assert summary.cycles_opened == 1
+    assert summary.cycles_closed == 0
+
+
+@pytest.mark.asyncio
+async def test_pmcc_long_close_full_ends_cycle(db_repos):
+    """SELL_TO_CLOSE long (no roll reason) → IDLE + cycle closed PMCC_FULL_CLOSED."""
+    broker = PaperBroker()
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                   started_at=_utc(), n_orders=1)
+    )
+    await _seed_pmcc_position(db_repos, PositionState.PMCC_LONG_OPEN, cycle_id)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    order = _pmcc_order(OrderType.SELL_TO_CLOSE, OptionType.CALL, 150.0,
+                        fill_price=6.50, client_id="pmcc-long-close")
+    await rec._on_fill(order, order, summary)
+
+    pos = await db_repos.positions.get_by_symbol("test", "AAPL", strategy_id="pmcc")
+    assert pos.state == PositionState.IDLE
+    assert pos.current_cycle_id is None
+    assert summary.cycles_closed == 1
+    cyc = await db_repos.cycles.get(cycle_id)
+    assert cyc.cycle_outcome == CycleOutcome.PMCC_FULL_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_pmcc_long_close_roll_tags_rolled(db_repos):
+    """SELL_TO_CLOSE long with trigger_reason 'pmcc_roll' → PMCC_LONG_ROLLED."""
+    broker = PaperBroker()
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                   started_at=_utc(), n_orders=1)
+    )
+    await _seed_pmcc_position(db_repos, PositionState.PMCC_LONG_OPEN, cycle_id)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    order = _pmcc_order(OrderType.SELL_TO_CLOSE, OptionType.CALL, 150.0,
+                        fill_price=6.50, client_id="pmcc-roll",
+                        trigger_reason="pmcc_roll_dte")
+    await rec._on_fill(order, order, summary)
+
+    cyc = await db_repos.cycles.get(cycle_id)
+    assert cyc.cycle_outcome == CycleOutcome.PMCC_LONG_ROLLED
+
+
+@pytest.mark.asyncio
+async def test_pmcc_short_expiration_via_diff_one(db_repos):
+    """In PMCC_BOTH_OPEN, broker shows no short call + no shares → the short
+    expired worthless → _diff_one returns to PMCC_LONG_OPEN, cycle continues."""
+    broker = PaperBroker()
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                   started_at=_utc(), n_orders=2)
+    )
+    await _seed_pmcc_position(db_repos, PositionState.PMCC_BOTH_OPEN, cycle_id)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    local = await db_repos.positions.get_by_symbol("test", "AAPL", strategy_id="pmcc")
+    # No broker rows → no short, no shares.
+    await rec._diff_one("AAPL", local, [], summary)
+
+    pos = await db_repos.positions.get_by_symbol("test", "AAPL", strategy_id="pmcc")
+    assert pos.state == PositionState.PMCC_LONG_OPEN
+    assert pos.current_cycle_id == cycle_id   # cycle preserved
+
+
+@pytest.mark.asyncio
+async def test_pmcc_short_assignment_flags_manual(db_repos):
+    """In PMCC_BOTH_OPEN, shares appearing at the broker = short assignment →
+    flag MANUAL_INTERVENTION (D3: covered-exercise math not auto-reconciled)."""
+    broker = PaperBroker()
+    await _seed_pmcc_position(db_repos, PositionState.PMCC_BOTH_OPEN)
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    local = await db_repos.positions.get_by_symbol("test", "AAPL", strategy_id="pmcc")
+    broker_row = Position(
+        account_id="test", symbol="AAPL", state=PositionState.SHARES_HELD,
+        shares=100, state_changed_at=_utc(),
+    )
+    await rec._diff_one("AAPL", local, [broker_row], summary)
+    assert summary.manual_interventions == 1
+
+
+@pytest.mark.asyncio
+async def test_pmcc_full_pnl_across_long_and_shorts(db_repos):
+    """Full PMCC cycle P&L: long debit + short credits/debits + long sale, all
+    priced at 100x (TICKET-014.5 is_option discriminator). Proves PMCC P&L
+    needs no special handling in _compute_cycle_pnl."""
+    rec = Reconciler(PaperBroker(), db_repos, _config())
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                   started_at=_utc(), n_orders=4)
+    )
+    for o in [
+        _pmcc_order(OrderType.BUY_TO_OPEN, OptionType.CALL, 150.0,
+                    fill_price=5.00, client_id="l", cycle_id=cycle_id),    # -500
+        _pmcc_order(OrderType.SELL_TO_OPEN, OptionType.CALL, 165.0,
+                    fill_price=1.00, client_id="s1", cycle_id=cycle_id),   # +100
+        _pmcc_order(OrderType.BUY_TO_CLOSE, OptionType.CALL, 165.0,
+                    fill_price=0.40, client_id="c1", cycle_id=cycle_id),   # -40
+        _pmcc_order(OrderType.SELL_TO_CLOSE, OptionType.CALL, 150.0,
+                    fill_price=6.50, client_id="lc", cycle_id=cycle_id),   # +650
+    ]:
+        await db_repos.orders.insert(o)
+    pnl = await rec._compute_cycle_pnl(cycle_id)
+    # -500 + 100 - 40 + 650 = +210
+    assert pnl == pytest.approx(210.0)

@@ -33,7 +33,14 @@ from strategies.spreads import MultiLegProposal
 from strategies.wheel import Proposal
 
 
-_OPEN_ORDER_TYPES = (OrderType.SELL_TO_OPEN, OrderType.MULTI_LEG_OPEN)
+# TICKET-015: BUY_TO_OPEN joins the open set — PMCC's long-LEAP entry is the
+# first routed BUY_TO_OPEN (synthetic stock legs are inserted, never routed).
+# This makes PMCC long opens respect the entry-window cutoff like any entry.
+_OPEN_ORDER_TYPES = (
+    OrderType.SELL_TO_OPEN,
+    OrderType.BUY_TO_OPEN,
+    OrderType.MULTI_LEG_OPEN,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +167,23 @@ def _router_config(config: dict[str, Any]) -> RouterConfig:
     )
 
 
-def _pending_state_for(order_type: OrderType, contract_is_put: bool) -> PositionState:
+def _pending_state_for(
+    order_type: OrderType,
+    contract_is_put: bool,
+    strategy_id: str | None = None,
+) -> PositionState:
+    # TICKET-015: PMCC has its own pending states. long=BUY_TO_OPEN call,
+    # short=SELL_TO_OPEN call, long-close=SELL_TO_CLOSE call (transient
+    # CLOSING), short-close=BUY_TO_CLOSE (no state change; reconciler drives
+    # PMCC_BOTH_OPEN → PMCC_LONG_OPEN on the observed fill).
+    if strategy_id == "pmcc":
+        if order_type == OrderType.BUY_TO_OPEN:
+            return PositionState.PMCC_LONG_PENDING
+        if order_type == OrderType.SELL_TO_OPEN:
+            return PositionState.PMCC_SHORT_PENDING
+        if order_type == OrderType.SELL_TO_CLOSE:
+            return PositionState.PMCC_CLOSING
+        return PositionState.PMCC_BOTH_OPEN  # BUY_TO_CLOSE short — held until fill
     # SELL_TO_OPEN of a put → CSP_PENDING; of a call → CC_PENDING.
     # BUY_TO_CLOSE returns the position to its prior state on fill, so we don't
     # change state here for closes; we keep it CSP_OPEN/CC_OPEN until reconciler
@@ -305,12 +328,25 @@ class OrderRouter:
         effective_qty = proposal.quantity
         from core.models import OptionType
 
-        if (
-            self._news_checker is not None
-            and proposal.order_type == OrderType.SELL_TO_OPEN
+        # Wheel CSP path is byte-identical (SELL_TO_OPEN + PUT, no profile).
+        # TICKET-015 adds a disjoint branch: a single-leg OPEN that carries a
+        # news_check_profile (PMCC long BUY_TO_OPEN) fires news_check with that
+        # profile. The two conditions can never both be true — a wheel CSP is
+        # SELL_TO_OPEN+PUT with profile=None; a PMCC long is BUY_TO_OPEN+CALL
+        # with profile set.
+        _profile = getattr(proposal, "news_check_profile", None)
+        _is_wheel_csp = (
+            proposal.order_type == OrderType.SELL_TO_OPEN
             and proposal.contract.option_type == OptionType.PUT
-        ):
-            check = await self._news_checker(proposal.symbol)
+        )
+        _is_profiled_open = (
+            _profile is not None and proposal.order_type in _OPEN_ORDER_TYPES
+        )
+        if self._news_checker is not None and (_is_wheel_csp or _is_profiled_open):
+            if _is_wheel_csp:
+                check = await self._news_checker(proposal.symbol)
+            else:
+                check = await self._news_checker(proposal.symbol, _profile)
             news_decision = getattr(check, "decision", None)
             news_rationale = getattr(check, "rationale", None)
             log_checkpoint(
@@ -718,11 +754,36 @@ class OrderRouter:
 
         account_id = self._config.get("account", {}).get("id", "primary")
         contract_is_put = proposal.contract.option_type == OptionType.PUT
-        new_state = _pending_state_for(proposal.order_type, contract_is_put)
+        new_state = _pending_state_for(
+            proposal.order_type, contract_is_put, proposal.strategy_id,
+        )
         existing = await self._repos.positions.get_by_symbol(
             account_id, proposal.symbol, strategy_id=proposal.strategy_id
         )
         now = _utcnow()
+        # TICKET-015: PMCC short-close (BUY_TO_CLOSE) leaves state unchanged —
+        # the reconciler drives PMCC_BOTH_OPEN → PMCC_LONG_OPEN on the fill.
+        if proposal.strategy_id == "pmcc" and proposal.order_type == OrderType.BUY_TO_CLOSE:
+            return
+        if proposal.strategy_id == "pmcc":
+            if existing is None:
+                await self._repos.positions.insert(
+                    Position(
+                        account_id=account_id,
+                        symbol=proposal.symbol,
+                        strategy_id=proposal.strategy_id,
+                        state=new_state,
+                        shares=0,
+                        state_changed_at=now,
+                        state_change_reason=f"router_pending:{placed.client_order_id}",
+                    )
+                )
+            elif existing.id is not None:
+                await self._repos.positions.update_state(
+                    existing.id, new_state,
+                    f"router_pending:{placed.client_order_id}", when=now,
+                )
+            return
         if existing is None:
             await self._repos.positions.insert(
                 Position(

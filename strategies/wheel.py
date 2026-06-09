@@ -47,6 +47,12 @@ class Proposal:
     # Structured close-reason tag for BUY_TO_CLOSE proposals (TICKET-005).
     # Plumbed through the router into orders.trigger_reason. None for entries.
     trigger_reason: str | None = None
+    # TICKET-015: per-strategy news_check prompt profile for single-leg opens.
+    # None (default) = legacy behavior: news_check fires only on the wheel CSP
+    # path (SELL_TO_OPEN + PUT) using bullish_csp. When set (PMCC long uses
+    # "bullish_long"), the router fires news_check on that open with the named
+    # profile. Mirrors MultiLegProposal.news_check_profile.
+    news_check_profile: str | None = None
 
 
 def _tier_flags(symbol: str, universe: dict[str, Any]) -> tuple[bool, bool]:
