@@ -301,6 +301,24 @@ async def test_pmcc_position_cap_passes_within_cap(db_repos):
 
 
 @pytest.mark.asyncio
+async def test_pmcc_long_not_macro_blocked(db_repos):
+    """A PMCC long (BUY_TO_OPEN, 90-180 DTE) must NOT be macro-blackout-gated —
+    its lifespan always spans a monthly macro event, which would block it
+    perpetually. Macro blackout is a short-premium gate; a long isn't short
+    premium. Regression for the strategy-killing bug."""
+    from risk.limits import RiskCheckResult, RiskGate
+    cfg = _risk_config()
+    cfg["risk"] = {"macro_blackout": {"enabled": True, "event_types": ["FOMC", "CPI", "NFP"]}}
+    gate = RiskGate(PaperBroker(cash=100_000), db_repos, cfg, _universe())
+    proposal = _pmcc_proposal(OrderType.BUY_TO_OPEN, 130.0, 30.0)
+    result = RiskCheckResult(proposal=proposal)
+    await gate._rule_macro_blackout(result, proposal, date(2025, 6, 1))
+    statuses = {r.rule: r.status for r in result.results}
+    # Skipped (long-option open), NOT failed.
+    assert statuses["macro_blackout"] == "skip"
+
+
+@pytest.mark.asyncio
 async def test_pmcc_short_below_breakeven_blocked_by_rule(db_repos):
     from risk.limits import RiskCheckResult, RiskGate
     # Seed a PMCC_LONG_OPEN with long strike 140 + debit 16 → breakeven 156.

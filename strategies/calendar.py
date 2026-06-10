@@ -34,7 +34,7 @@ from typing import Any
 
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
-from core.models import OptionContract, OptionType, OrderLeg, OrderType, PositionState
+from core.models import OptionContract, OrderLeg, OrderType, PositionState
 from core.strategies import StrategyDefinition
 from data.chain import ChainFilters, fetch_filtered_chain
 from data.ivr import IVRProvider

@@ -36,7 +36,7 @@ from typing import Any
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.config import effective_wheel_params
-from core.models import OptionType, OrderStatus, OrderType, PositionState
+from core.models import OptionType, OrderStatus, OrderType
 from data.earnings import in_blackout
 from db.repo import Repos
 from strategies.spreads import MultiLegProposal
@@ -767,6 +767,14 @@ class RiskGate:
         """
         if _is_close(proposal):
             result.add("macro_blackout", "skip", "close — not gated by macro events")
+            return
+        # TICKET-015: a long-option OPEN (the PMCC LEAP, BUY_TO_OPEN) is not
+        # short premium — a macro gap caps a buyer's risk at the debit, unlike a
+        # seller's. And a 90-180 DTE long's lifespan ALWAYS spans a monthly
+        # macro event, which would block the PMCC long perpetually. Skip it
+        # (the directional risk is covered by the bullish_long news_check).
+        if proposal.order_type == OrderType.BUY_TO_OPEN:
+            result.add("macro_blackout", "skip", "long-option open — not short premium")
             return
         cfg = (self._config.get("risk", {}) or {}).get("macro_blackout", {}) or {}
         if not bool(cfg.get("enabled", False)):

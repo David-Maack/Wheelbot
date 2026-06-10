@@ -32,7 +32,7 @@ from fastapi.templating import Jinja2Templates
 from core.broker import Broker, BrokerUnavailable
 from core.broker_factory import make_broker
 from core.config import load_config
-from core.models import Order, OrderStatus, OrderType, Position, PositionState, WheelCycle
+from core.models import Order, OrderStatus, OrderType, PositionState
 from data.earnings import next_earnings as _next_earnings
 from db.repo import Database, Repos
 from risk.earnings_recheck import is_in_earnings_window as _is_in_earnings_window
@@ -548,12 +548,22 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                     earnings_date_iso = e_date.isoformat()
 
         # TICKET-015: PMCC two-leg summary (long + optional short, DIFFERENT
-        # expirations) + breakeven. None for non-PMCC rows.
+        # expirations) + breakeven + full mark-to-market. None for non-PMCC rows.
         pmcc = None
         if p.strategy_id == "pmcc" and p.state in (
             PositionState.PMCC_LONG_OPEN, PositionState.PMCC_BOTH_OPEN,
         ):
-            pmcc = await _pmcc_leg_summary(deps, p, today)
+            pmcc = await _pmcc_leg_summary(deps, p, today, cache)
+            # Override the generic unrealized: the shared helper only marks the
+            # short leg (or nothing for LONG_OPEN), which is misleading for a
+            # covered structure where the LONG carries most of the P&L. Use the
+            # full long+short mark instead.
+            if pmcc is not None and pmcc.get("unrealized") is not None:
+                unrealized = pmcc["unrealized"]
+                unrealized_pct = pmcc.get("unrealized_pct")
+            else:
+                unrealized = None
+                unrealized_pct = None
 
         # TICKET-016: calendar two-leg summary (front + back, DIFFERENT
         # expirations, same strike) + net debit. None for non-calendar rows.
@@ -630,11 +640,15 @@ async def _calendar_leg_summary(
 
 
 async def _pmcc_leg_summary(
-    deps: DashboardDeps, position: Any, today: datetime,
+    deps: DashboardDeps, position: Any, today: datetime, cache: _QuoteCache,
 ) -> dict[str, Any] | None:
     """Long + (optional) short leg summary for a PMCC position. The legs have
     DIFFERENT expirations, so we surface both DTEs distinctly. Breakeven =
-    long strike + per-share debit (the floor the short must clear)."""
+    long strike + per-share debit (the floor the short must clear).
+
+    Also computes the FULL position mark-to-market (long appreciation + short
+    decay) — the long carries most of the P&L on a PMCC, so the short-only
+    number the generic helper produces would mislead."""
     from core.models import OptionType as _OptionType
     from strategies.pmcc import latest_filled_order, long_breakeven
     if position.current_cycle_id is None:
@@ -656,7 +670,23 @@ async def _pmcc_leg_summary(
         "short_strike": None,
         "short_dte": None,
         "has_short": False,
+        "unrealized": None,
+        "unrealized_pct": None,
     }
+
+    # Full mark-to-market. Long: paid a debit, current value is its mid →
+    # gain = (mid − debit) × 100 × qty. Short (if open): collected premium,
+    # current cost-to-close is its mid → gain = (premium − mid) × 100 × qty.
+    long_debit = abs(long_order.fill_price) if long_order.fill_price is not None else None
+    long_mid = (
+        await cache.get(deps.broker, long_order.contract_symbol)
+        if long_order.contract_symbol else None
+    )
+    unreal: float | None = None
+    if long_debit is not None and long_mid is not None:
+        qty = long_order.quantity or 1
+        unreal = (long_mid - long_debit) * 100 * qty
+
     if position.state == PositionState.PMCC_BOTH_OPEN:
         short_order = await latest_filled_order(
             deps.repos, position.current_cycle_id, OrderType.SELL_TO_OPEN,
@@ -669,6 +699,21 @@ async def _pmcc_leg_summary(
                 if short_order.expiration else None
             )
             summary["has_short"] = True
+            short_mid = (
+                await cache.get(deps.broker, short_order.contract_symbol)
+                if short_order.contract_symbol else None
+            )
+            if (
+                unreal is not None and short_mid is not None
+                and short_order.fill_price is not None
+            ):
+                sqty = short_order.quantity or 1
+                unreal += (short_order.fill_price - short_mid) * 100 * sqty
+
+    if unreal is not None:
+        summary["unrealized"] = unreal
+        if long_debit:
+            summary["unrealized_pct"] = unreal / (long_debit * 100 * (long_order.quantity or 1)) * 100
     return summary
 
 

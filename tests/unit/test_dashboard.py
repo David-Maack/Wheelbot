@@ -153,6 +153,48 @@ async def test_positions_renders_pmcc_long_only(app_client):
 
 
 @pytest.mark.asyncio
+async def test_pmcc_full_unrealized_marks_long_and_short(app_client):
+    """The PMCC unrealized must reflect the FULL position (long appreciation +
+    short decay), not just the short leg. Long paid 16, now 20 → +400; short
+    sold for 1.20, now 0.40 → +80; total +480."""
+    client, deps, broker = app_client
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await deps.repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                   started_at=now, n_orders=2)
+    )
+    await deps.repos.orders.insert(
+        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
+              order_type=OrderType.BUY_TO_OPEN, contract_symbol="AAPL_long",
+              strike=140.0, expiration=date(2026, 1, 16), option_type=OptionType.CALL,
+              quantity=1, fill_price=16.0, status=OrderStatus.FILLED,
+              placed_at=now, client_order_id="pl")
+    )
+    await deps.repos.orders.insert(
+        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
+              order_type=OrderType.SELL_TO_OPEN, contract_symbol="AAPL_short",
+              strike=160.0, expiration=date(2026, 6, 20), option_type=OptionType.CALL,
+              quantity=1, fill_price=1.20, status=OrderStatus.FILLED,
+              placed_at=now, client_order_id="ps")
+    )
+    await deps.repos.positions.insert(
+        Position(account_id="test", symbol="AAPL", strategy_id="pmcc",
+                 state=PositionState.PMCC_BOTH_OPEN, shares=0,
+                 current_cycle_id=cycle_id, state_changed_at=now)
+    )
+    # Seed current quotes: long up to 20.0, short down to 0.40.
+    from core.models import Quote
+    from dashboard.app import _positions_rows, _QuoteCache
+    broker.seed_quote(Quote(symbol="AAPL_long", bid=19.95, ask=20.05))
+    broker.seed_quote(Quote(symbol="AAPL_short", bid=0.38, ask=0.42))
+
+    rows = await _positions_rows(deps, _QuoteCache(0.0))
+    pmcc_row = next(r for r in rows if r["strategy_id"] == "pmcc")
+    # long (20 − 16)*100 = +400 ; short (1.20 − 0.40)*100 = +80 ; total +480
+    assert pmcc_row["unrealized"] == pytest.approx(480.0)
+
+
+@pytest.mark.asyncio
 async def test_positions_renders_calendar_two_expirations(app_client):
     """TICKET-016: a calendar SPREAD_OPEN shows front/back DTEs (different
     expirations), the shared strike, and the net debit."""
