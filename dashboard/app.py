@@ -555,6 +555,12 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
         ):
             pmcc = await _pmcc_leg_summary(deps, p, today)
 
+        # TICKET-016: calendar two-leg summary (front + back, DIFFERENT
+        # expirations, same strike) + net debit. None for non-calendar rows.
+        calendar = None
+        if p.strategy_id == "calendar" and p.state == PositionState.SPREAD_OPEN:
+            calendar = await _calendar_leg_summary(deps, p, today)
+
         out.append(
             {
                 "symbol": p.symbol,
@@ -570,9 +576,57 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 "earnings_warning": earnings_warning,
                 "earnings_date_iso": earnings_date_iso,
                 "pmcc": pmcc,
+                "calendar": calendar,
             }
         )
     return out
+
+
+async def _calendar_leg_summary(
+    deps: DashboardDeps, position: Any, today: datetime,
+) -> dict[str, Any] | None:
+    """Front + back leg summary for a calendar. Same strike, DIFFERENT
+    expirations — surface both DTEs distinctly so it's obvious which is front
+    vs back. Reads the legs from the cycle's MULTI_LEG_OPEN order."""
+    if position.current_cycle_id is None:
+        return None
+    c = await deps.repos.db.connect()
+    async with c.execute(
+        "SELECT * FROM orders WHERE cycle_id = ? AND order_type = ? AND status = ? "
+        "ORDER BY placed_at DESC LIMIT 1",
+        (position.current_cycle_id, OrderType.MULTI_LEG_OPEN.value, OrderStatus.FILLED.value),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    from db.repo import JSON_FIELDS_BY_TABLE, _row_to_dict
+    order = _row_to_dict(row, JSON_FIELDS_BY_TABLE["orders"])
+    legs = (order.get("raw_request") or {}).get("legs") or []
+    front = back = None
+    for leg in legs:
+        if str(leg.get("action")) == OrderType.SELL_TO_OPEN.value:
+            front = leg
+        elif str(leg.get("action")) == OrderType.BUY_TO_OPEN.value:
+            back = leg
+    if front is None or back is None:
+        return None
+
+    def _dte(leg: dict) -> int | None:
+        exp = leg.get("expiration")
+        if not exp:
+            return None
+        try:
+            d = date.fromisoformat(str(exp)[:10])
+        except ValueError:
+            return None
+        return (d - today.date()).days
+
+    return {
+        "strike": front.get("strike"),
+        "front_dte": _dte(front),
+        "back_dte": _dte(back),
+        "debit": abs(order.get("fill_price") or 0.0),
+    }
 
 
 async def _pmcc_leg_summary(

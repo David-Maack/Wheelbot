@@ -74,6 +74,8 @@ from intelligence.news_check import news_check as run_news_check
 from strategies import roll_orchestrator
 from strategies.roll_advisor import RollAction, RollContext
 from strategies.iron_condor import propose_all as propose_all_iron_condor
+from strategies.calendar import propose_all as propose_all_calendar
+from strategies.calendar_close import propose_all_closes as propose_all_calendar_closes
 from strategies.pmcc import propose_all as propose_all_pmcc
 from strategies.pmcc_close import propose_all_closes as propose_all_pmcc_closes
 from strategies.spreads import (
@@ -381,6 +383,19 @@ async def _propose_and_route(
                 broker, repos, config, strategy=strategy,
             )
             open_proposals = await propose_all_pmcc(
+                broker, repos, config, strategy_universe,
+                strategy=strategy, ivr=ivr,
+            )
+            proposals = close_proposals + open_proposals
+        elif strategy.type == "calendar":
+            # TICKET-016: Calendar. 2-leg MLEG (same strike, two expirations),
+            # net DEBIT. Closes first (25% profit / 2-DTE force-close), then
+            # opens (ATM, INVERTED IVR gate — enter only on LOW IV). Both are
+            # MultiLegProposals → place_multi_leg. size_multiplier N/A.
+            close_proposals = await propose_all_calendar_closes(
+                broker, repos, config, strategy=strategy,
+            )
+            open_proposals = await propose_all_calendar(
                 broker, repos, config, strategy_universe,
                 strategy=strategy, ivr=ivr,
             )

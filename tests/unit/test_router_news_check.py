@@ -442,6 +442,37 @@ def _pmcc_short_proposal() -> Proposal:
 
 
 @pytest.mark.asyncio
+async def test_calendar_news_block_skips_open(db_repos):
+    """TICKET-016: a calendar MLEG open carries news_check_profile=neutral_pin;
+    a block decision skips the open."""
+    from strategies.spreads import DIRECTION_CALENDAR, MultiLegProposal
+    from core.models import OrderLeg
+    today = date(2025, 6, 1)
+    legs = [
+        OrderLeg(contract_symbol="F250620C00012000", underlying="F",
+                 option_type=OptionType.CALL, strike=12.0,
+                 expiration=today + timedelta(days=14), action=OrderType.SELL_TO_OPEN),
+        OrderLeg(contract_symbol="F250801C00012000", underlying="F",
+                 option_type=OptionType.CALL, strike=12.0,
+                 expiration=today + timedelta(days=60), action=OrderType.BUY_TO_OPEN),
+    ]
+    proposal = MultiLegProposal(
+        symbol="F", legs=legs, net_credit_per_spread=-1.50,
+        max_loss_per_spread=150.0, width_dollars=0.0, quantity=1,
+        rationale="calendar test", strategy_id="calendar",
+        direction=DIRECTION_CALENDAR, news_check_profile="neutral_pin",
+    )
+    broker = PaperBroker(cash=50_000)
+    news = _NewsStub("block", "FOMC inside front-month")
+    router = OrderRouter(broker, db_repos, _config(), _universe(), news_checker=news)
+    result = await router.place_multi_leg(proposal, sleep=_noop_sleep, today=today)
+    assert news.calls == 1
+    assert news.profiles_seen == ["neutral_pin"]
+    assert result.placed is None
+    assert result.news_decision == "block"
+
+
+@pytest.mark.asyncio
 async def test_pmcc_long_fires_bullish_long_news(db_repos):
     """The PMCC long BUY_TO_OPEN is news-checked with the bullish_long profile."""
     broker = PaperBroker(cash=50_000)

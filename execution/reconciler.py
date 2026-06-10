@@ -88,15 +88,19 @@ _PROFIT_TO_LOSS_OUTCOME = {
     # filtering on /cycles can split iron_condor results from vanilla
     # vertical spreads.
     CycleOutcome.IRON_CONDOR_CLOSED_PROFIT: CycleOutcome.IRON_CONDOR_CLOSED_LOSS,
+    # TICKET-016: calendar.
+    CycleOutcome.CALENDAR_CLOSED_PROFIT: CycleOutcome.CALENDAR_CLOSED_LOSS,
 }
 
 
 def _spread_close_outcome(strategy_id: str | None) -> CycleOutcome:
-    """Pick the right CycleOutcome at MULTI_LEG_CLOSE. iron_condor cycles
-    get tagged distinctly from vanilla spreads so the /cycles filter and
+    """Pick the right CycleOutcome at MULTI_LEG_CLOSE. iron_condor and calendar
+    cycles get tagged distinctly from vanilla spreads so the /cycles filter and
     /performance breakdown can separate them."""
     if strategy_id == "iron_condor":
         return CycleOutcome.IRON_CONDOR_CLOSED_PROFIT
+    if strategy_id == "calendar":
+        return CycleOutcome.CALENDAR_CLOSED_PROFIT
     return CycleOutcome.SPREAD_CLOSED_PROFIT
 
 
@@ -104,6 +108,8 @@ def _spread_expired_outcome(strategy_id: str | None) -> CycleOutcome:
     """Same dispatch for MULTI_LEG_OPEN expiration paths (all legs OTM)."""
     if strategy_id == "iron_condor":
         return CycleOutcome.IRON_CONDOR_EXPIRED_PROFIT
+    if strategy_id == "calendar":
+        return CycleOutcome.CALENDAR_EXPIRED
     return CycleOutcome.SPREAD_EXPIRED_PROFIT
 
 
@@ -925,6 +931,22 @@ class Reconciler:
             return
 
         if local.state == PositionState.SPREAD_OPEN:
+            # TICKET-016: a calendar is same-strike, two expirations, NET DEBIT.
+            # It must be force-closed before the front leg expires (the 2-DTE
+            # close trigger). If we still see it SPREAD_OPEN with the front short
+            # leg GONE from the broker, the force-close didn't fire — flag it
+            # rather than mishandle the partial-expiry (back leg becomes a naked
+            # long). A healthy calendar still shows its short front leg.
+            if local.strategy_id == "calendar":
+                if not has_short_call and not has_shares:
+                    await self._flag_manual_intervention(
+                        local.symbol,
+                        f"calendar {local.symbol} still SPREAD_OPEN with front "
+                        "leg gone — 2-DTE force-close did not fire; review the "
+                        "back leg (now an uncovered long)",
+                        summary,
+                    )
+                return
             # Broker shows nothing for this symbol → both legs OTM at expiry,
             # full credit retained. Anything else is asymmetric (one leg ITM,
             # one OTM, or partial assignment) and needs a human eye.

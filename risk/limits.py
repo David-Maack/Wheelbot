@@ -413,7 +413,13 @@ class RiskGate:
         # fails both. When TICKET-013's 6-bucket regime adds an explicit
         # `iron_condor_allowed` column (matrix can diverge from AND in
         # NEUTRAL_HIGH_IV etc.), swap this branch to read that column.
-        if proposal.direction == "iron_condor":
+        # TICKET-016: a calendar wants a NEUTRAL, range-bound regime — which in
+        # the 4-bucket scheme is exactly "both directional wings allowed", the
+        # same AND-combine as iron_condor. (The LOW-IV requirement is enforced
+        # separately by the selector's inverted IVR gate, not here.) When
+        # TICKET-013's 6-bucket regime lands, swap to BULL_TREND_LOW_IV /
+        # NEUTRAL_LOW_IV.
+        if proposal.direction in ("iron_condor", "calendar"):
             c = await self._repos.db.connect()
             async with c.execute(
                 "SELECT csps_allowed, bear_calls_allowed FROM regime_snapshots "
@@ -430,12 +436,12 @@ class RiskGate:
             else:
                 missing = []
                 if not csps_ok:
-                    missing.append("put wing (csps_allowed=False)")
+                    missing.append("put side (csps_allowed=False)")
                 if not bear_ok:
-                    missing.append("call wing (bear_calls_allowed=False)")
+                    missing.append("call side (bear_calls_allowed=False)")
                 result.add(
                     "regime", "fail",
-                    f"iron_condor requires both wings allowed; blocked: {', '.join(missing)}",
+                    f"{proposal.direction} requires a range-bound regime; blocked: {', '.join(missing)}",
                 )
             return
 

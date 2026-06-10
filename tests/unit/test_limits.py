@@ -482,7 +482,7 @@ async def test_regime_gate_iron_condor_blocked_when_put_wing_disallowed(
     )
     rule_results = {r.rule: r for r in res.results}
     assert rule_results["regime"].status == "fail"
-    assert "put wing" in rule_results["regime"].detail
+    assert "put side" in rule_results["regime"].detail
 
 
 @pytest.mark.asyncio
@@ -503,7 +503,41 @@ async def test_regime_gate_iron_condor_blocked_when_call_wing_disallowed(
     )
     rule_results = {r.rule: r for r in res.results}
     assert rule_results["regime"].status == "fail"
-    assert "call wing" in rule_results["regime"].detail
+    assert "call side" in rule_results["regime"].detail
+
+
+@pytest.mark.asyncio
+async def test_regime_gate_calendar_passes_when_range_bound(db_repos, monkeypatch):
+    """TICKET-016: a calendar wants a range-bound (NEUTRAL) regime = both
+    directional flags allowed (same AND-combine as iron_condor)."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=1)
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(
+        _multi_leg_proposal(direction="calendar"),
+        today=date(2025, 6, 1), raise_on_fail=False,
+    )
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["regime"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_regime_gate_calendar_blocked_when_trending(db_repos, monkeypatch):
+    """A trending regime (one wing disallowed) blocks the calendar."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=0)
+    cfg = _config()
+    cfg["regime"] = {"enabled": True}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(
+        _multi_leg_proposal(direction="calendar"),
+        today=date(2025, 6, 1), raise_on_fail=False,
+    )
+    rule_results = {r.rule: r for r in res.results}
+    assert rule_results["regime"].status == "fail"
+    assert "calendar requires a range-bound regime" in rule_results["regime"].detail
 
 
 @pytest.mark.asyncio

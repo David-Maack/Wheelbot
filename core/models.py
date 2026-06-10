@@ -96,6 +96,10 @@ class CycleOutcome(StrEnum):
     PMCC_SHORT_CLOSED_LOSS = "PMCC_SHORT_CLOSED_LOSS"           # a short bought back at a loss (cycle continues)
     PMCC_LONG_ROLLED = "PMCC_LONG_ROLLED"                       # long closed + rolled forward → cycle ends, new cycle opens
     PMCC_FULL_CLOSED = "PMCC_FULL_CLOSED"                       # full unwind → cycle ends
+    # TICKET-016: Calendar spread (front decays faster than back, long vega).
+    CALENDAR_CLOSED_PROFIT = "CALENDAR_CLOSED_PROFIT"           # closed at profit_close_pct of debit
+    CALENDAR_CLOSED_LOSS = "CALENDAR_CLOSED_LOSS"               # closed at a loss
+    CALENDAR_EXPIRED = "CALENDAR_EXPIRED"                       # rare: not force-closed before front expiry
     MANUAL_CLOSE = "MANUAL_CLOSE"
 
 

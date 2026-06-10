@@ -49,6 +49,10 @@ DIRECTION_BEAR_CALL = "bear_call"
 # same expiration. The regime gate AND-combines csps_allowed + bear_calls_allowed
 # for this value — see risk/limits.py::_rule_regime_multi_leg.
 DIRECTION_IRON_CONDOR = "iron_condor"
+# TICKET-016: calendar spread — same-strike, two expirations, net DEBIT. The
+# regime gate treats it like iron_condor (AND-combine = NEUTRAL); the LOW-IV
+# requirement is enforced separately by the selector's inverted IVR gate.
+DIRECTION_CALENDAR = "calendar"
 
 
 @dataclass(frozen=True, slots=True)

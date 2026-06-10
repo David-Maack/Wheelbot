@@ -25,6 +25,16 @@
             {% endif %}
           </div>
         {% endif %}
+        {% if r.calendar %}
+          <div class="calendar-legs">
+            <span title="Calendar — same strike, two expirations">
+              {{ r.calendar.strike }}c
+              F {% if r.calendar.front_dte is not none %}{{ r.calendar.front_dte }}d{% else %}—{% endif %}
+              / B {% if r.calendar.back_dte is not none %}{{ r.calendar.back_dte }}d{% else %}—{% endif %}
+            </span>
+            <span class="caption">debit {{ "%.2f"|format(r.calendar.debit) }}</span>
+          </div>
+        {% endif %}
       </td>
       <td><code>{{ r.state }}</code></td>
       <td>{{ r.days_in_state }}</td>

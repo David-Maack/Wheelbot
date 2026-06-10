@@ -153,6 +153,45 @@ async def test_positions_renders_pmcc_long_only(app_client):
 
 
 @pytest.mark.asyncio
+async def test_positions_renders_calendar_two_expirations(app_client):
+    """TICKET-016: a calendar SPREAD_OPEN shows front/back DTEs (different
+    expirations), the shared strike, and the net debit."""
+    client, deps, _broker = app_client
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await deps.repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="SPY", strategy_id="calendar",
+                   started_at=now, n_orders=1)
+    )
+    legs = [
+        {"contract_symbol": "SPY250620C00500000", "underlying": "SPY",
+         "option_type": "CALL", "strike": 500.0, "expiration": "2026-06-24",
+         "action": "SELL_TO_OPEN", "ratio_qty": 1},
+        {"contract_symbol": "SPY250801C00500000", "underlying": "SPY",
+         "option_type": "CALL", "strike": 500.0, "expiration": "2026-08-09",
+         "action": "BUY_TO_OPEN", "ratio_qty": 1},
+    ]
+    await deps.repos.orders.insert(
+        Order(account_id="test", symbol="SPY", strategy_id="calendar", cycle_id=cycle_id,
+              order_type=OrderType.MULTI_LEG_OPEN, contract_symbol=legs[0]["contract_symbol"],
+              strike=500.0, expiration=date(2026, 6, 24), option_type=OptionType.CALL,
+              quantity=1, fill_price=-1.75, status=OrderStatus.FILLED,
+              placed_at=now, client_order_id="cal",
+              raw_request={"underlying": "SPY", "legs": legs, "quantity": 1, "width_dollars": 0.0})
+    )
+    await deps.repos.positions.insert(
+        Position(account_id="test", symbol="SPY", strategy_id="calendar",
+                 state=PositionState.SPREAD_OPEN, shares=0,
+                 current_cycle_id=cycle_id, state_changed_at=now)
+    )
+    resp = await client.get("/", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    assert "500.0c" in body              # shared strike
+    assert "debit 1.75" in body          # net debit
+    assert "calendar-legs" in body       # the leg block rendered
+
+
+@pytest.mark.asyncio
 async def test_positions_partial_returns_polling_div(app_client):
     client, _deps, _broker = app_client
     resp = await client.get(

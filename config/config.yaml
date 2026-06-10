@@ -449,3 +449,31 @@ strategies:
       # Drawdown circuit breaker — see monthly_wheel.
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150
+
+  # TICKET-016: Calendar Spread — same-strike front/back calls, net DEBIT.
+  # The COUNTER-CYCLICAL piece: it wants LOW IV (INVERTED ivr_max gate, the
+  # opposite of premium strategies) and a range-bound underlying. Profits from
+  # front-leg theta decay + rising IV (long vega). Defined risk = the debit.
+  # enabled: false until paper-validated. Force-closed at 2 DTE so the
+  # partial-expiry path stays unreachable (reconciler guard flags it if not).
+  # First net-debit MLEG open — verify the limit-price sign at Stage 2 parity.
+  - id: calendar
+    display_name: "Calendar Spread"
+    type: calendar
+    enabled: false
+    max_concurrent: 3
+    params:
+      short_dte_min: 7
+      short_dte_max: 21
+      long_dte_min: 45
+      long_dte_max: 75
+      option_type: call                # v1: call only
+      max_debit_per_spread_usd: 250
+      profit_close_pct: 25             # of the net debit
+      time_close_short_dte: 2          # force-close when front ≤ 2 DTE
+      ivr_max: 35                      # INVERTED — enter only when IVR is LOW
+      # Regime: treated like iron_condor (range-bound = both wings allowed =
+      # NEUTRAL in the 4-bucket scheme). Upgrade to *_LOW_IV after TICKET-013.
+      # Drawdown circuit breaker — see monthly_wheel.
+      auto_disable_drawdown_usd: -300
+      drawdown_warning_usd: -150
