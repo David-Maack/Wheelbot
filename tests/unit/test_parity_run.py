@@ -13,9 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from core.broker import Broker, BrokerUnavailable
+from core.broker import Broker, BrokerError, BrokerUnavailable
 from core.models import Account, OptionContract, OptionType, Quote
 from scripts.parity_run import (
+    _ReadOnlyBroker,
     _alpaca_has_liquidity,
     _build_rows,
     _join_and_compute,
@@ -23,7 +24,9 @@ from scripts.parity_run import (
     _normalize_occ,
     _render_daily_report,
     _select_symbols,
+    _select_window_keys,
     _tasty_has_liquidity,
+    _verify_creds,
     run,
 )
 
@@ -331,3 +334,82 @@ async def test_preflight_aborts_on_broker_unavailable(db_repos, tmp_path):
             alpaca_broker=_DeadBroker("alpaca_paper", {}),
             tasty_broker=_MockBroker("tastytrade_sandbox", {}),
         )
+
+
+# -- TICKET-026: shared near-the-money window + prod read-only path ----------
+
+
+def _opt(occ: str, strike: float, exp: date, otype: OptionType = OptionType.CALL) -> OptionContract:
+    return OptionContract(
+        underlying="XLE", occ_symbol=occ, strike=strike, expiration=exp, option_type=otype,
+    )
+
+
+def test_select_window_keys_picks_shared_near_money():
+    """Nearest expiry >= min_dte, strikes within +/-pct of spot, intersected
+    with the OCC keys present on BOTH sides."""
+    today = date(2026, 6, 4)
+    near = date(2026, 6, 20)  # 16 DTE
+    far = date(2026, 9, 19)
+    alpaca = [
+        _opt("XLE260620C00084000", 84.0, near),
+        _opt("XLE260620C00100000", 100.0, near),   # > +10% of spot 85 → out
+        _opt("XLE260919C00085000", 85.0, far),       # later expiry → out
+    ]
+    tasty = [
+        _opt("XLE260620C00084000", 84.0, near),
+        _opt("XLE260620C00100000", 100.0, near),
+    ]
+    keys = _select_window_keys(
+        alpaca, tasty, spot=85.0, today=today, min_dte=7, pct=0.10, max_contracts=10,
+    )
+    assert keys == {"XLE260620C00084000"}
+
+
+def test_select_window_keys_empty_without_overlap():
+    today = date(2026, 6, 4)
+    exp = date(2026, 6, 20)
+    alpaca = [_opt("XLE260620C00084000", 84.0, exp)]
+    tasty = [_opt("XLE260620C00090000", 90.0, exp)]  # no shared OCC
+    assert _select_window_keys(
+        alpaca, tasty, spot=85.0, today=today, min_dte=7, pct=0.50, max_contracts=10,
+    ) == set()
+
+
+def test_select_window_keys_band_fallback_keeps_nearest():
+    """If nothing sits within +/-pct, keep the nearest strike rather than
+    dropping the symbol entirely."""
+    today = date(2026, 6, 4)
+    exp = date(2026, 6, 20)
+    alpaca = [_opt("XLE260620C00084000", 84.0, exp)]
+    tasty = [_opt("XLE260620C00084000", 84.0, exp)]
+    keys = _select_window_keys(
+        alpaca, tasty, spot=1000.0, today=today, min_dte=7, pct=0.10, max_contracts=10,
+    )
+    assert keys == {"XLE260620C00084000"}
+
+
+@pytest.mark.asyncio
+async def test_readonly_broker_blocks_writes_delegates_reads():
+    """Prod parity wrapper: reads pass through, every write hard-raises."""
+    inner = _MockBroker("tastytrade", {"F": [_contract(bid=1.0, ask=1.1)]})
+    ro = _ReadOnlyBroker(inner)
+    assert ro.name == "tastytrade"
+    assert (await ro.get_account()).account_id == "test"
+    assert len(await ro.get_option_chain("F")) == 1
+    with pytest.raises(BrokerError):
+        await ro.place_order(object())
+    with pytest.raises(BrokerError):
+        await ro.cancel_order("x")
+    with pytest.raises(BrokerError):
+        await ro.place_multi_leg_order(underlying="F", legs=[], quantity=1, limit_price=None)
+
+
+def test_verify_creds_prod_requires_prod_vars(monkeypatch):
+    """--prod must demand TASTYTRADE_PROD_*; sandbox creds don't satisfy it."""
+    monkeypatch.delenv("TASTYTRADE_PROD_PROVIDER_SECRET", raising=False)
+    monkeypatch.delenv("TASTYTRADE_PROD_REMEMBER_TOKEN", raising=False)
+    monkeypatch.setenv("TASTYTRADE_PROVIDER_SECRET", "x")
+    monkeypatch.setenv("TASTYTRADE_REMEMBER_TOKEN", "y")
+    with pytest.raises(SystemExit):
+        _verify_creds({}, use_prod=True)
