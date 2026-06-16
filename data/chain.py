@@ -142,6 +142,11 @@ async def fetch_filtered_chain(
     if not in_window:
         return []
 
+    # Some brokers (Tastytrade) return structure-only chains; fetch quotes for
+    # just this DTE window. No-op for brokers that already quote inline (Alpaca,
+    # Paper), so the live path is unchanged.
+    in_window = await broker.populate_quotes(in_window)
+
     if underlying_price is None:
         try:
             quote = await broker.get_quote(underlying)

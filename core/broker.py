@@ -82,6 +82,18 @@ class Broker(ABC):
         back to data/greeks.py.
         """
 
+    async def populate_quotes(
+        self, contracts: list[OptionContract]
+    ) -> list[OptionContract]:
+        """Return `contracts` with bid/ask/mid/last/volume/open_interest filled.
+
+        Default no-op: adapters whose `get_option_chain` already returns quoted
+        contracts (Alpaca, Paper) inherit this untouched. Tastytrade returns
+        structure-only chains and overrides this to batch-fetch quotes for just
+        the DTE-windowed contracts the chain layer evaluates (bounded cost).
+        """
+        return contracts
+
     @abstractmethod
     async def place_order(self, order: Order) -> Order:
         """Submit `order` to the broker.

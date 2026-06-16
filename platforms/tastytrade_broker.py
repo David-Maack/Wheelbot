@@ -52,6 +52,10 @@ _PENDING = {"Received", "Live", "Routed", "In Flight", "Contingent"}
 _CANCELLED = {"Cancelled", "Cancel Requested", "Removed", "Expired"}
 _REJECTED = {"Rejected"}
 
+# Max option symbols per market-data/by-type snapshot call (conservative; the
+# endpoint caps per request, so populate_quotes pages through in chunks).
+_MARKET_DATA_CHUNK = 90
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
@@ -89,6 +93,29 @@ def _parse_occ(occ: str) -> tuple[str, date, OptionType, float] | None:
             strike = int(rest[7:]) / 1000.0
             return prefix, exp, opt, strike
     return None
+
+
+def _q_float(x: Any) -> float | None:
+    return float(x) if x is not None else None
+
+
+def _q_int(x: Any) -> int | None:
+    return int(x) if x is not None else None
+
+
+def _quote_fields(md: Any) -> dict[str, Any]:
+    """Map a tastytrade MarketData snapshot onto OptionContract quote fields.
+
+    Only the fields OptionContract carries — Greeks are not in the snapshot and
+    fall back to Black-Scholes in data/chain.py."""
+    return {
+        "bid": _q_float(getattr(md, "bid", None)),
+        "ask": _q_float(getattr(md, "ask", None)),
+        "mid": _q_float(getattr(md, "mid", None)),
+        "last": _q_float(getattr(md, "last", None)),
+        "volume": _q_int(getattr(md, "volume", None)),
+        "open_interest": _q_int(getattr(md, "open_interest", None)),
+    }
 
 
 def _map_status(tt_status: str) -> OrderStatus:
@@ -297,6 +324,46 @@ class TastytradeBroker(Broker):
                                 option_type=side,
                             )
                         )
+        return out
+
+    async def _market_data_by_type(
+        self, session: Any, option_symbols: list[str]
+    ) -> list[Any]:
+        """Thin seam over the SDK batch snapshot — stubbed in unit tests."""
+        from tastytrade.market_data import get_market_data_by_type
+
+        return await get_market_data_by_type(session, options=option_symbols)
+
+    async def populate_quotes(
+        self, contracts: list[OptionContract]
+    ) -> list[OptionContract]:
+        """Fill bid/ask/mid/last/volume/open_interest via the HTTP market-data
+        snapshot. NestedOptionChain returns structure only, so the chain layer
+        calls this for the DTE-windowed survivors it actually evaluates —
+        bounded cost. Best-effort: on a snapshot failure (e.g. the sandbox
+        serves no option market data) contracts keep their None quote fields
+        rather than raising, so the chain layer degrades instead of crashing."""
+        if not contracts:
+            return []
+        session, _account = await self._ensure_session()
+        symbols = [_occ_dense(c.occ_symbol) for c in contracts]
+        by_symbol: dict[str, Any] = {}
+        try:
+            for i in range(0, len(symbols), _MARKET_DATA_CHUNK):
+                chunk = symbols[i : i + _MARKET_DATA_CHUNK]
+                for md in await self._market_data_by_type(session, chunk):
+                    by_symbol[_occ_dense(str(md.symbol))] = md
+        except Exception as exc:  # noqa: BLE001 — degrade, don't crash the chain
+            log_checkpoint(
+                "tastytrade_quote_batch_failed",
+                status="fail", n=len(symbols),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return contracts
+        out: list[OptionContract] = []
+        for c in contracts:
+            md = by_symbol.get(_occ_dense(c.occ_symbol))
+            out.append(c.model_copy(update=_quote_fields(md)) if md is not None else c)
         return out
 
     async def place_order(self, order: Order) -> Order:

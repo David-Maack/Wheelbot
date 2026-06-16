@@ -137,3 +137,48 @@ def test_annualized_yield_none_for_expired():
     today = date(2025, 6, 1)
     c = _put("y", strike=10.0, days_out=0, bid=0.20, ask=0.30)
     assert annualized_yield(c, today) is None
+
+
+class _StructureOnlyBroker(PaperBroker):
+    """Mimics Tastytrade: get_option_chain returns structure with no quotes;
+    populate_quotes fills bid/ask afterward (TICKET-025)."""
+
+    def __init__(self, fills: dict[str, dict]):
+        super().__init__()
+        self._fills = fills
+
+    async def populate_quotes(self, contracts):
+        out = []
+        for c in contracts:
+            f = self._fills.get(c.occ_symbol)
+            out.append(c.model_copy(update=f) if f else c)
+        return out
+
+
+@pytest.mark.asyncio
+async def test_populate_quotes_default_is_noop():
+    """PaperBroker inherits the Broker ABC no-op — chains stay untouched."""
+    broker = PaperBroker()
+    cs = [_put("x", 10.0, days_out=35)]
+    assert await broker.populate_quotes(cs) is cs
+
+
+@pytest.mark.asyncio
+async def test_fetch_filtered_chain_uses_populate_quotes():
+    """A structure-only chain (no bid/ask/delta) must be quoted via
+    populate_quotes before filtering; Greeks then fall back from the filled mid.
+    If populate_quotes were not called, bid/ask stay None → spread gate drops it."""
+    broker = _StructureOnlyBroker({"b": {"bid": 0.50, "ask": 0.55}})
+    broker.seed_quote(Quote(symbol="F", bid=10.0, ask=10.04, last=10.02))
+    broker.seed_chain(
+        "F",
+        [_put("b", 10.0, days_out=35, delta=None, bid=None, ask=None)],
+    )
+    filt = ChainFilters(
+        dte_min=30, dte_max=45, delta_min=0.05, delta_max=0.60,
+        open_interest_min=100, volume_min=50, bid_ask_spread_max_pct=50.0,
+    )
+    out = await fetch_filtered_chain(broker, "F", "put", filt, today=date(2025, 6, 1))
+    assert len(out) == 1
+    assert (out[0].bid, out[0].ask) == (0.50, 0.55)  # came from populate_quotes
+    assert out[0].delta is not None  # Greeks computed from the filled mid
