@@ -74,6 +74,18 @@ def _occ_dense(occ: str) -> str:
     return occ.replace(" ", "")
 
 
+def _occ_padded(occ: str) -> str:
+    """Dense OCC -> the space-padded 21-char OCC the Tastytrade ORDER API
+    requires (root left-justified to 6 chars). Inverse of _occ_dense for option
+    symbols; market-data accepts dense, but order legs are rejected as
+    `invalid_symbol` unless the root is space-padded. Plain tickers (len < 15)
+    pass through unchanged so equity legs are unaffected."""
+    s = _occ_dense(occ or "")
+    if len(s) < 15:
+        return s
+    return f"{s[:-15]:<6}{s[-15:]}"
+
+
 def _parse_occ(occ: str) -> tuple[str, date, OptionType, float] | None:
     """Dense OCC → (underlying, expiration, type, strike). Tolerates Tastytrade
     space-padded form by collapsing spaces first."""
@@ -382,7 +394,7 @@ class TastytradeBroker(Broker):
             instrument_type=InstrumentType.EQUITY_OPTION
             if order.option_type is not None
             else InstrumentType.EQUITY,
-            symbol=_occ_dense(order.contract_symbol or order.symbol),
+            symbol=_occ_padded(order.contract_symbol or order.symbol),
             action=_wheel_action_to_tt(order.order_type),
             quantity=Decimal(order.quantity),
         )
@@ -455,7 +467,7 @@ class TastytradeBroker(Broker):
         tt_legs = [
             Leg(
                 instrument_type=InstrumentType.EQUITY_OPTION,
-                symbol=_occ_dense(leg.contract_symbol),
+                symbol=_occ_padded(leg.contract_symbol),
                 action=_wheel_action_to_tt(WheelOrderType(leg.action)),
                 quantity=Decimal(leg.ratio_qty * quantity),
             )

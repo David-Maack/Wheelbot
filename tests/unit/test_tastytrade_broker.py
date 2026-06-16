@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.models import OptionContract, OptionType
-from platforms.tastytrade_broker import TastytradeBroker
+from platforms.tastytrade_broker import TastytradeBroker, _occ_dense, _occ_padded
 
 
 def _broker() -> TastytradeBroker:
@@ -108,3 +108,25 @@ async def test_populate_quotes_degrades_on_snapshot_error(monkeypatch):
 async def test_populate_quotes_empty_input():
     b = _broker()
     assert await b.populate_quotes([]) == []
+
+
+# -- _occ_padded: TICKET-028 (orders need the space-padded 21-char OCC) -------
+
+
+def test_occ_padded_pads_root_to_six():
+    assert _occ_padded("F260717P00005000") == "F     260717P00005000"
+    assert _occ_padded("AAPL260116C00150000") == "AAPL  260116C00150000"
+    assert _occ_padded("GOOGL260116C00150000") == "GOOGL 260116C00150000"
+    assert _occ_padded("SPXW260116C04000000") == "SPXW  260116C04000000"
+
+
+def test_occ_padded_roundtrips_with_dense():
+    padded = "F     260717P00005000"
+    assert _occ_padded(_occ_dense(padded)) == padded
+    assert _occ_dense(_occ_padded("F260717P00005000")) == "F260717P00005000"
+
+
+def test_occ_padded_leaves_tickers_untouched():
+    assert _occ_padded("F") == "F"
+    assert _occ_padded("AAPL") == "AAPL"
+    assert _occ_padded("") == ""
