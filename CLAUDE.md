@@ -36,7 +36,7 @@ You still need to rebuild the image.
 ```
 cd /opt/wheelbot
 git pull
-docker compose up -d --build wheelbot
+docker compose up -d --build      # NO service name → rebuilds BOTH wheelbot + dashboard
 # auto-applies any pending migrations during startup; watch the log:
 docker logs wheelbot --tail 20 | grep -E 'bot_migrations'
 # Verify:
@@ -54,13 +54,18 @@ different entrypoint), the manual fallback is:
 docker exec wheelbot python -m scripts.run_migration --all-pending
 ```
 
-### Config + code changes both need `--build`
+### Config + code changes both need `--build` — and rebuild BOTH services
 
 Same trap applies to any code change: `git pull` alone leaves the container
-running the old image. Always rebuild:
+running the old image. Always rebuild — and **never name a single service**.
+`up -d --build wheelbot` rebuilds only the bot and silently leaves the
+`dashboard` container frozen on old code; once the DB schema drifts the
+dashboard 500s (it bit us 2026-06-17 — a 3-week-stale dashboard rejected the
+`trigger_reason` column on /orders and /positions). Name no service so compose
+rebuilds the bot AND the dashboard together:
 
 ```
-docker compose up -d --build wheelbot
+docker compose up -d --build      # bot + dashboard, kept in sync
 ```
 
 You can tell the deployed image is stale when:

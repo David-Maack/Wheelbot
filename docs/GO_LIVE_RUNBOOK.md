@@ -193,7 +193,7 @@ Every checklist below is and-gated. Every item must be true. Do not reason "four
 - [ ] `config/config.local.yaml` exists, committed to the LXC host at `/opt/wheelbot/config/config.local.yaml`, and overrides `account.broker: alpaca_paper`.
 - [ ] `risk.stop_file_path` resolves to `/opt/wheelbot/STOP` and the parent dir is writable by the container user.
 - [ ] `scripts/preflight_live.py` exits 0 (or any non-zero is acknowledged in the Stage 0 follow-up ticket).
-- [ ] `docker compose up -d --build wheelbot` succeeded on the LXC and `docker logs wheelbot --tail 50` shows the `bot_migrations` checkpoint at status=ok.
+- [ ] `docker compose up -d --build` (NO service name — rebuilds bot **and** dashboard; naming a single service leaves the other stale) succeeded on the LXC and `docker logs wheelbot --tail 50` shows the `bot_migrations` checkpoint at status=ok.
 - [ ] `docker exec wheelbot python -m scripts.db_health` exits 0.
 - [ ] `bash scripts/migrate_check.sh` reports no drift between host `db/migrations/` and the container.
 - [ ] Dashboard `/risk` is reachable on `127.0.0.1:8889` behind basic auth and renders the kill-switch panel without errors.
@@ -290,7 +290,7 @@ When in doubt, flatten. The decision matrix below is the tiebreaker, but the def
 5. Wait for fills. `manual_close` routes through `OrderRouter`; the reconciler resolves each position when the broker confirms the close. Do not proceed until `/positions` shows the targeted positions in a terminal state.
 6. Revert `account.broker` in `config/config.local.yaml` to the prior stage's broker if relevant: from Stage 3 or Stage 4 back to Stage 1 or 2, revert to `alpaca_paper`. Rolling back FROM Stage 2 is just "stop running the parity harness" — Stage 2 does not change the live broker, so no broker config change is needed there.
 7. Restore the position caps appropriate for the stage you are returning to (e.g. `account.max_concurrent_total: 14` for paper testing).
-8. `cd /opt/wheelbot && git pull && docker compose up -d --build wheelbot`. Watch `docker logs wheelbot --tail 20` for the `bot_migrations` line; verify `docker exec wheelbot python -m scripts.db_health` exits 0 and `bash scripts/migrate_check.sh` shows no drift.
+8. `cd /opt/wheelbot && git pull && docker compose up -d --build` (NO service name — rebuilds bot **and** dashboard together). Watch `docker logs wheelbot --tail 20` for the `bot_migrations` line; verify `docker exec wheelbot python -m scripts.db_health` exits 0 and `bash scripts/migrate_check.sh` shows no drift.
 9. Release the kill switch: `rm /opt/wheelbot/STOP` or POST `/risk/manual_stop` action=release from `/risk`. The next loop tick will resume new-order placement.
 
 Do NOT skip forward to the failed stage. Restart from the prior stage's entry criteria in §2 and re-clear every checkbox. The point of the staged runbook is that each gate is independently meaningful; treating a rollback as a brief pause defeats it.
