@@ -8,12 +8,13 @@ account:
   # Per-strategy caps (max_concurrent on each strategy) are additionally enforced;
   # this is the ceiling.
   #
-  # TESTING PHASE (paper, gathering data): set to the SUM of per-strategy caps
-  # (2 monthly + 4 weekly + 4 put_spread + 4 bear_call = 14) so the per-strategy
-  # caps are what actually bind and nothing throttles while we collect data.
-  # BEFORE GOING LIVE on the smaller real bankroll, tighten this back down
-  # (≈4) — on $5-wide spreads, 4 simultaneous positions ≈ $1400 max exposure.
-  max_concurrent_total: 14
+  # $5K SMALL-BANKROLL SIM (2026-06-17): only defined-risk strategies run —
+  # iron_condor + put_spread (bull put) + calendar. Wheel (monthly/weekly),
+  # bear_call_spread, and pmcc are disabled below (wheel = too capital-heavy for
+  # $5k; pmcc LEAPs cost more than the whole account; bear_call out of scope).
+  # Tightened to 4 — on $5-wide spreads, 4 simultaneous positions ≈ $1400 max
+  # exposure on a $5,000 paper account. Pair with an Alpaca paper reset to $5k.
+  max_concurrent_total: 4
 
 database:
   path: "/mnt/wheelbot-storage/wheelbot.db"
@@ -235,7 +236,7 @@ strategies:
   - id: monthly_wheel
     display_name: "Monthly Wheel"
     type: wheel
-    enabled: true
+    enabled: false              # $5k sim: wheel is too capital-heavy — re-enable when bankroll grows
     max_concurrent: 2
     params:
       dte_min: 30
@@ -287,7 +288,7 @@ strategies:
   - id: weekly_wheel
     display_name: "Weekly Wheel"
     type: wheel
-    enabled: true
+    enabled: false              # $5k sim: wheel is too capital-heavy — re-enable when bankroll grows
     max_concurrent: 4
     params:
       dte_min: 7
@@ -323,7 +324,7 @@ strategies:
     display_name: "Bull Put Spread"
     type: vertical_spread
     enabled: true
-    max_concurrent: 4
+    max_concurrent: 2           # $5k sim: ≤2 so condor/calendar also get slots under the global cap of 4
     params:
       direction: bull_put
       dte_min: 30
@@ -356,7 +357,7 @@ strategies:
   - id: bear_call_spread
     display_name: "Bear Call Spread"
     type: vertical_spread
-    enabled: true
+    enabled: false              # $5k sim: out of scope (you chose bull-put only on the credit-spread side)
     max_concurrent: 4
     params:
       direction: bear_call
@@ -395,7 +396,7 @@ strategies:
   - id: iron_condor
     display_name: "Iron Condor"
     type: iron_condor
-    enabled: false
+    enabled: true               # $5k sim: ON (defined-risk neutral structure)
     max_concurrent: 2
     params:
       dte_min: 30
@@ -406,7 +407,7 @@ strategies:
       min_credit_pct: 30               # total credit ≥ 30% of wing width
       profit_close_pct: 25             # tighter than verticals (50%) — short gamma both sides
       time_close_dte: 21               # close when either short ≤ 21 DTE
-      max_capital_per_condor_usd: 1000 # 2× the per-spread cap (4 legs)
+      max_capital_per_condor_usd: 500  # $5k sim: ~10% of the account per condor (was 1000)
       ivr_min: 30
       # Regime gate uses AND-combine of csps_allowed + bear_calls_allowed —
       # see risk/limits.py::_rule_regime_multi_leg. Both wings must be
@@ -427,7 +428,7 @@ strategies:
   - id: pmcc
     display_name: "Poor Man's Covered Call"
     type: pmcc
-    enabled: false
+    enabled: false              # $5k sim: dropped — a 0.80Δ LEAP on this universe costs more than the account
     max_concurrent: 3
     params:
       long_dte_min: 90
@@ -460,8 +461,8 @@ strategies:
   - id: calendar
     display_name: "Calendar Spread"
     type: calendar
-    enabled: false
-    max_concurrent: 3
+    enabled: true               # $5k sim: ON (low-IV, long-vega, defined risk = the debit)
+    max_concurrent: 2
     params:
       short_dte_min: 7
       short_dte_max: 21
