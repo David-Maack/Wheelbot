@@ -20,14 +20,22 @@ _NOW = datetime(2026, 6, 16, 12, 0, 0)
 
 
 class _StubBroker:
-    """Duck-typed broker for the smoke's call surface."""
+    """Duck-typed broker for the smoke's call surface. Tracks per-order status so
+    cancel_order can transition a resting order to CANCELLED (and a filled one
+    stays FILLED), letting run_smoke's re-fetch verification be exercised."""
 
-    def __init__(self, *, place_exc=None, mleg_exc=None, positions=None):
+    def __init__(self, *, place_exc=None, mleg_exc=None, positions=None, fill_single=False):
         self._place_exc = place_exc
         self._mleg_exc = mleg_exc
         self._positions = positions or []
+        self._fill_single = fill_single
         self.cancelled: list[str] = []
-        self._ids: list[str] = []
+        self._status: dict[str, OrderStatus] = {}
+
+    def _new(self, status: OrderStatus) -> str:
+        oid = f"ord-{len(self._status) + 1}"
+        self._status[oid] = status
+        return oid
 
     async def get_option_chain(self, underlying, expiration=None, option_type=None):
         return [
@@ -40,25 +48,25 @@ class _StubBroker:
     async def place_order(self, order):
         if self._place_exc:
             raise self._place_exc
-        oid = f"ord-{len(self._ids) + 1}"
-        self._ids.append(oid)
-        return order.model_copy(update={"broker_order_id": oid, "status": OrderStatus.PENDING})
+        oid = self._new(OrderStatus.FILLED if self._fill_single else OrderStatus.PENDING)
+        return order.model_copy(update={"broker_order_id": oid, "status": self._status[oid]})
 
     async def place_multi_leg_order(self, **kw):
         if self._mleg_exc:
             raise self._mleg_exc
-        oid = f"ord-{len(self._ids) + 1}"
-        self._ids.append(oid)
+        oid = self._new(OrderStatus.PENDING)
         return Order(account_id="tastytrade", symbol="F", order_type=OrderType.SELL_TO_OPEN,
                      quantity=1, status=OrderStatus.PENDING, placed_at=_NOW, broker_order_id=oid)
 
     async def get_orders_since(self, since):
         return [Order(account_id="tastytrade", symbol="F", order_type=OrderType.SELL_TO_OPEN,
-                      quantity=1, status=OrderStatus.PENDING, placed_at=_NOW, broker_order_id=oid)
-                for oid in self._ids]
+                      quantity=1, status=st, placed_at=_NOW, broker_order_id=oid)
+                for oid, st in self._status.items()]
 
     async def cancel_order(self, oid):
         self.cancelled.append(oid)
+        if self._status.get(oid) == OrderStatus.PENDING:  # best-effort: only resting orders cancel
+            self._status[oid] = OrderStatus.CANCELLED
 
     async def get_positions(self):
         return self._positions
@@ -68,10 +76,20 @@ class _StubBroker:
 async def test_smoke_happy_path_places_verifies_cancels():
     b = _StubBroker()
     single, multi, positions = await run_smoke(b)
-    assert "single-leg: PASS" in single and "in_orders_since=True" in single
+    assert "single-leg: PASS" in single and "cancelled" in single
     assert "multi-leg: PASS" in multi
     assert "positions: OK — 0 open" in positions
-    assert len(b.cancelled) == 2  # both orders placed and cancelled
+    assert len(b.cancelled) == 2  # both resting orders cancelled
+
+
+@pytest.mark.asyncio
+async def test_smoke_warns_when_single_leg_fills():
+    """A marketable single-leg that fills must NOT read as PASS — the re-fetch
+    sees FILLED and reports WARN (the old code trusted best-effort cancel)."""
+    b = _StubBroker(fill_single=True)
+    single, multi, _positions = await run_smoke(b)
+    assert "single-leg: WARN" in single and "FILLED" in single
+    assert "multi-leg: PASS" in multi  # vertical still rests + cancels cleanly
 
 
 @pytest.mark.asyncio

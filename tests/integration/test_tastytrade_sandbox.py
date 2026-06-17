@@ -11,9 +11,11 @@ manually in `config/secrets.env`):
     TASTYTRADE_ACCOUNT_NUMBER         (optional — first account picked otherwise)
     TASTYTRADE_USE_SANDBOX=true
 
-The test does not place fillable orders. It places a $0.01 limit CSP on F
-that should rest on the book, verifies it shows up via get_orders_since,
-then cancels it. **This is sandbox; it should never touch real money.**
+The test does not place fillable orders. It places a CSP on F at a limit
+ABOVE the put's strike (a put can't be worth more than its strike, so it can
+never fill — a $0.01 sell would be marketable and fill instantly), verifies it
+shows up via get_orders_since, then cancels it. **This is sandbox; it should
+never touch real money.**
 """
 
 from __future__ import annotations
@@ -88,7 +90,7 @@ async def test_place_paper_csp_through_abstraction():
                 expiration=contract.expiration,
                 option_type=OptionType.PUT,
                 quantity=1,
-                limit_price=0.01,
+                limit_price=round(contract.strike + 1.0, 2),  # above strike -> never fills
                 status=OrderStatus.PENDING,
                 placed_at=datetime.now(UTC).replace(tzinfo=None),
                 client_order_id=client_id,

@@ -7,9 +7,13 @@ abstraction — the Sprint-6 code that was never run end-to-end:
   Phase B  multi-leg    place_multi_leg_order (put vertical) -> verify -> cancel
            positions    get_positions shape (reconciler input)
 
-Every order is NON-FILLABLE (deep-OTM puts on F at a $0.01 / non-marketable
-limit) and cancelled immediately. **SANDBOX ONLY** (is_test=True →
-cert.tastyworks.com, fake money, 24h reset). It never touches real money.
+Every order is NON-FILLABLE and cancelled immediately: the single-leg sells a
+deep-OTM put ABOVE its strike (a put can't be worth more than its strike, so it
+can never fill), and the vertical asks a credit well above the spread's value.
+After cancelling, the order is re-fetched and asserted CANCELLED — a marketable
+limit that filled would otherwise be masked by best-effort cancel_order.
+**SANDBOX ONLY** (is_test=True → cert.tastyworks.com, fake money, 24h reset).
+It never touches real money.
 
 Run (after deploying the latest image so the OCC-padding fix is present):
 
@@ -71,17 +75,35 @@ def _classify_rejection(exc: Exception) -> str:
     return f"REJECTED — {msg}"
 
 
+async def _find_order(broker: Broker, oid: str, cutoff: datetime) -> Order | None:
+    orders = await broker.get_orders_since(cutoff)
+    return next((o for o in orders if o.broker_order_id == oid), None)
+
+
 async def _verify_and_cancel(broker: Broker, placed: Order, label: str) -> str:
-    if not placed.broker_order_id:
+    """Place is done; confirm the order is on the book, cancel it, then re-fetch
+    and assert it actually went CANCELLED. cancel_order is best-effort (swallows
+    errors), so trusting it would let a 422 on a filled order read as success —
+    we verify the resulting status instead."""
+    oid = placed.broker_order_id
+    if not oid:
         return f"{label}: FAIL — no broker_order_id (status={placed.status})"
     if placed.status == OrderStatus.REJECTED:
         return f"{label}: REJECTED (status) raw={placed.raw_response}"
     cutoff = _utcnow() - timedelta(minutes=5)
-    recent = await broker.get_orders_since(cutoff)
-    seen = any(o.broker_order_id == placed.broker_order_id for o in recent)
-    await broker.cancel_order(placed.broker_order_id)
-    return (f"{label}: PASS — id={placed.broker_order_id} status={placed.status} "
-            f"in_orders_since={seen} cancelled=ok")
+    before = await _find_order(broker, oid, cutoff)
+    seen = before is not None
+    if before is not None and before.status == OrderStatus.FILLED:
+        return (f"{label}: WARN — order FILLED immediately (marketable limit); left a "
+                f"position and is not cancellable. id={oid}")
+    await broker.cancel_order(oid)
+    after = await _find_order(broker, oid, cutoff)
+    status = after.status if after is not None else None
+    if status == OrderStatus.CANCELLED:
+        return f"{label}: PASS — id={oid} placed -> in_orders_since={seen} -> cancelled"
+    if status == OrderStatus.FILLED:
+        return f"{label}: WARN — filled before cancel; left a position. id={oid}"
+    return f"{label}: WARN — cancel not confirmed (status={status}); id={oid} seen={seen}"
 
 
 async def _low_strike_puts(broker: Broker, n: int) -> tuple[date, list[Any]]:
@@ -101,10 +123,13 @@ async def _phase_a_single_leg(broker: Broker) -> str:
     if not puts:
         return "single-leg: SKIP — empty F put chain"
     c = puts[0]
+    # SELL_TO_OPEN above the put's max value (a put can't be worth more than its
+    # strike) -> non-marketable -> rests on the book. A $0.01 sell would be
+    # marketable ("sell for >= 1c") and fill instantly, leaving a position.
     order = Order(
         account_id="tastytrade", symbol=SYMBOL, order_type=OrderType.SELL_TO_OPEN,
         contract_symbol=c.occ_symbol, strike=c.strike, expiration=c.expiration,
-        option_type=OptionType.PUT, quantity=1, limit_price=0.01,
+        option_type=OptionType.PUT, quantity=1, limit_price=round(c.strike + 1.0, 2),
         status=OrderStatus.PENDING, placed_at=_utcnow(),
         client_order_id=f"wb-smoke-1leg-{uuid.uuid4().hex[:8]}",
     )
