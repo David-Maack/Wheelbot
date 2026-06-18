@@ -36,7 +36,7 @@ tickers:
   - symbol: BAC
     name: "Bank of America"
     tier: 1
-    strategies: [monthly_wheel]
+    strategies: [narrow_put_spread, pmcc]   # $5k sim: re-pointed off monthly_wheel — very liquid, clean LEAPs
     notes: "Low IV but tight spreads, very liquid."
 
   - symbol: NOK
@@ -47,7 +47,7 @@ tickers:
   - symbol: SOFI
     name: "SoFi Technologies"
     tier: 1
-    strategies: [monthly_wheel]
+    strategies: [narrow_put_spread, pmcc, calendar]   # $5k sim: re-pointed off monthly_wheel — higher IV
     notes: "Higher IV fintech. Good monthly premium."
 
   - symbol: T
@@ -65,7 +65,7 @@ tickers:
   - symbol: INTC
     name: "Intel"
     tier: 1
-    strategies: [monthly_wheel]
+    strategies: [narrow_put_spread, pmcc, calendar]   # $5k sim: re-pointed off monthly_wheel — liquid LEAPs + IV
     notes: "Cyclical, often in IV-rich pockets after misses."
 
   - symbol: KMI
@@ -114,8 +114,15 @@ tickers:
   - symbol: AAL
     name: "American Airlines"
     tier: 1
-    strategies: [weekly_wheel]
+    strategies: [narrow_put_spread]   # $5k sim: re-pointed off weekly_wheel (LEAPs too thin for PMCC)
     notes: "Sub-$20 airline, weeklies + earnings IV."
+
+  # $5k sim (2026-06-18): low-price names for the defined-risk + PMCC mix.
+  - symbol: CCL
+    name: "Carnival Corporation"
+    tier: 1
+    strategies: [narrow_put_spread, pmcc, calendar]
+    notes: "~$22 cruise/travel; higher IV → good short-call/credit income + calendar vega; liquid options + LEAPs. Replaces Ford in the small-account set."
 
   # ============================================================
   # put_spread — 30-45 DTE bull put credit spreads, defined risk

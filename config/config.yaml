@@ -354,6 +354,33 @@ strategies:
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150
 
+  # $5k sim: low-price-name variant of the bull put spread (CCL/INTC/SOFI/BAC/AAL
+  # in universe.yaml). Same structure as put_spread but a NARROW $2 width — a $5
+  # width on a $15-40 stock pushes the long leg near-worthless (awful credit-to-
+  # risk, basically a naked put). Per-ticker width overrides aren't wired for
+  # spreads, so a dedicated strategy is the clean way to run cheap names at the
+  # right width — mirrors the monthly/weekly wheel split.
+  - id: narrow_put_spread
+    display_name: "Bull Put Spread (low-price)"
+    type: vertical_spread
+    enabled: true
+    max_concurrent: 2
+    params:
+      direction: bull_put
+      dte_min: 30
+      dte_max: 45
+      short_delta_min: 0.20
+      short_delta_max: 0.30
+      spread_width_dollars: 2.0
+      max_capital_per_spread_usd: 250
+      bid_ask_spread_max_pct: 15       # $5k sim: cheaper names quote wider than mega-caps — reject the worst fills
+      profit_close_pct: 50
+      time_close_dte: 21
+      stop_loss_mult: 2.0
+      ivr_min: 30
+      auto_disable_drawdown_usd: -300
+      drawdown_warning_usd: -150
+
   - id: bear_call_spread
     display_name: "Bear Call Spread"
     type: vertical_spread
@@ -428,8 +455,8 @@ strategies:
   - id: pmcc
     display_name: "Poor Man's Covered Call"
     type: pmcc
-    enabled: false              # $5k sim: dropped — a 0.80Δ LEAP on this universe costs more than the account
-    max_concurrent: 3
+    enabled: true               # $5k sim: ON for LOW-PRICE underlyings (CCL/INTC/SOFI/BAC) — a 0.80Δ LEAP there is ~$300-700, fits the account
+    max_concurrent: 2
     params:
       long_dte_min: 90
       long_dte_max: 180
@@ -443,7 +470,12 @@ strategies:
       profit_close_pct_short: 50       # close short at 50% of premium captured
       short_time_close_dte: 1          # close/roll short when it reaches 1 DTE
       long_roll_dte: 30                # roll the long forward when DTE < this
-      max_capital_per_position_usd: 10000
+      max_capital_per_position_usd: 1000   # $5k sim: cap the LEAP debit (was 10000) — a 0.80Δ LEAP on CCL/INTC/SOFI/BAC is $300-700
+      # $5k sim: reject illiquid LEAPs. The 0.80Δ long is the most expensive leg,
+      # so a bad fill hurts most — and a 2026-06-18 probe showed CCL/BAC/SOFI
+      # LEAPs at 12-72% spreads. At 10% those are filtered out, so PMCC stays
+      # dormant until a name has a tight, affordable LEAP (the honest $5k reality).
+      bid_ask_spread_max_pct: 10
       ivr_min: 25                      # lower than the wheel — PMCC tolerates flatter IV
       # Regime: PMCC long is a bullish bet, gated on csps_allowed (same flag a
       # CSP uses). PMCC short is covered premium → not regime-gated.
@@ -470,6 +502,7 @@ strategies:
       long_dte_max: 75
       option_type: call                # v1: call only
       max_debit_per_spread_usd: 250
+      bid_ask_spread_max_pct: 20       # $5k sim: two-leg, naturally wider — reject the worst cheap-name fills (indices are tight, unaffected)
       profit_close_pct: 25             # of the net debit
       time_close_short_dte: 2          # force-close when front ≤ 2 DTE
       ivr_max: 35                      # INVERTED — enter only when IVR is LOW
