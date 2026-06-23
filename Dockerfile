@@ -21,11 +21,12 @@ COPY intelligence/ ./intelligence/
 COPY risk/ ./risk/
 COPY dashboard/ ./dashboard/
 COPY db/ ./db/
+COPY mcp_server/ ./mcp_server/
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
 RUN pip install --upgrade pip \
- && pip install -e ".[broker,dashboard,intelligence,data]"
+ && pip install -e ".[broker,dashboard,intelligence,data,mcp]"
 
 RUN useradd --create-home --uid 1000 wheelbot \
  && mkdir -p /mnt/wheelbot-storage \
