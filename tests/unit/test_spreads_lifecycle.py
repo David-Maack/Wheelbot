@@ -163,6 +163,37 @@ async def test_reconciler_multi_leg_open_fill_transitions_to_spread_open(db_repo
     assert cycle.initial_capital_at_risk == pytest.approx(140.0)
 
 
+@pytest.mark.asyncio
+async def test_reconciler_selfheals_stuck_spread_pending_to_open(db_repos):
+    """TICKET-029: a spread whose PENDING→OPEN transition was missed (reconcile
+    cursor reset mid-rebuild, or a missed close-cancel) is stranded in
+    SPREAD_PENDING. The close orchestrator only walks SPREAD_OPEN, so it would
+    never be managed and never stopped out (META/GOOGL did exactly this). With
+    no order in flight and the legs still at the broker, the reconciler
+    self-heals it back to SPREAD_OPEN so the stop-loss can run again."""
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    open_result = await router.place_multi_leg(
+        _spread_proposal(qty=1), sleep=_noop_sleep, today=date(2025, 6, 1),
+    )
+    await broker.fill_multi_leg(open_result.placed.broker_order_id, fill_price=0.30)
+    reconciler = Reconciler(broker, db_repos, _config())
+    await reconciler.reconcile_once()  # normal path → SPREAD_OPEN
+
+    pos = await db_repos.positions.get_by_symbol("test", "F", strategy_id="put_spread")
+    assert pos.state == PositionState.SPREAD_OPEN
+    cycle_id = pos.current_cycle_id
+
+    # Strand it: force SPREAD_PENDING while the legs are still open at the broker
+    # and no order is in flight (the open FILLED earlier) — the exact stuck shape.
+    await db_repos.positions.update(pos.id, state=PositionState.SPREAD_PENDING.value)
+
+    await reconciler.reconcile_once()
+    healed = await db_repos.positions.get_by_symbol("test", "F", strategy_id="put_spread")
+    assert healed.state == PositionState.SPREAD_OPEN
+    assert healed.current_cycle_id == cycle_id
+
+
 # -- reconciler: multi-leg close fill -------------------------------------
 
 
@@ -419,8 +450,9 @@ async def test_close_orchestrator_triggers_on_profit_target(db_repos):
     )
     assert proposal is not None
     assert proposal.order_type == OrderType.MULTI_LEG_CLOSE
-    # Buy short at 0.13 mid, sell long at 0.03 mid → debit 0.10 → net credit -0.10
-    assert proposal.net_credit_per_spread == pytest.approx(-0.10)
+    # Order price is MARKETABLE: buy short at ask 0.14, sell long at bid 0.02 →
+    # debit 0.12 → net credit -0.12 (the 0.10 mid still drives the trigger).
+    assert proposal.net_credit_per_spread == pytest.approx(-0.12)
     actions = sorted(str(leg.action) for leg in proposal.legs)
     assert actions == sorted([OrderType.BUY_TO_CLOSE.value, OrderType.SELL_TO_CLOSE.value])
 
@@ -482,8 +514,10 @@ async def test_close_orchestrator_stop_loss_triggers_at_2x_credit_bull_put(db_re
     assert proposal is not None
     assert proposal.order_type == OrderType.MULTI_LEG_CLOSE
     assert "stop_loss" in proposal.rationale
-    # Debit = 0.72 short - 0.11 long = 0.61. Closing credit (signed) = -0.61.
-    assert proposal.net_credit_per_spread == pytest.approx(-0.61)
+    # Trigger uses the 0.61 mid debit (≥ 0.60 threshold). Order price is
+    # MARKETABLE: buy short at ask 0.73, sell long at bid 0.10 → debit 0.63 →
+    # net credit -0.63.
+    assert proposal.net_credit_per_spread == pytest.approx(-0.63)
 
 
 @pytest.mark.asyncio
