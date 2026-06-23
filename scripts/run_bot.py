@@ -290,53 +290,61 @@ async def _propose_and_route(
     total_placed = 0
     total_blocked = 0
     for strategy in strategies:
-        if not strategy.enabled:
-            continue
-        # Sprint 13 sub-sprint 1 + TICKET-008: drawdown circuit breaker is now
-        # tri-state. DISABLED → skip the strategy entirely. WARNING → size
-        # spreads at half (wheels stay at qty=1; the multiplier is a no-op for
-        # them but logged via wheel_warning_size_unhalved). NORMAL → unchanged.
-        drawdown_state = await auto_disable.current_state(repos, strategy.id)
-        if drawdown_state is auto_disable.DrawdownState.DISABLED:
-            log_checkpoint(
-                "bot_strategy_runtime_disabled",
-                status="skip",
-                strategy=strategy.id,
-                state=drawdown_state.value,
-            )
-            continue
-        # TICKET-009: independent pause gate. Read after drawdown
-        # (cheaper) — and both gates are independent so this can fire
-        # while drawdown is NORMAL or WARNING. PAUSE supersedes WARNING
-        # for the skip decision (more restrictive wins). INFO-level log
-        # only; no Discord forwarding (notify fires once on the
-        # NORMAL→PAUSED transition inside win_rate_floor.check_and_apply,
-        # rate-limited to 24h).
-        pause_state = await win_rate_floor.current_pause_state(repos, strategy.id)
-        if pause_state is win_rate_floor.WinRateState.PAUSED_LOW_WIN_RATE:
-            log_checkpoint(
-                "bot_strategy_runtime_paused_low_win_rate",
-                status="skip",
-                strategy=strategy.id,
-                state=pause_state.value,
-            )
-            continue
-        size_multiplier = drawdown_state.size_multiplier
-        if drawdown_state is auto_disable.DrawdownState.WARNING:
-            log_checkpoint(
-                "bot_strategy_warning_size_halved",
-                status="ok",
-                strategy=strategy.id,
-                size_multiplier=size_multiplier,
-            )
+        # TICKET-029: existing positions are MANAGED (closes / stops / rolls)
+        # on EVERY tick regardless of the gates below — disabling a strategy, or
+        # the drawdown breaker / win-rate floor tripping, must NEVER orphan its
+        # open positions (that left a disabled-wheel PLTR CSP unmanaged to
+        # -300%). Only NEW ENTRIES are gated. `opens_allowed` aggregates every
+        # entry-suppressing gate; closes always run further down.
+        opens_allowed = True
+        size_multiplier = 1.0
         strategy_universe = universe_for_strategy(strategy, universe)
-        if not strategy_universe["tickers"]:
+        if not strategy.enabled:
+            opens_allowed = False
+        else:
+            # Sprint 13 sub-sprint 1 + TICKET-008: tri-state drawdown breaker.
+            # DISABLED → no new entries (closes still run). WARNING → size
+            # spreads at half (wheels stay qty=1). NORMAL → unchanged.
+            drawdown_state = await auto_disable.current_state(repos, strategy.id)
+            if drawdown_state is auto_disable.DrawdownState.DISABLED:
+                log_checkpoint(
+                    "bot_strategy_runtime_disabled",
+                    status="skip",
+                    strategy=strategy.id,
+                    state=drawdown_state.value,
+                )
+                opens_allowed = False
+            else:
+                # TICKET-009: independent pause gate. Both gates are
+                # independent; PAUSE suppresses entries while drawdown is
+                # NORMAL or WARNING. Notify fires once on the NORMAL→PAUSED
+                # transition inside win_rate_floor.check_and_apply (24h limit).
+                pause_state = await win_rate_floor.current_pause_state(repos, strategy.id)
+                if pause_state is win_rate_floor.WinRateState.PAUSED_LOW_WIN_RATE:
+                    log_checkpoint(
+                        "bot_strategy_runtime_paused_low_win_rate",
+                        status="skip",
+                        strategy=strategy.id,
+                        state=pause_state.value,
+                    )
+                    opens_allowed = False
+                else:
+                    size_multiplier = drawdown_state.size_multiplier
+                    if drawdown_state is auto_disable.DrawdownState.WARNING:
+                        log_checkpoint(
+                            "bot_strategy_warning_size_halved",
+                            status="ok",
+                            strategy=strategy.id,
+                            size_multiplier=size_multiplier,
+                        )
+        # A non-empty universe is required to OPEN; closes never need it.
+        if opens_allowed and not strategy_universe["tickers"]:
             log_checkpoint(
                 "bot_strategy_empty_universe",
                 status="skip",
                 strategy=strategy.id,
             )
-            continue
+            opens_allowed = False
         if strategy.type == "wheel":
             # Profit-closes first — free up capital before considering new entries.
             # Closes are unaffected by drawdown WARNING; only new entries scale.
@@ -344,21 +352,25 @@ async def _propose_and_route(
                 broker, repos, config, strategy=strategy,
                 delta_unavailable_counters=delta_unavailable_counters,
             )
-            open_proposals = await propose_all(
-                broker, repos, config, strategy_universe, ivr, strategy=strategy,
-                size_multiplier=size_multiplier,
-            )
+            open_proposals = []
+            if opens_allowed:
+                open_proposals = await propose_all(
+                    broker, repos, config, strategy_universe, ivr, strategy=strategy,
+                    size_multiplier=size_multiplier,
+                )
             proposals = close_proposals + open_proposals
         elif strategy.type == "vertical_spread":
             # Closes first — free up capital before considering new entries.
             close_proposals = await propose_all_spread_closes(
                 broker, repos, config, strategy=strategy,
             )
-            open_proposals = await propose_all_spreads(
-                broker, repos, config, strategy_universe,
-                strategy=strategy, ivr=ivr,
-                size_multiplier=size_multiplier,
-            )
+            open_proposals = []
+            if opens_allowed:
+                open_proposals = await propose_all_spreads(
+                    broker, repos, config, strategy_universe,
+                    strategy=strategy, ivr=ivr,
+                    size_multiplier=size_multiplier,
+                )
             proposals = close_proposals + open_proposals
         elif strategy.type == "iron_condor":
             # TICKET-014: closes reuse propose_all_spread_closes — the close
@@ -368,11 +380,13 @@ async def _propose_and_route(
             close_proposals = await propose_all_spread_closes(
                 broker, repos, config, strategy=strategy,
             )
-            open_proposals = await propose_all_iron_condor(
-                broker, repos, config, strategy_universe,
-                strategy=strategy, ivr=ivr,
-                size_multiplier=size_multiplier,
-            )
+            open_proposals = []
+            if opens_allowed:
+                open_proposals = await propose_all_iron_condor(
+                    broker, repos, config, strategy_universe,
+                    strategy=strategy, ivr=ivr,
+                    size_multiplier=size_multiplier,
+                )
             proposals = close_proposals + open_proposals
         elif strategy.type == "pmcc":
             # TICKET-015: PMCC. Closes first (short profit/time, long roll),
@@ -382,10 +396,12 @@ async def _propose_and_route(
             close_proposals = await propose_all_pmcc_closes(
                 broker, repos, config, strategy=strategy,
             )
-            open_proposals = await propose_all_pmcc(
-                broker, repos, config, strategy_universe,
-                strategy=strategy, ivr=ivr,
-            )
+            open_proposals = []
+            if opens_allowed:
+                open_proposals = await propose_all_pmcc(
+                    broker, repos, config, strategy_universe,
+                    strategy=strategy, ivr=ivr,
+                )
             proposals = close_proposals + open_proposals
         elif strategy.type == "calendar":
             # TICKET-016: Calendar. 2-leg MLEG (same strike, two expirations),
@@ -395,10 +411,12 @@ async def _propose_and_route(
             close_proposals = await propose_all_calendar_closes(
                 broker, repos, config, strategy=strategy,
             )
-            open_proposals = await propose_all_calendar(
-                broker, repos, config, strategy_universe,
-                strategy=strategy, ivr=ivr,
-            )
+            open_proposals = []
+            if opens_allowed:
+                open_proposals = await propose_all_calendar(
+                    broker, repos, config, strategy_universe,
+                    strategy=strategy, ivr=ivr,
+                )
             proposals = close_proposals + open_proposals
         else:
             log_checkpoint(
@@ -600,7 +618,7 @@ async def main(argv: list[str] | None = None) -> int:
             return
         await _propose_and_route(
             broker=broker, repos=repos, router=router, ivr=ivr,
-            config=config, universe=universe, strategies=enabled_strategies,
+            config=config, universe=universe, strategies=strategies,
             delta_unavailable_counters=delta_unavailable_counters,
         )
 

@@ -306,8 +306,9 @@ async def test_close_orchestrator_infers_bear_call_direction_from_legs(db_repos)
     # Direction inference from leg option_type.
     assert proposal.direction == "bear_call"
     assert "bear_call_close" in proposal.rationale
-    # Buy short at 0.13 mid, sell long at 0.03 mid → debit 0.10 → net credit -0.10.
-    assert proposal.net_credit_per_spread == pytest.approx(-0.10)
+    # Order price is MARKETABLE: buy short at ask 0.14, sell long at bid 0.02 →
+    # debit 0.12 → net credit -0.12 (the 0.10 mid still drives the trigger).
+    assert proposal.net_credit_per_spread == pytest.approx(-0.12)
     actions = sorted(str(leg.action) for leg in proposal.legs)
     assert actions == sorted(
         [OrderType.BUY_TO_CLOSE.value, OrderType.SELL_TO_CLOSE.value]

@@ -35,6 +35,7 @@ from core.models import (
     OrderLeg,
     OrderType,
     PositionState,
+    Quote,
 )
 from core.strategies import StrategyDefinition
 from data.ivr import IVRProvider
@@ -360,6 +361,16 @@ async def _quote_mid(broker: Broker, symbol: str) -> float | None:
     return q.last or q.bid or q.ask
 
 
+async def _leg_quote(broker: Broker, symbol: str) -> Quote | None:
+    """Full quote for a close leg. The MID drives the close DECISION (fair
+    value); the BID/ASK drive the ORDER PRICE so the close is marketable and
+    actually fills rather than sitting behind a moving spread."""
+    try:
+        return await broker.get_quote(symbol)
+    except Exception:
+        return None
+
+
 async def propose_close_for_symbol(
     broker: Broker,
     repos: Repos,
@@ -435,12 +446,15 @@ async def propose_close_for_symbol(
         ):
             direction = DIRECTION_BEAR_CALL
 
-    # Re-quote each leg to compute current debit to close.
-    leg_mids: list[tuple[OrderLeg, float | None]] = []
+    # Re-quote each leg. The MID drives the close DECISION (fair value), while
+    # the BID/ASK drive the ORDER PRICE: a close limit at the mid sits behind a
+    # fast-moving spread, cancel-loops, and the position rides to max loss
+    # (META/GOOGL did exactly that). Pricing the package marketably — buy legs
+    # at the ask, sell legs at the bid — makes a stop-loss actually fill.
+    leg_quotes: list[tuple[OrderLeg, Quote | None]] = []
     for leg in close_legs:
-        mid = await _quote_mid(broker, leg.contract_symbol)
-        leg_mids.append((leg, mid))
-    if any(mid is None for _, mid in leg_mids):
+        leg_quotes.append((leg, await _leg_quote(broker, leg.contract_symbol)))
+    if any(q is None or q.mid is None for _, q in leg_quotes):
         log_checkpoint(
             "spread_close_skip_no_quote",
             status="skip",
@@ -449,17 +463,23 @@ async def propose_close_for_symbol(
         )
         return None
 
-    # Net debit-to-close per share = sum_buy_mid - sum_sell_mid (for the close
-    # legs). For a bull put credit spread close: buy short (debit) + sell long
-    # (credit). Convention: positive = we pay debit, negative = we still
-    # collect a credit (rare, only late in winning trades).
+    # Two debit-to-close figures, per share. Convention: positive = we pay a
+    # debit. `debit_to_close` (mid) is fair value and drives the trigger;
+    # `marketable_debit` (ask for buys, bid for sells) crosses the spread and
+    # drives the order limit so the close fills.
     debit_to_close = 0.0
-    for leg, mid in leg_mids:
-        assert mid is not None
+    marketable_debit = 0.0
+    for leg, q in leg_quotes:
+        assert q is not None and q.mid is not None
+        mid = q.mid
+        ask = q.ask if q.ask is not None else mid
+        bid = q.bid if q.bid is not None else mid
         if leg.action == OrderType.BUY_TO_CLOSE:
             debit_to_close += mid
+            marketable_debit += ask
         elif leg.action == OrderType.SELL_TO_CLOSE:
             debit_to_close -= mid
+            marketable_debit -= bid
 
     # Original credit collected per package = open_order.fill_price (signed).
     original_credit_per_share = open_order.fill_price or 0.0
@@ -490,8 +510,10 @@ async def propose_close_for_symbol(
 
     quantity = open_order.quantity or 1
     # MultiLegProposal.net_credit_per_spread for a CLOSE: signed net per share
-    # we'd receive. For a debit close, this is negative.
-    net_close_credit = -debit_to_close
+    # we'd receive. For a debit close, this is negative. Use the MARKETABLE
+    # debit (crosses the spread) so the close fills; the router concedes an
+    # extra close_slippage on top.
+    net_close_credit = -marketable_debit
     rationale_parts = []
     if profit_trigger:
         rationale_parts.append(

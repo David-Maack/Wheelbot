@@ -926,8 +926,57 @@ class Reconciler:
             return
 
         if local.state in (PositionState.CSP_PENDING, PositionState.CC_PENDING):
-            # Pending means we have an order but no fill yet. No transition here;
-            # _on_fill drives it.
+            # Normally _on_fill drives PENDING → OPEN off the order stream. But
+            # if the reconcile cursor was reset mid-flight (process restart
+            # during a rebuild), a one-shot fill/cancel can be missed and the
+            # position is stranded in PENDING forever — never managed. Self-heal
+            # off broker truth, but only when NO order is still working.
+            if await self._has_inflight_order(local):
+                return
+            if local.state == PositionState.CSP_PENDING:
+                if has_short_put:
+                    await self._set_position_state(
+                        local, symbol, PositionState.CSP_OPEN,
+                        "selfheal:stuck_csp_pending",
+                        cycle_id=local.current_cycle_id,
+                        strategy_id=local.strategy_id,
+                    )
+                    log_checkpoint(
+                        "reconcile_selfheal_pending", status="ok", symbol=symbol,
+                        from_state="CSP_PENDING", to_state="CSP_OPEN",
+                    )
+                elif not broker_present:
+                    await self._set_position_state(
+                        local, symbol, PositionState.IDLE,
+                        "selfheal:csp_pending_unfilled",
+                        strategy_id=local.strategy_id,
+                    )
+                    log_checkpoint(
+                        "reconcile_selfheal_pending", status="ok", symbol=symbol,
+                        from_state="CSP_PENDING", to_state="IDLE",
+                    )
+            else:  # CC_PENDING
+                if has_short_call:
+                    await self._set_position_state(
+                        local, symbol, PositionState.CC_OPEN,
+                        "selfheal:stuck_cc_pending",
+                        cycle_id=local.current_cycle_id,
+                        strategy_id=local.strategy_id,
+                    )
+                    log_checkpoint(
+                        "reconcile_selfheal_pending", status="ok", symbol=symbol,
+                        from_state="CC_PENDING", to_state="CC_OPEN",
+                    )
+                elif has_shares:
+                    await self._set_position_state(
+                        local, symbol, PositionState.SHARES_HELD,
+                        "selfheal:cc_pending_unfilled",
+                        strategy_id=local.strategy_id,
+                    )
+                    log_checkpoint(
+                        "reconcile_selfheal_pending", status="ok", symbol=symbol,
+                        from_state="CC_PENDING", to_state="SHARES_HELD",
+                    )
             return
 
         if local.state == PositionState.SPREAD_OPEN:
@@ -969,7 +1018,34 @@ class Reconciler:
             return
 
         if local.state == PositionState.SPREAD_PENDING:
-            # No state-shape transition; _on_fill drives PENDING → OPEN.
+            # Normally _on_fill (open) / _on_cancel (close) drive PENDING
+            # transitions off the order stream. A cursor reset mid-flight
+            # (process restart during a rebuild) can drop that one-shot signal,
+            # stranding the spread in PENDING forever — the close orchestrator
+            # only walks SPREAD_OPEN, so it's never managed and never stopped
+            # out (META/GOOGL did exactly this). Self-heal off broker truth, but
+            # only when NO order is still working for this position.
+            if await self._has_inflight_order(local):
+                return
+            if broker_present:
+                await self._set_position_state(
+                    local, symbol, PositionState.SPREAD_OPEN,
+                    "selfheal:stuck_spread_pending",
+                    cycle_id=local.current_cycle_id,
+                    strategy_id=local.strategy_id,
+                )
+                log_checkpoint(
+                    "reconcile_selfheal_pending", status="ok", symbol=symbol,
+                    from_state="SPREAD_PENDING", to_state="SPREAD_OPEN",
+                )
+            else:
+                await self._flag_manual_intervention(
+                    symbol,
+                    f"spread {symbol} stuck SPREAD_PENDING with no in-flight "
+                    "order and no legs at broker — open never filled or close "
+                    "not reconciled; review",
+                    summary,
+                )
             return
 
         # TICKET-015 PMCC. The long LEAP is invisible at the broker on
@@ -1265,6 +1341,24 @@ class Reconciler:
             )
 
     # -- Helpers --------------------------------------------------------------
+
+    async def _has_inflight_order(self, position: Position) -> bool:
+        """True if any order on this position's symbol is still working
+        (PENDING/PARTIAL). The stuck-PENDING self-heal uses this to avoid racing
+        a genuinely in-flight order — match on symbol only (not strategy_id) so
+        the guard stays conservative: if anything is working on the underlying,
+        defer the self-heal one tick rather than risk clobbering a transition
+        the order stream is about to drive."""
+        c = await self._repos.db.connect()
+        async with c.execute(
+            "SELECT 1 FROM orders WHERE symbol = ? AND status IN (?, ?) LIMIT 1",
+            (
+                position.symbol,
+                OrderStatus.PENDING.value,
+                OrderStatus.PARTIAL.value,
+            ),
+        ) as cur:
+            return await cur.fetchone() is not None
 
     async def _set_position_state(
         self,
