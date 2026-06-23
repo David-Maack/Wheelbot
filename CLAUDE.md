@@ -75,9 +75,13 @@ You can tell the deployed image is stale when:
 
 ### Cron timezone
 
-The LXC was historically MDT, which made the screener cron fire 6 hours off.
-TZ is now **UTC** on the LXC. Cron entries in this repo (`scripts/run_*.py`)
-assume UTC; if you re-host on a non-UTC machine, adjust the crontab.
+The LXC runs on **MDT (UTC-6)** local time — verified via `date` on CT 105
+(2026-06-23). An earlier note here claimed the box had been switched to UTC;
+that did not hold, so treat the LXC as MDT. The installed host crontab is
+MDT-aware (its header comment and the times line up, e.g. `0 7` = 07:00 MDT =
+09:00 ET pre-market), so jobs fire at the intended ET moments. Keep any new
+cron entries in LXC-local MDT (e.g. the daily macro-calendar refresh at
+`0 6 * * *` = 06:00 MDT).
 
 ## Workflow conventions
 

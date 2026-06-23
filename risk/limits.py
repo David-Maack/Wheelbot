@@ -325,12 +325,14 @@ class RiskGate:
             return
         days_before = int(params.get("earnings_blackout_days_before", 5))
         days_after = int(params.get("earnings_blackout_days_after", 2))
+        block_if_spans = bool(params.get("earnings_block_if_spans", True))
         in_window = in_blackout(
             proposal.symbol,
             proposal.contract.expiration,
             days_before=days_before,
             days_after=days_after,
             today=today,
+            block_if_spans=block_if_spans,
         )
         if in_window is None:
             result.add("earnings_blackout", "skip", "no earnings data")
@@ -357,6 +359,7 @@ class RiskGate:
             return
         days_before = int(params.get("earnings_blackout_days_before", 5))
         days_after = int(params.get("earnings_blackout_days_after", 2))
+        block_if_spans = bool(params.get("earnings_block_if_spans", True))
         short_leg = next(
             (
                 leg for leg in proposal.legs
@@ -371,6 +374,7 @@ class RiskGate:
             days_before=days_before,
             days_after=days_after,
             today=today,
+            block_if_spans=block_if_spans,
         )
         if in_window is None:
             result.add("earnings_blackout", "skip", "no earnings data")

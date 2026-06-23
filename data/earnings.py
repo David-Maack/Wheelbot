@@ -177,8 +177,20 @@ def in_blackout(
     days_before: int,
     days_after: int,
     today: date | None = None,
+    block_if_spans: bool = True,
 ) -> bool | None:
-    """True if expiration falls inside the blackout window around earnings.
+    """True if opening a position expiring on `expiration` conflicts with the
+    symbol's next earnings date. Two independent triggers (either one → True):
+
+      1. Expiration sits inside the window AROUND the event:
+         earnings - days_before  <=  expiration  <=  earnings + days_after.
+      2. `block_if_spans` and the position would be HELD THROUGH earnings —
+         the event falls in (today, expiration]. This catches a position that
+         expires well AFTER earnings (outside window #1) but is short gamma
+         across the event, e.g. earnings 2026-07-27 with a 2026-07-31 expiry.
+         Pre-TICKET-030 only trigger #1 ran, so earnings-spanning spreads
+         slipped through entry and were caught (too late) by the mid-cycle
+         recheck → MANUAL_INTERVENTION churn.
 
     Returns None when we can't determine the next earnings date — caller decides
     fail-open vs fail-closed. The risk gate uses fail-open (skip rule).
@@ -188,10 +200,11 @@ def in_blackout(
         return None
     today = today or datetime.now(timezone.utc).date()
     earnings = lookup.next_date
-    # Blackout if expiration is within days_before before or days_after after the event.
-    return (earnings - expiration).days <= days_before and (
+    near_expiry = (earnings - expiration).days <= days_before and (
         expiration - earnings
     ).days <= days_after
+    spans = block_if_spans and today < earnings <= expiration
+    return near_expiry or spans
 
 
 def _clear_cache() -> None:
