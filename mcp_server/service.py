@@ -172,7 +172,7 @@ class WheelbotMcpService:
 
     async def get_regime_and_calendar(self, days: int = 14) -> dict:
         """Latest market-regime flags + upcoming macro events and calendar freshness."""
-        snap = await self._repos.regime_snapshots.latest()
+        snap = await self._repos.regime.latest()
         today = datetime.now(UTC).date()
         events = await self._repos.macro_events.between(today, today + timedelta(days=days))
         last_fetched = await self._repos.macro_events.last_fetched_at()
@@ -217,7 +217,7 @@ class WheelbotMcpService:
                     "enabled": s.enabled,
                     "runtime": self._runtime_summary(rt),
                 })
-        snap = await self._repos.regime_snapshots.latest()
+        snap = await self._repos.regime.latest()
         regime = None
         if snap is not None:
             regime = {

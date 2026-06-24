@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
-from core.models import Position, PositionState
+from core.models import Position, PositionState, Regime, RegimeSnapshot
 from mcp_server.service import ControlsDisabled, WheelbotMcpService
 from platforms.paper_broker import PaperBroker
 
@@ -81,3 +81,37 @@ async def test_get_account_risk_reports_cap(db_repos, tmp_path):
     assert res["concurrent_cap"]["limit"] == 4
     assert res["concurrent_cap"]["used"] == 0
     assert "equity" in res and "net_position_value" in res
+
+
+async def _seed_regime(db_repos) -> None:
+    await db_repos.regime.insert(RegimeSnapshot(
+        snapshot_date=date(2026, 6, 24),
+        regime=Regime.BULL_TREND,
+        csps_allowed=True,
+        bear_calls_allowed=False,
+        spy_above_sma=True,
+        vix_close=17.3,
+    ))
+
+
+@pytest.mark.asyncio
+async def test_get_regime_and_calendar_reads_snapshot(db_repos, tmp_path):
+    # Regression: the service read `self._repos.regime_snapshots` (no such attr
+    # on Repos — it's `.regime`), so this tool raised AttributeError in prod.
+    await _seed_regime(db_repos)
+    res = await _service(db_repos, tmp_path).get_regime_and_calendar(days=30)
+    assert res["regime"] is not None
+    assert res["regime"]["regime"] == "BULL_TREND"
+    assert res["regime"]["csps_allowed"] is True
+    assert res["regime"]["bear_calls_allowed"] is False
+    assert "upcoming_events" in res
+
+
+@pytest.mark.asyncio
+async def test_diagnose_symbol_reads_regime(db_repos, tmp_path):
+    # Regression: same `self._repos.regime_snapshots` bug also broke this tool.
+    await _seed_regime(db_repos)
+    res = await _service(db_repos, tmp_path).diagnose_symbol("spy")
+    assert res["symbol"] == "SPY"
+    assert res["regime"] is not None
+    assert res["regime"]["regime"] == "BULL_TREND"
