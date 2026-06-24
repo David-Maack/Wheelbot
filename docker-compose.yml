@@ -45,6 +45,32 @@ services:
       timeout: 10s
       retries: 3
 
+  # Ops MCP: read tools + guarded controls over authenticated streamable HTTP.
+  # Bound to 127.0.0.1 like the dashboard; exposed to the tailnet via the same
+  # mechanism (tailscale serve / tunnel — see docs/MCP.md). Requires
+  # WHEELBOT_MCP_TOKEN in secrets.env (server refuses to start without it).
+  mcp:
+    build: .
+    image: wheelbot:latest
+    container_name: wheelbot-mcp
+    restart: unless-stopped
+    depends_on:
+      - wheelbot
+    env_file:
+      - ./config/secrets.env
+    volumes:
+      - wheelbot-storage:/mnt/wheelbot-storage
+      - ./config/config.local.yaml:/opt/wheelbot/config/config.local.yaml:ro
+      - ./config/universe.yaml:/opt/wheelbot/config/universe.yaml:ro
+    command: ["python", "-m", "scripts.run_mcp"]
+    ports:
+      - "127.0.0.1:8890:8890"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8890), timeout=5).close()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
 volumes:
   wheelbot-storage:
     driver: local

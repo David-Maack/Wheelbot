@@ -69,6 +69,15 @@ wheel:
   max_concurrent_positions: 4
   buying_power_floor_pct: 20
 
+# Ops MCP (scripts/run_mcp): read tools always on; control tools gated by
+# controls_enabled (shipped ON — the bearer token + private port binding are
+# the guards). Requires WHEELBOT_MCP_TOKEN in secrets.env; the server refuses
+# to start without it. See docs/MCP.md.
+mcp:
+  host: "0.0.0.0"
+  port: 8890
+  controls_enabled: true
+
 risk:
   daily_loss_kill_switch_pct: 5  # if account drops 5% in a day, halt new trades
   consecutive_losses_pause: 3    # 3 losses in a row → pause for human review
@@ -138,6 +147,13 @@ intelligence:
   #     output_per_mtok: 75.0
 
 risk:
+  # Kill-switch stop file on the SHARED volume so the bot, dashboard, and
+  # ops-MCP containers all reach it. (Was /opt/wheelbot/STOP in the now-dead
+  # duplicate `risk:` block above — only the bot container could touch it, and
+  # the duplicate key dropped it from the effective config entirely, silently
+  # disabling the manual stop switch.)
+  stop_file_path: "/mnt/wheelbot-storage/STOP"
+
   # TICKET-007: macro event blackout. Blocks NEW short premium entries whose
   # lifespan [today, expiration] would cross a high-impact macro event
   # (FOMC / CPI / NFP by default). Bypassed for closes — once a position is
