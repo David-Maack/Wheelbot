@@ -23,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 
 from backtest.data import load_daily_yf, load_intraday_alpaca, load_vix_daily
 from backtest.engine import EngineConfig, run_backtest
-from backtest.report import format_table, summarize
+from backtest.report import format_exit_breakdown, format_table, summarize
 from strategies.swing_signal import SwingParams, TimeframeSpec
 
 # Timeframe stacks for the sweep. The trigger is always 5m; higher TFs gate.
@@ -40,14 +40,16 @@ _STACKS = {
 }
 
 
-# Exit-tuning grid (3-TF stack). max_hold_days=7 matches the 2-7 day thesis;
-# we vary the stop width / min-hold / anchor to fix the 0.58-day flush-out.
+# Exit-mechanism grid (3-TF stack). The prior round showed the 5-min opposite
+# -cross was flushing every trade in ~0.5 day regardless of stop width, so this
+# round varies the EXIT MECHANISM: keep it / drop it / replace with a daily flip.
+# Base = prior-day-level stop + 1-day min-hold + 7-day max-hold (the prior best).
+_BASE = dict(stop_mode="prior_day_level", min_hold_days=1.0, max_hold_days=7)
 _EXIT_CONFIGS = [
-    ("atr1.0/mh0", dict(stop_atr=1.0, min_hold_days=0.0, stop_mode="atr", max_hold_days=7)),
-    ("atr2.0/mh0", dict(stop_atr=2.0, min_hold_days=0.0, stop_mode="atr", max_hold_days=7)),
-    ("atr2.0/mh1", dict(stop_atr=2.0, min_hold_days=1.0, stop_mode="atr", max_hold_days=7)),
-    ("atr2.5/mh1", dict(stop_atr=2.5, min_hold_days=1.0, stop_mode="atr", max_hold_days=7)),
-    ("pdl/mh1", dict(stop_mode="prior_day_level", min_hold_days=1.0, max_hold_days=7)),
+    ("pdl/opp", dict(**_BASE, opposite_cross_exit=True)),  # prior best, for reference
+    ("pdl/noopp", dict(**_BASE, opposite_cross_exit=False)),  # stop/target/time only
+    ("pdl/flip", dict(**_BASE, opposite_cross_exit=False, exit_on_daily_flip=True)),
+    ("atr2/noopp", dict(stop_atr=2.0, min_hold_days=1.0, max_hold_days=7, opposite_cross_exit=False)),
 ]
 
 
@@ -69,6 +71,8 @@ def _tune(bars5m, daily, weekly, vix, json_out: bool) -> int:
         print(json.dumps(payload, indent=2, default=str))
     else:
         print(format_table(rows))
+        print()
+        print(format_exit_breakdown(rows))
         print("\nAll variants shown (no cherry-picking). If a config turns clearly "
               "positive, validate it on a held-out window before trusting it — else "
               "it's curve-fit to 2024-26.")

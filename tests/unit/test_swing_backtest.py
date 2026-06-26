@@ -183,6 +183,38 @@ def test_prior_day_level_stop_anchors_to_prior_low():
     assert trades[0].exit_reason == "stop" and trades[0].exit_spot == pytest.approx(96.0)
 
 
+def test_opposite_cross_off_ignores_5m_reversal():
+    daily = _constant_daily()  # ATR 2, stop far away at 90 (stop_atr large)
+    idx = pd.date_range("2026-06-03 09:30", periods=4, freq="5min")
+    # Long entry then an opposite 5-min cross at bar 2.
+    sig_df = pd.DataFrame(
+        {"open": [100, 100, 100, 100], "high": [100, 100, 100, 100],
+         "low": [100, 100, 100, 100], "close": [100, 100, 100, 100],
+         "volume": [1000] * 4, "cross": [0, 1, -1, 0], "signal": [0, 1, 0, 0]},
+        index=idx,
+    )
+    on = simulate_spy_trades(sig_df, daily, EngineConfig(stop_atr=5.0, opposite_cross_exit=True))
+    assert on[0].exit_reason == "opposite_cross"
+    off = simulate_spy_trades(sig_df, daily, EngineConfig(stop_atr=5.0, opposite_cross_exit=False))
+    assert off[0].exit_reason != "opposite_cross"  # the 5-min reversal is ignored
+
+
+def test_daily_flip_exit_fires_on_direction_change():
+    daily = _constant_daily()
+    idx = pd.date_range("2026-06-03 09:30", periods=4, freq="5min")
+    # Long entry; daily direction flips to -1 at bar 2 → exit on the flip.
+    sig_df = pd.DataFrame(
+        {"open": [100, 100, 100, 100], "high": [100, 100, 100, 100],
+         "low": [100, 100, 100, 100], "close": [100, 100, 100, 100],
+         "volume": [1000] * 4, "cross": [0, 1, 0, 0], "signal": [0, 1, 0, 0],
+         "dir_1D": [1, 1, -1, -1]},
+        index=idx,
+    )
+    cfg = EngineConfig(stop_atr=5.0, opposite_cross_exit=False, exit_on_daily_flip=True)
+    trades = simulate_spy_trades(sig_df, daily, cfg)
+    assert trades[0].exit_reason == "daily_flip"
+
+
 # --- 200-SMA regime gate ----------------------------------------------------
 def test_regime_by_date_signs():
     idx = pd.date_range("2026-06-01", periods=5, freq="1D")

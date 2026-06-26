@@ -54,7 +54,8 @@ class EngineConfig:
     regime_sma: int = 200
     iv_floor: float = 0.08
     contracts: int = 1
-    opposite_cross_exit: bool = True
+    opposite_cross_exit: bool = True  # exit on a 5-min opposite EMA/VWAP cross (noisy)
+    exit_on_daily_flip: bool = False  # exit when the daily direction flips against us
     structures: tuple[StructureSpec, ...] = (
         StructureSpec("ITM", 0.67),
         StructureSpec("OTM", 0.30),
@@ -230,6 +231,7 @@ def simulate_spy_trades(signal_df: pd.DataFrame, daily: pd.DataFrame, cfg: Engin
             held_days = (pd.Timestamp(b.Index) - pd.Timestamp(entry_ts)).total_seconds() / 86400.0
             hi, lo, close = float(b.high), float(b.low), float(b.close)
             opp_cross = cfg.opposite_cross_exit and int(getattr(b, "cross", 0)) == -sig
+            daily_flip = cfg.exit_on_daily_flip and int(getattr(b, "dir_1D", 0)) == -sig
             allow_stop = held_days >= cfg.min_hold_days  # let the trade breathe first
             if sig > 0:
                 if allow_stop and lo <= stop_px:  # stop checked first (conservative)
@@ -243,6 +245,8 @@ def simulate_spy_trades(signal_df: pd.DataFrame, daily: pd.DataFrame, cfg: Engin
                     exit_ts, exit_spot, reason = b.Index, target_px, "target"
             if exit_ts is None and opp_cross:
                 exit_ts, exit_spot, reason = b.Index, close, "opposite_cross"
+            if exit_ts is None and daily_flip:
+                exit_ts, exit_spot, reason = b.Index, close, "daily_flip"
             if exit_ts is None and held_days >= cfg.max_hold_days:
                 exit_ts, exit_spot, reason = b.Index, close, "time_stop"
             if exit_ts is not None:

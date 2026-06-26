@@ -9,7 +9,8 @@ side.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 
 from backtest.engine import Trade
 
@@ -26,6 +27,7 @@ class Summary:
     total_pnl: float
     max_drawdown: float
     avg_hold_days: float
+    exit_reasons: dict = field(default_factory=dict)  # reason -> count
 
 
 def summarize(trades: list[Trade]) -> Summary:
@@ -60,6 +62,7 @@ def summarize(trades: list[Trade]) -> Summary:
         total_pnl=sum(pnls),
         max_drawdown=max_dd,
         avg_hold_days=sum(t.hold_days for t in trades) / len(trades),
+        exit_reasons=dict(Counter(t.exit_reason for t in trades)),
     )
 
 
@@ -77,4 +80,21 @@ def format_table(rows: list[tuple[str, str, Summary]]) -> str:
             f"{s.expectancy_pct * 100:>6.1f} {s.expectancy_usd:>8.0f} {pf:>6} "
             f"{s.max_drawdown:>9.0f} {s.avg_hold_days:>7.2f} {s.total_pnl:>10.0f}"
         )
+    return "\n".join(lines)
+
+
+def format_exit_breakdown(rows: list[tuple[str, str, Summary]]) -> str:
+    """One line per unique config: exit-reason mix (% of trades). ITM/OTM share
+    the same SPY-level exits, so we report each config once."""
+    lines = ["exit-reason mix (% of trades, per config):"]
+    seen = set()
+    for label, _struct, s in rows:
+        if label in seen or s.n_trades == 0:
+            continue
+        seen.add(label)
+        parts = ", ".join(
+            f"{reason} {100 * cnt / s.n_trades:.0f}%"
+            for reason, cnt in sorted(s.exit_reasons.items(), key=lambda kv: -kv[1])
+        )
+        lines.append(f"  {label:>12}: {parts}")
     return "\n".join(lines)
