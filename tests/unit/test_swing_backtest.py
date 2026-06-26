@@ -17,7 +17,7 @@ from backtest.engine import (
     price_structure,
     simulate_spy_trades,
 )
-from backtest.report import summarize
+from backtest.report import compound_equity, summarize
 from strategies.swing_signal import SwingParams, TimeframeSpec
 
 
@@ -257,6 +257,27 @@ def test_price_shares_is_pure_direction():
     assert out[0].pnl == pytest.approx(3.0 * 100 - 2.0)  # +$298
     assert out[1].pnl == pytest.approx(-3.0 * 100 - 2.0)  # -$302
     assert out[0].structure == "SHARES"
+
+
+# --- compounding ------------------------------------------------------------
+def test_compound_equity_multiplies_in_sequence():
+    # +10% then -10% at full deployment → 1.1 * 0.9 = 0.99 (volatility drag).
+    final, max_dd, ruin = compound_equity([0.10, -0.10], start=1000.0, fraction=1.0)
+    assert not ruin
+    assert final == pytest.approx(990.0)
+    assert max_dd == pytest.approx(0.10)  # peaked at 1100, fell to 990
+
+
+def test_compound_equity_fraction_scales_exposure():
+    # Half deployment halves each trade's impact.
+    final, _dd, _r = compound_equity([0.10], start=1000.0, fraction=0.5)
+    assert final == pytest.approx(1050.0)
+
+
+def test_compound_equity_detects_ruin():
+    # A -120% deployed return (leverage) wipes the account.
+    final, _dd, ruin = compound_equity([-1.2], start=1000.0, fraction=1.0)
+    assert ruin and final == 0.0
 
 
 # --- 200-SMA regime gate ----------------------------------------------------

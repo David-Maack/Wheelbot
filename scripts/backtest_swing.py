@@ -29,10 +29,16 @@ from backtest.engine import (
     StructureSpec,
     generate_signals,
     price_shares,
+    price_structure,
     run_backtest,
     simulate_spy_trades,
 )
-from backtest.report import format_exit_breakdown, format_table, summarize
+from backtest.report import (
+    compound_equity,
+    format_exit_breakdown,
+    format_table,
+    summarize,
+)
 from strategies.swing_signal import SwingParams, TimeframeSpec
 
 # Timeframe stacks for the sweep. The trigger is always 5m; higher TFs gate.
@@ -215,8 +221,53 @@ def _greeks(bars5m, daily, weekly, vix, json_out: bool) -> int:
     return 0
 
 
+def _compound(bars5m, daily, weekly, vix, json_out: bool, *, capital: float,
+              fraction: float, delta: float, dte: float, as_shares: bool) -> int:
+    """Reinvest profits: compound per-trade returns at `fraction` of capital."""
+    cfg = _winner_cfg(delta, dte, commission_per_contract=_COMMISSION,
+                      slippage_per_contract=_OOS_SLIPPAGE)
+    sig = generate_signals(bars5m, daily, _STACKS[3], weekly=weekly, cfg=cfg)
+    spy = simulate_spy_trades(sig, daily, cfg)
+    if as_shares:
+        trades = price_shares(spy, shares=100, cost_per_trade=2.0)
+        label = "SPY shares (return on notional, UNLEVERAGED)"
+    else:
+        trades = price_structure(spy, StructureSpec("ITM", delta), vix, cfg)
+        label = f"{delta:.2f}-delta/{dte:.0f}-DTE options (return on premium, LEVERAGED)"
+    trades = sorted(trades, key=lambda t: t.entry_ts)
+    final, max_dd, ruined = compound_equity([t.pnl_pct for t in trades], capital, fraction)
+    c = daily["close"].dropna()
+    spy_mult = float(c.iloc[-1] / c.iloc[0]) if len(c) else 1.0
+    out = {
+        "structure": label, "start": capital, "fraction": fraction, "n_trades": len(trades),
+        "final": round(final), "ruin": ruined,
+        "total_return_pct": -100.0 if ruined else round((final / capital - 1) * 100, 1),
+        "max_drawdown_pct": round(max_dd * 100, 1),
+        "spy_buyhold_final": round(capital * spy_mult), "spy_buyhold_pct": round((spy_mult - 1) * 100, 1),
+    }
+    if json_out:
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    print(f"COMPOUNDING — {label}")
+    print(f"  start ${capital:,.0f}, deploy {fraction:.0%} of capital/trade, "
+          f"{len(trades)} trades over ~2 yr")
+    if ruined:
+        print("  *** RUIN: capital hit zero — fraction too high for this structure's variance ***")
+    else:
+        print(f"  final ${final:,.0f}  ({out['total_return_pct']:+.0f}% total)  "
+              f"max drawdown {max_dd:.0%}")
+    print(f"  vs SPY buy-hold (same $ compounded by the index): "
+          f"${capital * spy_mult:,.0f} ({out['spy_buyhold_pct']:+.0f}%)")
+    print("\nCAVEATS: hyper-sensitive to the deploy fraction AND to the 111-trade "
+          "sequence (tiny sample — one early bad streak changes everything). Leverage "
+          "(options + high fraction) raises BOTH the final number AND ruin risk. "
+          "Illustrative, NOT a projection.")
+    return 0
+
+
 def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool,
-        mode: str, delta: float = 0.67, dte: float = 25.0) -> int:
+        mode: str, delta: float = 0.67, dte: float = 25.0,
+        capital: float = 5000.0, fraction: float = 0.5, as_shares: bool = False) -> int:
     print(f"Loading SPY 5-min bars from Alpaca ({start.date()} -> {end.date()}, feed={feed})...",
           file=sys.stderr)
     bars5m = load_intraday_alpaca("SPY", start, end, feed=feed)
@@ -239,6 +290,9 @@ def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool,
         return _shares(bars5m, daily, weekly, vix, json_out)
     if mode == "greeks":
         return _greeks(bars5m, daily, weekly, vix, json_out)
+    if mode == "compound":
+        return _compound(bars5m, daily, weekly, vix, json_out, capital=capital,
+                         fraction=fraction, delta=delta, dte=dte, as_shares=as_shares)
 
     cfg = EngineConfig()
     rows, payload = [], {}
@@ -270,11 +324,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--start", type=str, default=None)
     p.add_argument("--end", type=str, default=None)
     p.add_argument("--sweep", type=str, default="2,3", help="timeframe counts, e.g. '2,3'")
-    p.add_argument("--mode", choices=["sweep", "tune", "costs", "oos", "shares", "greeks"],
+    p.add_argument("--mode",
+                   choices=["sweep", "tune", "costs", "oos", "shares", "greeks", "compound"],
                    default="sweep",
-                   help="'sweep'=TF-count; 'tune'=exit x 200-SMA; 'costs'=slippage sweep; "
-                        "'oos'=per-year robustness; 'shares'=P&L signal as shares/MES (no "
-                        "theta/spread); 'greeks'=option delta x DTE sweep")
+                   help="'sweep'/'tune'/'costs'/'oos'/'shares'/'greeks'; 'compound'=reinvest "
+                        "profits at --fraction of --capital (add --shares for the equity version)")
+    p.add_argument("--capital", type=float, default=5000.0, help="compound: starting capital")
+    p.add_argument("--fraction", type=float, default=0.5,
+                   help="compound: fraction of capital deployed per trade (leverage knob)")
+    p.add_argument("--shares", action="store_true",
+                   help="compound: use the SPY-shares version instead of options")
     p.add_argument("--yf-period", type=str, default="3y")
     p.add_argument("--feed", type=str, default="iex")
     p.add_argument("--delta", type=float, default=0.67,
@@ -289,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
              else end - timedelta(days=args.lookback_days))
     sweep = [int(x) for x in args.sweep.split(",") if x.strip()]
     return run(start, end, sweep, args.yf_period, args.feed, args.json, args.mode,
-               args.delta, args.dte)
+               args.delta, args.dte, args.capital, args.fraction, args.shares)
 
 
 if __name__ == "__main__":

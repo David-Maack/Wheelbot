@@ -83,6 +83,26 @@ def format_table(rows: list[tuple[str, str, Summary]]) -> str:
     return "\n".join(lines)
 
 
+def compound_equity(
+    pct_returns: list[float], start: float, fraction: float
+) -> tuple[float, float, bool]:
+    """Compound a chronological list of per-trade returns, deploying `fraction`
+    of current capital each trade. Returns (final_capital, max_drawdown, ruined).
+
+    `pct_returns` are returns on the DEPLOYED capital (premium for options,
+    notional for shares). One-position-at-a-time, so trades compound in sequence.
+    Ruin = capital hits <= 0 (only possible with leverage + a large fraction).
+    """
+    cap, peak, max_dd = start, start, 0.0
+    for r in pct_returns:
+        cap *= 1 + fraction * r
+        if cap <= 0:
+            return 0.0, 1.0, True
+        peak = max(peak, cap)
+        max_dd = max(max_dd, (peak - cap) / peak)
+    return cap, max_dd, False
+
+
 def format_exit_breakdown(rows: list[tuple[str, str, Summary]]) -> str:
     """One line per unique config: exit-reason mix (% of trades). ITM/OTM share
     the same SPY-level exits, so we report each config once."""
