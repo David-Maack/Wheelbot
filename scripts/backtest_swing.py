@@ -21,6 +21,8 @@ import sys
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
+import pandas as pd
+
 from backtest.data import load_daily_yf, load_intraday_alpaca, load_vix_daily
 from backtest.engine import EngineConfig, StructureSpec, run_backtest
 from backtest.report import format_exit_breakdown, format_table, summarize
