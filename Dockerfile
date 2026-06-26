@@ -16,6 +16,7 @@ COPY core/ ./core/
 COPY platforms/ ./platforms/
 COPY data/ ./data/
 COPY strategies/ ./strategies/
+COPY backtest/ ./backtest/
 COPY execution/ ./execution/
 COPY intelligence/ ./intelligence/
 COPY risk/ ./risk/
