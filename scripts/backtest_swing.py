@@ -103,16 +103,19 @@ _COMMISSION = 0.65  # per contract per side (typical retail)
 _OOS_SLIPPAGE = 5.0  # the cost level used for the per-period robustness check
 
 
-def _winner_cfg(**over) -> EngineConfig:
-    return EngineConfig(**_WINNER, structures=_WINNER_STRUCTS, **over)
+def _winner_cfg(delta: float = 0.67, dte: float = 25.0, **over) -> EngineConfig:
+    return EngineConfig(
+        **_WINNER, dte=float(dte), structures=(StructureSpec("ITM", delta),), **over
+    )
 
 
-def _costs(bars5m, daily, weekly, vix, json_out: bool) -> int:
-    """Run the locked winner config across a slippage grid → breakeven cost."""
+def _costs(bars5m, daily, weekly, vix, json_out: bool, delta: float, dte: float) -> int:
+    """Run the chosen option config across a slippage grid → breakeven cost."""
     params = _STACKS[3]
     rows, payload = [], {}
     for slip in _SLIPPAGE_GRID:
-        cfg = _winner_cfg(commission_per_contract=_COMMISSION, slippage_per_contract=slip)
+        cfg = _winner_cfg(delta, dte, commission_per_contract=_COMMISSION,
+                          slippage_per_contract=slip)
         trades = run_backtest(bars5m, daily, vix, params, cfg, weekly=weekly)["ITM"]
         s = summarize(trades)
         rt = 2 * (_COMMISSION + slip)
@@ -121,24 +124,26 @@ def _costs(bars5m, daily, weekly, vix, json_out: bool) -> int:
     if json_out:
         print(json.dumps(payload, indent=2, default=str))
     else:
+        print(f"{delta:.2f}-delta / {dte:.0f}-DTE option, slippage sweep:\n")
         print(format_table(rows))
         print("\nrt$ = round-trip cost/contract (commission+slippage, both sides). The "
-              "edge survives only up to the slippage where exp$/PF cross <=0. PF~1.10 "
-              "pre-cost has little room — sensitivity-test, don't trust one number.")
+              "edge survives only up to the slippage where exp$/PF cross <=0. A deeper-ITM "
+              "(pricier) contract may have a wider absolute spread, so push the grid high.")
     return 0
 
 
-def _oos(bars5m, daily, weekly, vix, json_out: bool) -> int:
-    """Run the locked winner (with realistic cost) once, then bucket trades by
-    period to check the edge isn't driven by a single regime."""
+def _oos(bars5m, daily, weekly, vix, json_out: bool, delta: float, dte: float) -> int:
+    """Run the chosen option config (realistic cost) once, then bucket trades by
+    year to check the edge isn't driven by a single regime."""
     params = _STACKS[3]
-    cfg = _winner_cfg(commission_per_contract=_COMMISSION, slippage_per_contract=_OOS_SLIPPAGE)
+    cfg = _winner_cfg(delta, dte, commission_per_contract=_COMMISSION,
+                      slippage_per_contract=_OOS_SLIPPAGE)
     trades = run_backtest(bars5m, daily, vix, params, cfg, weekly=weekly)["ITM"]
     rows = [(lbl, "ITM", s) for lbl, s in _by_year(trades, summarize)]
     if json_out:
         print(json.dumps({lbl: asdict(s) for lbl, _st, s in rows}, indent=2, default=str))
     else:
-        print(f"Locked winner config, costs = ${_COMMISSION}/contract commission + "
+        print(f"{delta:.2f}-delta / {dte:.0f}-DTE option, cost ${_COMMISSION} commission + "
               f"${_OOS_SLIPPAGE}/side slippage (rt ${2*(_COMMISSION+_OOS_SLIPPAGE):.0f}):\n")
         print(format_table(rows))
         print("\nThe edge must hold in EACH period, not just FULL. One good year "
@@ -211,7 +216,7 @@ def _greeks(bars5m, daily, weekly, vix, json_out: bool) -> int:
 
 
 def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool,
-        mode: str) -> int:
+        mode: str, delta: float = 0.67, dte: float = 25.0) -> int:
     print(f"Loading SPY 5-min bars from Alpaca ({start.date()} -> {end.date()}, feed={feed})...",
           file=sys.stderr)
     bars5m = load_intraday_alpaca("SPY", start, end, feed=feed)
@@ -227,9 +232,9 @@ def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool,
     if mode == "tune":
         return _tune(bars5m, daily, weekly, vix, json_out)
     if mode == "costs":
-        return _costs(bars5m, daily, weekly, vix, json_out)
+        return _costs(bars5m, daily, weekly, vix, json_out, delta, dte)
     if mode == "oos":
-        return _oos(bars5m, daily, weekly, vix, json_out)
+        return _oos(bars5m, daily, weekly, vix, json_out, delta, dte)
     if mode == "shares":
         return _shares(bars5m, daily, weekly, vix, json_out)
     if mode == "greeks":
@@ -272,6 +277,10 @@ def main(argv: list[str] | None = None) -> int:
                         "theta/spread); 'greeks'=option delta x DTE sweep")
     p.add_argument("--yf-period", type=str, default="3y")
     p.add_argument("--feed", type=str, default="iex")
+    p.add_argument("--delta", type=float, default=0.67,
+                   help="target option delta for costs/oos modes (e.g. 0.90 for deep-ITM)")
+    p.add_argument("--dte", type=float, default=25.0,
+                   help="option DTE for costs/oos modes (e.g. 60)")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
 
@@ -279,7 +288,8 @@ def main(argv: list[str] | None = None) -> int:
     start = (datetime.fromisoformat(args.start) if args.start
              else end - timedelta(days=args.lookback_days))
     sweep = [int(x) for x in args.sweep.split(",") if x.strip()]
-    return run(start, end, sweep, args.yf_period, args.feed, args.json, args.mode)
+    return run(start, end, sweep, args.yf_period, args.feed, args.json, args.mode,
+               args.delta, args.dte)
 
 
 if __name__ == "__main__":
