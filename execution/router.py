@@ -171,7 +171,16 @@ def _pending_state_for(
     order_type: OrderType,
     contract_is_put: bool,
     strategy_id: str | None = None,
+    *,
+    is_swing: bool = False,
 ) -> PositionState:
+    # Sub-sprint 2.2b: directional swing — a single deep-ITM long. BUY_TO_OPEN →
+    # SWING_PENDING (reconciler upgrades to SWING_OPEN on the fill). SELL_TO_CLOSE
+    # holds SWING_OPEN until the reconciler observes the close fill → IDLE.
+    if is_swing:
+        if order_type == OrderType.BUY_TO_OPEN:
+            return PositionState.SWING_PENDING
+        return PositionState.SWING_OPEN
     # TICKET-015: PMCC has its own pending states. long=BUY_TO_OPEN call,
     # short=SELL_TO_OPEN call, long-close=SELL_TO_CLOSE call (transient
     # CLOSING), short-close=BUY_TO_CLOSE (no state change; reconciler drives
@@ -211,6 +220,10 @@ class OrderRouter:
         self._universe = universe
         self._cfg = _router_config(config)
         self._gate = RiskGate(broker, repos, config, universe)
+        # Sub-sprint 2.2b: ids of strategies whose type is "swing" — these route
+        # to the SWING_* pending states (single deep-ITM long lifecycle).
+        from core.strategies import load_strategies
+        self._swing_ids = {s.id for s in load_strategies(config) if s.type == "swing"}
         # News checker is an awaitable that takes (symbol) and returns a
         # NewsCheckResult-shaped object with .decision / .rationale. Optional —
         # tests pass a stub or None to disable.
@@ -756,6 +769,7 @@ class OrderRouter:
         contract_is_put = proposal.contract.option_type == OptionType.PUT
         new_state = _pending_state_for(
             proposal.order_type, contract_is_put, proposal.strategy_id,
+            is_swing=proposal.strategy_id in self._swing_ids,
         )
         existing = await self._repos.positions.get_by_symbol(
             account_id, proposal.symbol, strategy_id=proposal.strategy_id

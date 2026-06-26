@@ -142,6 +142,14 @@ _DIFF_ONE_NO_TRANSITION_STATES: frozenset[PositionState] = frozenset({
     PositionState.PMCC_LONG_PENDING,
     PositionState.PMCC_SHORT_PENDING,
     PositionState.PMCC_CLOSING,
+    # Sub-sprint 2.2b swing: SWING_PENDING is driven by _on_swing_fill
+    # (PENDING → OPEN on the observed fill). SWING_OPEN has no shape-only
+    # transition — the single long is closed via a SELL_TO_CLOSE fill, and our
+    # 7-day max hold keeps it far from expiry, so there's no shape ambiguity to
+    # reconcile (mirrors SHARES_HELD). v1 limitation: a long that vanishes at the
+    # broker without a close fill is not auto-detected here (acceptable on paper).
+    PositionState.SWING_PENDING,
+    PositionState.SWING_OPEN,
     PositionState.BROKER_DOWN,
     PositionState.MANUAL_INTERVENTION,
     PositionState.KILLED,
@@ -195,6 +203,10 @@ class Reconciler:
         # standard fill/expiration/assignment sweep. Tests pass a stub.
         self._roll_evaluator = roll_evaluator
         self._universe = universe or {"tickers": [], "banned": [], "banned_rules": []}
+        # Sub-sprint 2.2b: ids of "swing"-type strategies — their fills follow the
+        # single deep-ITM long lifecycle (_on_swing_fill), like pmcc's firewall.
+        from core.strategies import load_strategies
+        self._swing_strategy_ids = {s.id for s in load_strategies(config) if s.type == "swing"}
         # In-memory cursor for "orders updated since"; persists across reconcile_once
         # calls within a single Reconciler instance. Loop runner re-uses the
         # instance so this stays tight.
@@ -408,6 +420,11 @@ class Reconciler:
         # below stays byte-identical (the strategy_id guard is the firewall).
         if local.strategy_id == "pmcc":
             await self._on_pmcc_fill(local, position, fill_price, summary)
+            return
+
+        # Sub-sprint 2.2b: swing fills follow their own single-long lifecycle.
+        if local.strategy_id in self._swing_strategy_ids:
+            await self._on_swing_fill(local, position, fill_price, summary)
             return
 
         if local.order_type == OrderType.MULTI_LEG_OPEN:
@@ -645,6 +662,86 @@ class Reconciler:
         per-share debit paid; defined max loss = the debit. Reuses the
         WheelCycle fields (initial_csp_strike = long strike, initial_csp_premium
         = debit paid as a negative cash flow, initial_capital_at_risk = debit)."""
+        if order.order_type != OrderType.BUY_TO_OPEN:
+            return None
+        debit = abs(fill_price)
+        qty = order.quantity or 1
+        cycle = WheelCycle(
+            account_id=self._account_id,
+            symbol=order.symbol,
+            strategy_id=order.strategy_id,
+            started_at=_utcnow(),
+            initial_csp_strike=order.strike,
+            initial_csp_premium=-debit * 100 * qty,
+            initial_capital_at_risk=debit * 100 * qty,
+            n_orders=1,
+        )
+        cycle_id = await self._repos.cycles.insert(cycle)
+        summary.cycles_opened += 1
+        return cycle_id
+
+    # -- Swing fill dispatch (sub-sprint 2.2b) --------------------------------
+
+    async def _on_swing_fill(
+        self,
+        local: Order,
+        position: Position | None,
+        fill_price: float,
+        summary: ReconcileSummary,
+    ) -> None:
+        """Route a swing fill. A single deep-ITM long (call or put) is bought
+        (BUY_TO_OPEN) → SWING_OPEN, and sold (SELL_TO_CLOSE) → IDLE, ending the
+        cycle. No short leg, no roll. Both legs are options (option_type set) →
+        priced 100× by _compute_cycle_pnl with no special handling."""
+        symbol = local.symbol
+        ot = local.order_type
+        is_option = local.option_type in (OptionType.CALL, OptionType.PUT)
+        existing_cycle = position.current_cycle_id if position else None
+
+        if ot == OrderType.BUY_TO_OPEN and is_option:
+            cycle_id = await self._open_cycle_for_swing(local, fill_price, summary)
+            await self._set_position_state(
+                position, symbol, PositionState.SWING_OPEN,
+                f"fill:{local.client_order_id}",
+                cycle_id=cycle_id or existing_cycle,
+                strategy_id=local.strategy_id,
+            )
+            if cycle_id is not None and local.id is not None:
+                await self._repos.orders.update(local.id, cycle_id=cycle_id)
+            return
+
+        if ot == OrderType.SELL_TO_CLOSE and is_option:
+            # Long closed → cycle ends → IDLE. trigger_reason (swing_stop /
+            # swing_target / swing_time_stop) is preserved on the order for P&L.
+            if existing_cycle is not None and local.id is not None and local.cycle_id is None:
+                await self._repos.orders.update(local.id, cycle_id=existing_cycle)
+            await self._set_position_state(
+                position, symbol, PositionState.IDLE,
+                f"close:{local.client_order_id}",
+                strategy_id=local.strategy_id,
+            )
+            if existing_cycle is not None:
+                await self._close_cycle(existing_cycle, CycleOutcome.SWING_CLOSED, summary)
+                if position is not None and position.id is not None:
+                    await self._repos.positions.update(position.id, current_cycle_id=None)
+            return
+
+        log_checkpoint(
+            "reconcile_swing_unhandled_fill", status="fail", symbol=symbol,
+            order_type=ot.value if hasattr(ot, "value") else str(ot),
+            option_type=str(local.option_type), client_order_id=local.client_order_id,
+        )
+        await self._flag_manual_intervention(
+            symbol, f"_on_swing_fill: unhandled fill {ot}/{local.option_type} "
+            f"({local.client_order_id})", summary,
+        )
+
+    async def _open_cycle_for_swing(
+        self, order: Order, fill_price: float, summary: ReconcileSummary,
+    ) -> int | None:
+        """Open a swing cycle on the long-option fill. `fill_price` is the
+        per-share debit paid; defined max loss = the debit (a long option).
+        Reuses the WheelCycle fields like PMCC's long-open does."""
         if order.order_type != OrderType.BUY_TO_OPEN:
             return None
         debit = abs(fill_price)

@@ -43,6 +43,12 @@ class PositionState(StrEnum):
     PMCC_SHORT_PENDING = "PMCC_SHORT_PENDING"
     PMCC_BOTH_OPEN = "PMCC_BOTH_OPEN"
     PMCC_CLOSING = "PMCC_CLOSING"
+    # Sub-sprint 2.2b: directional SPY swing. A single deep-ITM long call (long)
+    # or put (short) — no short leg, no roll. IDLE → PENDING (order placed) →
+    # OPEN (fill) → IDLE (SELL_TO_CLOSE fill; stop/target/time exit). Both legs
+    # are options → priced 100× by the existing P&L computer.
+    SWING_PENDING = "SWING_PENDING"
+    SWING_OPEN = "SWING_OPEN"
     BROKER_DOWN = "BROKER_DOWN"
     MANUAL_INTERVENTION = "MANUAL_INTERVENTION"
     KILLED = "KILLED"
@@ -100,6 +106,9 @@ class CycleOutcome(StrEnum):
     CALENDAR_CLOSED_PROFIT = "CALENDAR_CLOSED_PROFIT"           # closed at profit_close_pct of debit
     CALENDAR_CLOSED_LOSS = "CALENDAR_CLOSED_LOSS"               # closed at a loss
     CALENDAR_EXPIRED = "CALENDAR_EXPIRED"                       # rare: not force-closed before front expiry
+    # Sub-sprint 2.2b: directional swing exited (SELL_TO_CLOSE). The exit reason
+    # — stop / target / time — is on the close order's trigger_reason.
+    SWING_CLOSED = "SWING_CLOSED"
     MANUAL_CLOSE = "MANUAL_CLOSE"
 
 
