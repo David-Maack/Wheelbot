@@ -84,6 +84,7 @@ from strategies.spreads import (
     propose_all_closes as propose_all_spread_closes,
 )
 from risk import auto_disable, win_rate_floor
+from strategies.swing import propose_all_swing_closes, propose_all_swings
 from strategies.wheel import propose_all
 from strategies.wheel_close import propose_all_closes as propose_all_wheel_closes
 
@@ -416,6 +417,19 @@ async def _propose_and_route(
                 open_proposals = await propose_all_calendar(
                     broker, repos, config, strategy_universe,
                     strategy=strategy, ivr=ivr,
+                )
+            proposals = close_proposals + open_proposals
+        elif strategy.type == "swing":
+            # Directional SPY swing (sub-sprint 2.1: DRY-RUN — evaluates and logs
+            # the live signal, places nothing. 2.2 adds deep-ITM long-option entry).
+            close_proposals = await propose_all_swing_closes(
+                broker, repos, config, strategy=strategy,
+            )
+            open_proposals = []
+            if opens_allowed:
+                open_proposals = await propose_all_swings(
+                    broker, repos, config, strategy_universe,
+                    strategy=strategy, size_multiplier=size_multiplier,
                 )
             proposals = close_proposals + open_proposals
         else:

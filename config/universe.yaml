@@ -175,8 +175,8 @@ tickers:
     # TICKET-015/016: pmcc + calendar added — index LEAP substitute + low-IV
     # calendar. Each strategy on SPY holds independent, separately-keyed
     # positions.
-    strategies: [put_spread, iron_condor, pmcc, calendar]
-    notes: "Broad-market hedge candidate too. Iron condor + PMCC + calendar target — deepest liquidity."
+    strategies: [put_spread, iron_condor, pmcc, calendar, spy_swing_opt]
+    notes: "Broad-market hedge candidate too. Iron condor + PMCC + calendar target — deepest liquidity. spy_swing_opt = directional swing (dry-run in 2.1)."
 
   - symbol: QQQ
     name: "NASDAQ-100 ETF"
