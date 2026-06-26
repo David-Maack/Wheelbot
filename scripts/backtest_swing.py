@@ -236,8 +236,17 @@ def _compound(bars5m, daily, weekly, vix, json_out: bool, *, capital: float,
         label = f"{delta:.2f}-delta/{dte:.0f}-DTE options (return on premium, LEVERAGED)"
     trades = sorted(trades, key=lambda t: t.entry_ts)
     final, max_dd, ruined = compound_equity([t.pnl_pct for t in trades], capital, fraction)
+    # Benchmark SPY buy-hold over the SAME window the strategy traded (not the
+    # full 3y daily series the loader returns) — else the comparison is apples
+    # to oranges.
     c = daily["close"].dropna()
-    spy_mult = float(c.iloc[-1] / c.iloc[0]) if len(c) else 1.0
+    spy_mult = 1.0
+    if trades and len(c):
+        t0 = pd.Timestamp(trades[0].entry_ts).normalize()
+        t1 = pd.Timestamp(trades[-1].exit_ts).normalize()
+        cw = c[(c.index >= t0) & (c.index <= t1)]
+        if len(cw) >= 2:
+            spy_mult = float(cw.iloc[-1] / cw.iloc[0])
     out = {
         "structure": label, "start": capital, "fraction": fraction, "n_trades": len(trades),
         "final": round(final), "ruin": ruined,
