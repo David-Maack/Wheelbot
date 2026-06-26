@@ -320,6 +320,39 @@ def price_structure(
     return out
 
 
+def price_shares(
+    spy_trades: list[SpyTrade], *, shares: int = 100, cost_per_trade: float = 0.0
+) -> list[Trade]:
+    """P&L the SAME SPY-level trades as the underlying (shares / MES futures):
+    no option spread, no theta, no vega — isolates whether the directional signal
+    itself has edge. Win/loss here is pure direction, unlike the option version
+    where theta can turn a correct call into a loss."""
+    out: list[Trade] = []
+    for st in spy_trades:
+        pts = (st.exit_spot - st.entry_spot) * st.direction
+        pnl = pts * shares - cost_per_trade
+        notional = st.entry_spot * shares
+        out.append(
+            Trade(
+                structure="SHARES",
+                direction=st.direction,
+                entry_ts=st.entry_ts,
+                exit_ts=st.exit_ts,
+                entry_spot=st.entry_spot,
+                exit_spot=st.exit_spot,
+                strike=0.0,
+                entry_price=st.entry_spot,
+                exit_price=st.exit_spot,
+                pnl=pnl,
+                pnl_pct=(pnl / notional) if notional > 0 else 0.0,
+                hold_days=st.hold_days,
+                exit_reason=st.exit_reason,
+                costs=cost_per_trade,
+            )
+        )
+    return out
+
+
 def run_backtest(
     bars5m: pd.DataFrame,
     daily: pd.DataFrame,

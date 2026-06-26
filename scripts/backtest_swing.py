@@ -24,7 +24,14 @@ from datetime import UTC, datetime, timedelta
 import pandas as pd
 
 from backtest.data import load_daily_yf, load_intraday_alpaca, load_vix_daily
-from backtest.engine import EngineConfig, StructureSpec, run_backtest
+from backtest.engine import (
+    EngineConfig,
+    StructureSpec,
+    generate_signals,
+    price_shares,
+    run_backtest,
+    simulate_spy_trades,
+)
 from backtest.report import format_exit_breakdown, format_table, summarize
 from strategies.swing_signal import SwingParams, TimeframeSpec
 
@@ -127,17 +134,9 @@ def _oos(bars5m, daily, weekly, vix, json_out: bool) -> int:
     params = _STACKS[3]
     cfg = _winner_cfg(commission_per_contract=_COMMISSION, slippage_per_contract=_OOS_SLIPPAGE)
     trades = run_backtest(bars5m, daily, vix, params, cfg, weekly=weekly)["ITM"]
-    buckets: dict[str, list] = {"FULL": list(trades)}
-    for t in trades:
-        yr = str(pd.Timestamp(t.entry_ts).year)
-        buckets.setdefault(yr, []).append(t)
-    rows, payload = [], {}
-    for label in ["FULL"] + sorted(k for k in buckets if k != "FULL"):
-        s = summarize(buckets[label])
-        rows.append((label, "ITM", s))
-        payload[label] = asdict(s)
+    rows = [(lbl, "ITM", s) for lbl, s in _by_year(trades, summarize)]
     if json_out:
-        print(json.dumps(payload, indent=2, default=str))
+        print(json.dumps({lbl: asdict(s) for lbl, _st, s in rows}, indent=2, default=str))
     else:
         print(f"Locked winner config, costs = ${_COMMISSION}/contract commission + "
               f"${_OOS_SLIPPAGE}/side slippage (rt ${2*(_COMMISSION+_OOS_SLIPPAGE):.0f}):\n")
@@ -145,6 +144,69 @@ def _oos(bars5m, daily, weekly, vix, json_out: bool) -> int:
         print("\nThe edge must hold in EACH period, not just FULL. One good year "
               "carrying a flat/negative one = fragile. Note: config was chosen on the "
               "whole window, so this is regime-robustness, not a pure holdout.")
+    return 0
+
+
+def _by_year(trades, summarize_fn):
+    """(label, Summary) rows: FULL + each calendar year, by entry date."""
+    buckets: dict[str, list] = {"FULL": list(trades)}
+    for t in trades:
+        buckets.setdefault(str(pd.Timestamp(t.entry_ts).year), []).append(t)
+    out = []
+    for label in ["FULL"] + sorted(k for k in buckets if k != "FULL"):
+        out.append((label, summarize_fn(buckets[label])))
+    return out
+
+
+def _shares(bars5m, daily, weekly, vix, json_out: bool) -> int:
+    """P&L the locked winner's SPY-level trades as the UNDERLYING (shares/MES):
+    no spread, no theta. Per-year, so we test signal robustness directly."""
+    cfg = _winner_cfg()  # option-cost fields irrelevant; we re-P&L as shares
+    sig = generate_signals(bars5m, daily, _STACKS[3], weekly=weekly, cfg=cfg)
+    spy = simulate_spy_trades(sig, daily, cfg)
+    # ~$2/round-trip is generous for 100 SPY shares or 1 MES (commission + ~1 tick).
+    trades = price_shares(spy, shares=100, cost_per_trade=2.0)
+    rows = [(lbl, "SHARES", s) for lbl, s in _by_year(trades, summarize)]
+    if json_out:
+        print(json.dumps({lbl: asdict(s) for lbl, _st, s in rows}, indent=2, default=str))
+    else:
+        print("Locked signal, P&L as 100 SPY shares / 1 MES (cost $2/round-trip, "
+              "NO spread, NO theta):\n")
+        print(format_table(rows))
+        print("\nCompare to the options OOS: if SHARES is positive in EACH of "
+              "2024/2025/2026 (esp. 2025, which lost on options), the signal is real "
+              "and options theta/spread were the killer. If 2025 still loses here, the "
+              "signal itself lacks edge.")
+    return 0
+
+
+# Be choosier via Greeks: deeper ITM (higher delta) + longer DTE cut theta. The
+# delta->1 / long-DTE corner approaches the shares trade.
+_DELTA_DTE_GRID = [(0.67, 25), (0.80, 25), (0.90, 25), (0.80, 45), (0.90, 45), (0.90, 60)]
+
+
+def _greeks(bars5m, daily, weekly, vix, json_out: bool) -> int:
+    """Sweep option delta x DTE on the locked winner (realistic cost) to see if
+    deeper-ITM / longer-DTE (less theta) survives costs better."""
+    rows, payload = [], {}
+    for delta, dte in _DELTA_DTE_GRID:
+        cfg = EngineConfig(
+            **_WINNER, dte=float(dte), structures=(StructureSpec(f"d{delta:.2f}/{dte}", delta),),
+            commission_per_contract=_COMMISSION, slippage_per_contract=_OOS_SLIPPAGE,
+        )
+        trades = run_backtest(bars5m, daily, vix, _STACKS[3], cfg, weekly=weekly)[f"d{delta:.2f}/{dte}"]
+        s = summarize(trades)
+        rows.append((f"d{delta:.2f}/{dte}d", "OPT", s))
+        payload[f"d{delta:.2f}/{dte}"] = asdict(s)
+    if json_out:
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        print(f"Option delta x DTE sweep, cost ${_COMMISSION}+${_OOS_SLIPPAGE}/side "
+              f"(rt ${2*(_COMMISSION+_OOS_SLIPPAGE):.0f}):\n")
+        print(format_table(rows))
+        print("\nDeeper ITM (higher delta) + longer DTE = less theta drag. If a corner "
+              "turns clearly positive, theta was the killer; the limit (delta->1) is the "
+              "shares trade (--mode shares). Watch n: deeper/longer also costs more capital.")
     return 0
 
 
@@ -168,6 +230,10 @@ def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool,
         return _costs(bars5m, daily, weekly, vix, json_out)
     if mode == "oos":
         return _oos(bars5m, daily, weekly, vix, json_out)
+    if mode == "shares":
+        return _shares(bars5m, daily, weekly, vix, json_out)
+    if mode == "greeks":
+        return _greeks(bars5m, daily, weekly, vix, json_out)
 
     cfg = EngineConfig()
     rows, payload = [], {}
@@ -199,10 +265,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--start", type=str, default=None)
     p.add_argument("--end", type=str, default=None)
     p.add_argument("--sweep", type=str, default="2,3", help="timeframe counts, e.g. '2,3'")
-    p.add_argument("--mode", choices=["sweep", "tune", "costs", "oos"], default="sweep",
-                   help="'sweep' = TF-count comparison; 'tune' = exit x 200-SMA matrix; "
-                        "'costs' = slippage sweep on the locked winner (breakeven cost); "
-                        "'oos' = per-period robustness of the locked winner with costs")
+    p.add_argument("--mode", choices=["sweep", "tune", "costs", "oos", "shares", "greeks"],
+                   default="sweep",
+                   help="'sweep'=TF-count; 'tune'=exit x 200-SMA; 'costs'=slippage sweep; "
+                        "'oos'=per-year robustness; 'shares'=P&L signal as shares/MES (no "
+                        "theta/spread); 'greeks'=option delta x DTE sweep")
     p.add_argument("--yf-period", type=str, default="3y")
     p.add_argument("--feed", type=str, default="iex")
     p.add_argument("--json", action="store_true")

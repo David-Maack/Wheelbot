@@ -13,6 +13,7 @@ from backtest.engine import (
     _regime_by_date,
     asof_daily_direction,
     generate_signals,
+    price_shares,
     price_structure,
     simulate_spy_trades,
 )
@@ -239,6 +240,23 @@ def test_costs_reduce_net_pnl_by_round_trip():
     assert net.costs == pytest.approx((0.65 + 5.0) * 2 * 2)
     assert net.pnl == pytest.approx(gross.pnl - net.costs)
     assert net.pnl < gross.pnl  # costs always reduce a long's P&L
+
+
+# --- shares / futures P&L (pure direction, no theta) -----------------------
+def test_price_shares_is_pure_direction():
+    Spy = simulate_spy_trades.__globals__["SpyTrade"]
+    ts = pd.Timestamp("2026-06-03 09:35")
+    tx = pd.Timestamp("2026-06-05 10:00")
+    # Long that rose +3 points → +$300 on 100 shares, minus cost.
+    win = Spy(direction=1, entry_ts=ts, entry_spot=100.0, exit_ts=tx,
+              exit_spot=103.0, exit_reason="target", hold_days=2.0)
+    # Short while price rose +3 → loses on a short.
+    loss = Spy(direction=-1, entry_ts=ts, entry_spot=100.0, exit_ts=tx,
+               exit_spot=103.0, exit_reason="stop", hold_days=2.0)
+    out = price_shares([win, loss], shares=100, cost_per_trade=2.0)
+    assert out[0].pnl == pytest.approx(3.0 * 100 - 2.0)  # +$298
+    assert out[1].pnl == pytest.approx(-3.0 * 100 - 2.0)  # -$302
+    assert out[0].structure == "SHARES"
 
 
 # --- 200-SMA regime gate ----------------------------------------------------
