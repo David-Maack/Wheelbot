@@ -22,7 +22,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
 from backtest.data import load_daily_yf, load_intraday_alpaca, load_vix_daily
-from backtest.engine import EngineConfig, run_backtest
+from backtest.engine import EngineConfig, StructureSpec, run_backtest
 from backtest.report import format_exit_breakdown, format_table, summarize
 from strategies.swing_signal import SwingParams, TimeframeSpec
 
@@ -79,6 +79,73 @@ def _tune(bars5m, daily, weekly, vix, json_out: bool) -> int:
     return 0
 
 
+# The winning config from tune round 2 (pdl/noopp+sma ITM). Locked for cost +
+# out-of-sample validation — we do NOT re-tune here.
+_WINNER = dict(
+    stop_mode="prior_day_level", min_hold_days=1.0, max_hold_days=7,
+    opposite_cross_exit=False, use_regime=True,
+)
+_WINNER_STRUCTS = (StructureSpec("ITM", 0.67),)
+# Slippage levels to bracket reality ($/contract/side). Research: spread, not
+# commission, dominates for ITM SPY, and PF~1.10 is where costs bite — so we
+# find the breakeven slippage rather than trust one number.
+_SLIPPAGE_GRID = [0.0, 2.0, 5.0, 10.0, 15.0, 20.0]
+_COMMISSION = 0.65  # per contract per side (typical retail)
+_OOS_SLIPPAGE = 5.0  # the cost level used for the per-period robustness check
+
+
+def _winner_cfg(**over) -> EngineConfig:
+    return EngineConfig(**_WINNER, structures=_WINNER_STRUCTS, **over)
+
+
+def _costs(bars5m, daily, weekly, vix, json_out: bool) -> int:
+    """Run the locked winner config across a slippage grid → breakeven cost."""
+    params = _STACKS[3]
+    rows, payload = [], {}
+    for slip in _SLIPPAGE_GRID:
+        cfg = _winner_cfg(commission_per_contract=_COMMISSION, slippage_per_contract=slip)
+        trades = run_backtest(bars5m, daily, vix, params, cfg, weekly=weekly)["ITM"]
+        s = summarize(trades)
+        rt = 2 * (_COMMISSION + slip)
+        rows.append((f"slip${slip:.0f}/rt${rt:.0f}", "ITM", s))
+        payload[f"slip_{slip}"] = asdict(s)
+    if json_out:
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        print(format_table(rows))
+        print("\nrt$ = round-trip cost/contract (commission+slippage, both sides). The "
+              "edge survives only up to the slippage where exp$/PF cross <=0. PF~1.10 "
+              "pre-cost has little room — sensitivity-test, don't trust one number.")
+    return 0
+
+
+def _oos(bars5m, daily, weekly, vix, json_out: bool) -> int:
+    """Run the locked winner (with realistic cost) once, then bucket trades by
+    period to check the edge isn't driven by a single regime."""
+    params = _STACKS[3]
+    cfg = _winner_cfg(commission_per_contract=_COMMISSION, slippage_per_contract=_OOS_SLIPPAGE)
+    trades = run_backtest(bars5m, daily, vix, params, cfg, weekly=weekly)["ITM"]
+    buckets: dict[str, list] = {"FULL": list(trades)}
+    for t in trades:
+        yr = str(pd.Timestamp(t.entry_ts).year)
+        buckets.setdefault(yr, []).append(t)
+    rows, payload = [], {}
+    for label in ["FULL"] + sorted(k for k in buckets if k != "FULL"):
+        s = summarize(buckets[label])
+        rows.append((label, "ITM", s))
+        payload[label] = asdict(s)
+    if json_out:
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        print(f"Locked winner config, costs = ${_COMMISSION}/contract commission + "
+              f"${_OOS_SLIPPAGE}/side slippage (rt ${2*(_COMMISSION+_OOS_SLIPPAGE):.0f}):\n")
+        print(format_table(rows))
+        print("\nThe edge must hold in EACH period, not just FULL. One good year "
+              "carrying a flat/negative one = fragile. Note: config was chosen on the "
+              "whole window, so this is regime-robustness, not a pure holdout.")
+    return 0
+
+
 def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool,
         mode: str) -> int:
     print(f"Loading SPY 5-min bars from Alpaca ({start.date()} -> {end.date()}, feed={feed})...",
@@ -95,6 +162,10 @@ def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool,
 
     if mode == "tune":
         return _tune(bars5m, daily, weekly, vix, json_out)
+    if mode == "costs":
+        return _costs(bars5m, daily, weekly, vix, json_out)
+    if mode == "oos":
+        return _oos(bars5m, daily, weekly, vix, json_out)
 
     cfg = EngineConfig()
     rows, payload = [], {}
@@ -126,9 +197,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--start", type=str, default=None)
     p.add_argument("--end", type=str, default=None)
     p.add_argument("--sweep", type=str, default="2,3", help="timeframe counts, e.g. '2,3'")
-    p.add_argument("--mode", choices=["sweep", "tune"], default="sweep",
-                   help="'sweep' = TF-count comparison (baseline exits); "
-                        "'tune' = exit-config x 200-SMA matrix on the 3-TF stack")
+    p.add_argument("--mode", choices=["sweep", "tune", "costs", "oos"], default="sweep",
+                   help="'sweep' = TF-count comparison; 'tune' = exit x 200-SMA matrix; "
+                        "'costs' = slippage sweep on the locked winner (breakeven cost); "
+                        "'oos' = per-period robustness of the locked winner with costs")
     p.add_argument("--yf-period", type=str, default="3y")
     p.add_argument("--feed", type=str, default="iex")
     p.add_argument("--json", action="store_true")

@@ -215,6 +215,32 @@ def test_daily_flip_exit_fires_on_direction_change():
     assert trades[0].exit_reason == "daily_flip"
 
 
+# --- cost model -------------------------------------------------------------
+def test_costs_reduce_net_pnl_by_round_trip():
+    ddates = pd.date_range("2026-06-01", periods=3, freq="1D")
+    daily = pd.DataFrame(
+        {"open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000}, index=ddates
+    )
+    idx = pd.date_range("2026-06-03 09:30", periods=4, freq="5min")
+    sig_df = pd.DataFrame(
+        {"open": [100, 100, 101, 103], "high": [100, 100, 101.5, 103.5],
+         "low": [100, 100, 100.5, 101.0], "close": [100, 100, 101, 103],
+         "volume": [1000] * 4, "cross": [0, 1, 0, 0], "signal": [0, 1, 0, 0]},
+        index=idx,
+    )
+    vix = pd.Series([0.18, 0.18], index=pd.to_datetime(["2026-06-01", "2026-06-02"]))
+    spec = StructureSpec("ITM", 0.67)
+    spy = simulate_spy_trades(sig_df, daily, EngineConfig())
+
+    gross = price_structure(spy, spec, vix, EngineConfig(contracts=2))[0]
+    # $0.65 commission + $5 slippage, per side, x2 sides, x2 contracts = $22.60.
+    netcfg = EngineConfig(contracts=2, commission_per_contract=0.65, slippage_per_contract=5.0)
+    net = price_structure(spy, spec, vix, netcfg)[0]
+    assert net.costs == pytest.approx((0.65 + 5.0) * 2 * 2)
+    assert net.pnl == pytest.approx(gross.pnl - net.costs)
+    assert net.pnl < gross.pnl  # costs always reduce a long's P&L
+
+
 # --- 200-SMA regime gate ----------------------------------------------------
 def test_regime_by_date_signs():
     idx = pd.date_range("2026-06-01", periods=5, freq="1D")

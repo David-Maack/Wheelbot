@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from backtest.data import atr
-from backtest.option_model import OptionLeg, leg_pnl, open_leg, price_leg, pnl_pct
+from backtest.option_model import OptionLeg, leg_pnl, open_leg, price_leg
 from core.models import OptionType
 from strategies.swing_signal import (
     SwingParams,
@@ -56,6 +56,12 @@ class EngineConfig:
     contracts: int = 1
     opposite_cross_exit: bool = True  # exit on a 5-min opposite EMA/VWAP cross (noisy)
     exit_on_daily_flip: bool = False  # exit when the daily direction flips against us
+    # Trading costs (applied per side, charged on both entry and exit). Default 0
+    # to keep modeled behavior pure; the cost/oos sweeps inject realistic values.
+    # Slippage is per-contract dollars (models crossing part of the bid/ask spread,
+    # which dominates commission for ITM SPY); sensitivity-tested, not a fixed truth.
+    commission_per_contract: float = 0.0
+    slippage_per_contract: float = 0.0
     structures: tuple[StructureSpec, ...] = (
         StructureSpec("ITM", 0.67),
         StructureSpec("OTM", 0.30),
@@ -84,10 +90,11 @@ class Trade:
     strike: float
     entry_price: float
     exit_price: float
-    pnl: float
-    pnl_pct: float
+    pnl: float  # NET of costs
+    pnl_pct: float  # net return on premium paid
     hold_days: float
     exit_reason: str
+    costs: float = 0.0  # round-trip commission + slippage charged
 
 
 # --- no-lookahead as-of direction ------------------------------------------
@@ -289,6 +296,9 @@ def price_structure(
         leg: OptionLeg = open_leg(st.entry_spot, cfg.dte, spec.target_delta, ot, iv_in, cfg.contracts)
         iv_out = _iv_asof(st.exit_ts, vix_daily, cfg.iv_floor)
         exit_price = price_leg(leg, st.exit_spot, st.hold_days, iv_out)
+        cost = (cfg.commission_per_contract + cfg.slippage_per_contract) * 2 * cfg.contracts
+        net = leg_pnl(leg, exit_price) - cost
+        net_pct = (net / leg.cost) if leg.cost > 0 else 0.0
         out.append(
             Trade(
                 structure=spec.name,
@@ -300,10 +310,11 @@ def price_structure(
                 strike=leg.strike,
                 entry_price=leg.entry_price,
                 exit_price=exit_price,
-                pnl=leg_pnl(leg, exit_price),
-                pnl_pct=pnl_pct(leg, exit_price),
+                pnl=net,
+                pnl_pct=net_pct,
                 hold_days=st.hold_days,
                 exit_reason=st.exit_reason,
+                costs=cost,
             )
         )
     return out
