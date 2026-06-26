@@ -22,8 +22,11 @@ from typing import Any
 
 from backtest.data import load_daily_yf, load_intraday_alpaca, load_vix_daily
 from backtest.engine import EngineConfig, generate_signals
+from core.broker import Broker
 from core.checkpoint import log_checkpoint
+from core.models import OptionContract, OptionType
 from core.strategies import StrategyDefinition
+from data.chain import ChainFilters, fetch_filtered_chain
 from strategies.swing_signal import Signal, SwingParams, TimeframeSpec
 
 # Default 3-timeframe stack (weekly + daily direction, 5-min trigger), matching
@@ -58,16 +61,123 @@ def evaluate_swing_signal(
     return Signal(ts=sig_df.index[-1], direction=direction, spot=float(last["close"]))
 
 
+# Daily/weekly/VIX only change once a day, but the loop ticks every 5 min — so
+# cache them per (symbol, date) and only re-pull intraday 5-min bars each tick.
+_DAILY_CACHE: dict[tuple[str, date], tuple] = {}
+
+
+def _cached_daily(symbol: str, today: date) -> tuple:
+    key = (symbol, today)
+    if key not in _DAILY_CACHE:
+        _DAILY_CACHE.clear()  # drop yesterday's
+        _DAILY_CACHE[key] = (
+            load_daily_yf(symbol, period="2y"),
+            load_daily_yf(symbol, period="2y", weekly=True),
+            load_vix_daily(period="2y"),
+        )
+    return _DAILY_CACHE[key]
+
+
 def fetch_swing_frames(symbol: str = "SPY", *, lookback_days: int = 10, feed: str = "iex"):
-    """Live data: 5-min bars from Alpaca, daily/weekly/VIX from yfinance — the
-    same sources the backtest used. Returns (bars5m, daily, weekly, vix)."""
+    """Live data: fresh 5-min bars from Alpaca each tick; daily/weekly/VIX from
+    yfinance, cached per day. Returns (bars5m, daily, weekly, vix)."""
     end = datetime.now(UTC).replace(tzinfo=None)
     start = end - timedelta(days=lookback_days)
     bars5m = load_intraday_alpaca(symbol, start, end, feed=feed)
-    daily = load_daily_yf(symbol, period="2y")
-    weekly = load_daily_yf(symbol, period="2y", weekly=True)
-    vix = load_vix_daily(period="2y")
+    daily, weekly, vix = _cached_daily(symbol, end.date())
     return bars5m, daily, weekly, vix
+
+
+# --- deep-ITM option selection (2.2a) --------------------------------------
+def _mid(c: OptionContract) -> float | None:
+    if c.bid is None or c.ask is None:
+        return None
+    m = (c.bid + c.ask) / 2
+    return m if m > 0 else None
+
+
+def pick_deep_itm(candidates: list[OptionContract], target_delta: float) -> OptionContract | None:
+    """The contract whose |delta| is closest to target_delta (default ~0.90),
+    among those with a usable mid price. Pure — easy to unit-test."""
+    scored = [
+        (abs(abs(c.delta) - target_delta), c)
+        for c in candidates
+        if c.delta is not None and _mid(c) is not None
+    ]
+    if not scored:
+        return None
+    scored.sort(key=lambda t: t[0])
+    return scored[0][1]
+
+
+async def select_swing_option(
+    broker: Broker, symbol: str, direction: int, params: dict[str, Any], *, today: date | None = None
+) -> OptionContract | None:
+    """Pick the deep-ITM long CALL (direction +1) or PUT (-1) at ~entry_delta,
+    in the DTE band. Mirrors PMCC's select_long_call."""
+    today = today or date.today()
+    target = float(params.get("entry_delta", 0.90))
+    dte = int(params.get("dte_target", 60))
+    band = int(params.get("dte_band", 15))
+    opt = "call" if direction > 0 else "put"
+    filters = ChainFilters(
+        dte_min=max(1, dte - band),
+        dte_max=dte + band,
+        delta_min=max(0.50, target - 0.12),
+        delta_max=min(0.98, target + 0.08),
+        open_interest_min=int(params.get("open_interest_min", 0)),
+        volume_min=int(params.get("volume_min", 0)),
+        bid_ask_spread_max_pct=float(params.get("bid_ask_spread_max_pct", 100.0)),
+    )
+    candidates = await fetch_filtered_chain(broker, symbol, opt, filters, today=today)
+    best = pick_deep_itm(candidates, target)
+    if best is None:
+        log_checkpoint("swing_no_option_candidates", status="ok", symbol=symbol, direction=direction)
+    return best
+
+
+# --- SPY-level exit decision (2.2a) ----------------------------------------
+def swing_stop_target(
+    entry_spot: float, direction: int, prior_day_level: float, reward_risk: float
+) -> tuple[float, float]:
+    """Stop anchored to the prior day's low (long) / high (short); target at an
+    R-multiple of the stop distance. Matches the validated backtest exits."""
+    if direction > 0:
+        stop = prior_day_level
+        dist = max(entry_spot - stop, 1e-9)
+        return stop, entry_spot + reward_risk * dist
+    stop = prior_day_level
+    dist = max(stop - entry_spot, 1e-9)
+    return stop, entry_spot - reward_risk * dist
+
+
+def swing_exit_decision(
+    direction: int,
+    current_spot: float,
+    stop_px: float,
+    target_px: float,
+    hold_days: float,
+    *,
+    min_hold_days: float,
+    max_hold_days: float,
+) -> tuple[bool, str | None]:
+    """Decide whether to close, checked against the latest SPY quote each tick.
+    Stop is suppressed until min_hold_days (let the trade breathe); target and
+    time-stop always apply. Stop is checked before target (conservative)."""
+    allow_stop = hold_days >= min_hold_days
+    if direction > 0:
+        if allow_stop and current_spot <= stop_px:
+            return True, "swing_stop"
+        if current_spot >= target_px:
+            return True, "swing_target"
+    else:
+        if allow_stop and current_spot >= stop_px:
+            return True, "swing_stop"
+        if current_spot <= target_px:
+            return True, "swing_target"
+    if hold_days >= max_hold_days:
+        return True, "swing_time_stop"
+    return False, None
 
 
 async def propose_all_swings(
