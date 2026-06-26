@@ -44,10 +44,14 @@ class StructureSpec:
 @dataclass(frozen=True, slots=True)
 class EngineConfig:
     dte: float = 25.0
-    stop_atr: float = 1.0  # stop distance = stop_atr * ATR(entry)
+    stop_atr: float = 1.0  # stop distance = stop_atr * ATR(entry)  (stop_mode="atr")
+    stop_mode: str = "atr"  # "atr" | "prior_day_level" (anchor stop to prior day's low/high)
     reward_risk: float = 1.5  # target distance = reward_risk * stop distance
     max_hold_days: int = 4  # time stop (calendar days)
+    min_hold_days: float = 0.0  # suppress the STOP until this many days elapse (let it breathe)
     atr_period: int = 14
+    use_regime: bool = False  # require signal to agree with the daily 200-SMA trend
+    regime_sma: int = 200
     iv_floor: float = 0.08
     contracts: int = 1
     opposite_cross_exit: bool = True
@@ -117,17 +121,29 @@ def asof_weekly_direction(intraday_index: pd.DatetimeIndex, weekly_dir: pd.Serie
 
 
 # --- signal generation ------------------------------------------------------
+def _regime_by_date(daily: pd.DataFrame, sma_period: int) -> pd.Series:
+    """+1 / -1 / 0 per daily bar: sign(close - SMA). Warm-up (NaN SMA) → 0."""
+    sma = daily["close"].rolling(sma_period, min_periods=sma_period).mean()
+    reg = pd.Series(0, index=daily.index)
+    reg[daily["close"] > sma] = 1
+    reg[daily["close"] < sma] = -1
+    reg.index = pd.to_datetime(reg.index).normalize()
+    return reg
+
+
 def generate_signals(
     bars5m: pd.DataFrame,
     daily: pd.DataFrame,
     params: SwingParams,
     *,
     weekly: pd.DataFrame | None = None,
+    cfg: EngineConfig | None = None,
 ) -> pd.DataFrame:
     """Return the 5-min frame with `cross` and `signal` columns.
 
-    `signal` is +1/-1/0 — a fresh 5-min EMA/VWAP cross confirmed by every
-    higher timeframe in `params` agreeing on the same direction.
+    `signal` is +1/-1/0 — a fresh 5-min EMA/VWAP cross confirmed by every higher
+    timeframe in `params` agreeing on the same direction, and (when
+    `cfg.use_regime`) by the daily 200-SMA trend agreeing too.
     """
     tf_by_role = {tf.role: tf for tf in params.timeframes}
     trigger_tf = tf_by_role["trigger"]
@@ -148,10 +164,18 @@ def generate_signals(
         out["dir_1W"] = asof_weekly_direction(out.index, wdir).values
         htf_cols.append("dir_1W")
 
+    # Optional 200-SMA regime gate (as-of prior completed day, no lookahead).
+    regime = None
+    if cfg is not None and cfg.use_regime:
+        regime = asof_daily_direction(out.index, _regime_by_date(daily, cfg.regime_sma)).values
+
     signals = []
-    for _, row in out.iterrows():
+    for i, (_, row) in enumerate(out.iterrows()):
         htf = [int(row[c]) for c in htf_cols]
-        signals.append(combine_signal(int(row["cross"]), htf))
+        sig = combine_signal(int(row["cross"]), htf)
+        if regime is not None and sig != int(regime[i]):
+            sig = 0  # counter-trend vs the 200-SMA → skip
+        signals.append(sig)
     out["signal"] = signals
     return out
 
@@ -163,6 +187,11 @@ def simulate_spy_trades(signal_df: pd.DataFrame, daily: pd.DataFrame, cfg: Engin
     atr_by_date = atr(daily, cfg.atr_period)
     atr_by_date.index = pd.to_datetime(atr_by_date.index).normalize()
     atr_lookup = atr_by_date.shift(1).bfill().to_dict()  # prior-day ATR
+    # Prior-day low/high for the "prior_day_level" stop anchor.
+    low_prior = daily["low"].copy(); low_prior.index = pd.to_datetime(low_prior.index).normalize()
+    high_prior = daily["high"].copy(); high_prior.index = pd.to_datetime(high_prior.index).normalize()
+    low_lookup = low_prior.shift(1).to_dict()
+    high_lookup = high_prior.shift(1).to_dict()
 
     rows = list(signal_df.itertuples())
     trades: list[SpyTrade] = []
@@ -175,11 +204,20 @@ def simulate_spy_trades(signal_df: pd.DataFrame, daily: pd.DataFrame, cfg: Engin
             continue
         entry_ts = r.Index
         entry_spot = float(r.close)
-        a = atr_lookup.get(pd.Timestamp(entry_ts).normalize(), None)
+        entry_date = pd.Timestamp(entry_ts).normalize()
+        a = atr_lookup.get(entry_date, None)
         if a is None or a <= 0:
             i += 1
             continue
+
+        # Stop distance: ATR multiple, or anchored to the prior day's low/high.
         stop_dist = cfg.stop_atr * a
+        if cfg.stop_mode == "prior_day_level":
+            lvl = low_lookup.get(entry_date) if sig > 0 else high_lookup.get(entry_date)
+            if lvl is not None:
+                d = (entry_spot - lvl) if sig > 0 else (lvl - entry_spot)
+                if d > 0:
+                    stop_dist = d  # fall back to ATR distance if the level is on the wrong side
         if sig > 0:
             stop_px, target_px = entry_spot - stop_dist, entry_spot + cfg.reward_risk * stop_dist
         else:
@@ -192,13 +230,14 @@ def simulate_spy_trades(signal_df: pd.DataFrame, daily: pd.DataFrame, cfg: Engin
             held_days = (pd.Timestamp(b.Index) - pd.Timestamp(entry_ts)).total_seconds() / 86400.0
             hi, lo, close = float(b.high), float(b.low), float(b.close)
             opp_cross = cfg.opposite_cross_exit and int(getattr(b, "cross", 0)) == -sig
+            allow_stop = held_days >= cfg.min_hold_days  # let the trade breathe first
             if sig > 0:
-                if lo <= stop_px:  # stop checked first (conservative)
+                if allow_stop and lo <= stop_px:  # stop checked first (conservative)
                     exit_ts, exit_spot, reason = b.Index, stop_px, "stop"
                 elif hi >= target_px:
                     exit_ts, exit_spot, reason = b.Index, target_px, "target"
             else:
-                if hi >= stop_px:
+                if allow_stop and hi >= stop_px:
                     exit_ts, exit_spot, reason = b.Index, stop_px, "stop"
                 elif lo <= target_px:
                     exit_ts, exit_spot, reason = b.Index, target_px, "target"
@@ -276,6 +315,6 @@ def run_backtest(
     weekly: pd.DataFrame | None = None,
 ) -> dict[str, list[Trade]]:
     """Full run: signals → SPY trades → ITM & OTM option trades."""
-    sig_df = generate_signals(bars5m, daily, params, weekly=weekly)
+    sig_df = generate_signals(bars5m, daily, params, weekly=weekly, cfg=cfg)
     spy_trades = simulate_spy_trades(sig_df, daily, cfg)
     return {spec.name: price_structure(spy_trades, spec, vix_daily, cfg) for spec in cfg.structures}

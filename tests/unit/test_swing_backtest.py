@@ -10,6 +10,7 @@ from backtest.data import atr, normalize_columns, resample_ohlcv, to_rth
 from backtest.engine import (
     EngineConfig,
     StructureSpec,
+    _regime_by_date,
     asof_daily_direction,
     generate_signals,
     price_structure,
@@ -135,3 +136,73 @@ def test_simulate_and_price_winning_long():
         assert trades[0].pnl > 0  # a +3 SPY move on a long call must profit
         s = summarize(trades)
         assert s.n_trades == 1 and s.win_rate == 1.0 and s.total_pnl > 0
+
+
+# --- exit tuning: min-hold + prior-day-level stop --------------------------
+def _constant_daily(closes_range=2):
+    idx = pd.date_range("2026-06-01", periods=3, freq="1D")
+    return pd.DataFrame(
+        {"open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000}, index=idx
+    )
+
+
+def _entry_then_dip(dip_low):
+    idx = pd.date_range("2026-06-03 09:30", periods=4, freq="5min")
+    return pd.DataFrame(
+        {"open": [100, 100, 98, 99], "high": [100, 100, 100, 100],
+         "low": [100, 100, dip_low, 98], "close": [100, 100, 98, 99],
+         "volume": [1000] * 4, "cross": [0, 1, 0, 0], "signal": [0, 1, 0, 0]},
+        index=idx,
+    )
+
+
+def test_min_hold_suppresses_same_day_stop():
+    daily, sig_df = _constant_daily(), _entry_then_dip(97)  # ATR 2 → stop at 98; dip to 97
+    # No min-hold: the same-day dip trips the stop.
+    t0 = simulate_spy_trades(sig_df, daily, EngineConfig(stop_atr=1.0, min_hold_days=0.0))
+    assert t0[0].exit_reason == "stop" and t0[0].exit_spot == pytest.approx(98.0)
+    # 1-day min-hold: the same-day stop is suppressed (trade gets to breathe).
+    t1 = simulate_spy_trades(sig_df, daily, EngineConfig(stop_atr=1.0, min_hold_days=1.0))
+    assert t1[0].exit_reason != "stop"
+
+
+def test_prior_day_level_stop_anchors_to_prior_low():
+    idx = pd.date_range("2026-06-01", periods=3, freq="1D")
+    daily = pd.DataFrame(
+        {"open": 100, "high": [105, 104, 103], "low": [95, 96, 99],
+         "close": 100, "volume": 1000}, index=idx,
+    )  # prior-day (06-02) low = 96 → that's the stop for a 06-03 long
+    sidx = pd.date_range("2026-06-03 09:30", periods=3, freq="5min")
+    sig_df = pd.DataFrame(
+        {"open": [100, 100, 96], "high": [100, 100, 100], "low": [100, 100, 95.5],
+         "close": [100, 100, 96], "volume": [1000] * 3, "cross": [0, 1, 0],
+         "signal": [0, 1, 0]},
+        index=sidx,
+    )
+    trades = simulate_spy_trades(sig_df, daily, EngineConfig(stop_mode="prior_day_level"))
+    assert trades[0].exit_reason == "stop" and trades[0].exit_spot == pytest.approx(96.0)
+
+
+# --- 200-SMA regime gate ----------------------------------------------------
+def test_regime_by_date_signs():
+    idx = pd.date_range("2026-06-01", periods=5, freq="1D")
+    daily = pd.DataFrame({"close": [10, 10, 10, 13, 7]}, index=idx)
+    reg = _regime_by_date(daily, sma_period=3)
+    assert reg.iloc[0] == 0   # warm-up
+    assert reg.iloc[3] == 1   # close 13 > SMA(10,10,13)=11
+    assert reg.iloc[4] == -1  # close 7 < SMA(10,13,7)=10
+
+
+def test_regime_gate_only_removes_signals():
+    ddates = pd.date_range("2026-06-01", periods=5, freq="1D")
+    daily = _spread_frame(ddates, [90, 92, 94, 96, 98], hl=1.0)
+    idx = pd.date_range("2026-06-05 09:30", periods=12, freq="5min")
+    five = _spread_frame(idx, [98, 97, 96, 95, 96, 97, 98, 99, 100, 101, 102, 103])
+    params = SwingParams(timeframes=(
+        TimeframeSpec("1D", "direction", vwap_mode="rolling", vwap_window=20),
+        TimeframeSpec("5m", "trigger", vwap_mode="session"),
+    ))
+    off = generate_signals(five, daily, params)
+    on = generate_signals(five, daily, params, cfg=EngineConfig(use_regime=True, regime_sma=3))
+    # The regime gate can only filter signals out, never add them.
+    assert on["signal"].abs().sum() <= off["signal"].abs().sum()

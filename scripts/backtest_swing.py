@@ -40,7 +40,43 @@ _STACKS = {
 }
 
 
-def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool) -> int:
+# Exit-tuning grid (3-TF stack). max_hold_days=7 matches the 2-7 day thesis;
+# we vary the stop width / min-hold / anchor to fix the 0.58-day flush-out.
+_EXIT_CONFIGS = [
+    ("atr1.0/mh0", dict(stop_atr=1.0, min_hold_days=0.0, stop_mode="atr", max_hold_days=7)),
+    ("atr2.0/mh0", dict(stop_atr=2.0, min_hold_days=0.0, stop_mode="atr", max_hold_days=7)),
+    ("atr2.0/mh1", dict(stop_atr=2.0, min_hold_days=1.0, stop_mode="atr", max_hold_days=7)),
+    ("atr2.5/mh1", dict(stop_atr=2.5, min_hold_days=1.0, stop_mode="atr", max_hold_days=7)),
+    ("pdl/mh1", dict(stop_mode="prior_day_level", min_hold_days=1.0, max_hold_days=7)),
+]
+
+
+def _tune(bars5m, daily, weekly, vix, json_out: bool) -> int:
+    """Sweep exit configs x {no-regime, +200SMA} on the 3-TF stack."""
+    params = _STACKS[3]
+    rows, payload = [], {}
+    for exit_label, kw in _EXIT_CONFIGS:
+        for use_regime in (False, True):
+            cfg = EngineConfig(use_regime=use_regime, **kw)
+            label = f"{exit_label}{'+sma' if use_regime else ''}"
+            results = run_backtest(bars5m, daily, vix, params, cfg, weekly=weekly)
+            payload[label] = {}
+            for struct, trades in results.items():
+                s = summarize(trades)
+                rows.append((label, struct, s))
+                payload[label][struct] = asdict(s)
+    if json_out:
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        print(format_table(rows))
+        print("\nAll variants shown (no cherry-picking). If a config turns clearly "
+              "positive, validate it on a held-out window before trusting it — else "
+              "it's curve-fit to 2024-26.")
+    return 0
+
+
+def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool,
+        mode: str) -> int:
     print(f"Loading SPY 5-min bars from Alpaca ({start.date()} -> {end.date()}, feed={feed})...",
           file=sys.stderr)
     bars5m = load_intraday_alpaca("SPY", start, end, feed=feed)
@@ -52,6 +88,9 @@ def run(start, end, sweep: list[int], yf_period: str, feed: str, json_out: bool)
     vix = load_vix_daily(period=yf_period)
     print(f"  5m bars: {len(bars5m)}  daily: {len(daily)}  weekly: {len(weekly)}  vix: {len(vix)}",
           file=sys.stderr)
+
+    if mode == "tune":
+        return _tune(bars5m, daily, weekly, vix, json_out)
 
     cfg = EngineConfig()
     rows, payload = [], {}
@@ -83,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--start", type=str, default=None)
     p.add_argument("--end", type=str, default=None)
     p.add_argument("--sweep", type=str, default="2,3", help="timeframe counts, e.g. '2,3'")
+    p.add_argument("--mode", choices=["sweep", "tune"], default="sweep",
+                   help="'sweep' = TF-count comparison (baseline exits); "
+                        "'tune' = exit-config x 200-SMA matrix on the 3-TF stack")
     p.add_argument("--yf-period", type=str, default="3y")
     p.add_argument("--feed", type=str, default="iex")
     p.add_argument("--json", action="store_true")
@@ -92,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     start = (datetime.fromisoformat(args.start) if args.start
              else end - timedelta(days=args.lookback_days))
     sweep = [int(x) for x in args.sweep.split(",") if x.strip()]
-    return run(start, end, sweep, args.yf_period, args.feed, args.json)
+    return run(start, end, sweep, args.yf_period, args.feed, args.json, args.mode)
 
 
 if __name__ == "__main__":

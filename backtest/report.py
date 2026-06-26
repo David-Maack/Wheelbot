@@ -64,16 +64,16 @@ def summarize(trades: list[Trade]) -> Summary:
 
 
 def format_table(rows: list[tuple[str, str, Summary]]) -> str:
-    """rows = list of (tf_label, structure, Summary). Returns a printable table."""
+    """rows = list of (config_label, structure, Summary). Returns a printable table."""
     header = (
-        f"{'TFs':>4} {'struct':>6} {'n':>5} {'win%':>6} {'exp%':>7} "
+        f"{'config':>12} {'struct':>6} {'n':>5} {'win%':>6} {'exp%':>7} "
         f"{'exp$':>8} {'PF':>6} {'maxDD$':>9} {'hold_d':>7} {'totP&L$':>10}"
     )
     lines = [header, "-" * len(header)]
     for tf_label, struct, s in rows:
         pf = "inf" if s.profit_factor == float("inf") else f"{s.profit_factor:.2f}"
         lines.append(
-            f"{tf_label:>4} {struct:>6} {s.n_trades:>5} {s.win_rate * 100:>5.1f} "
+            f"{tf_label:>12} {struct:>6} {s.n_trades:>5} {s.win_rate * 100:>5.1f} "
             f"{s.expectancy_pct * 100:>6.1f} {s.expectancy_usd:>8.0f} {pf:>6} "
             f"{s.max_drawdown:>9.0f} {s.avg_hold_days:>7.2f} {s.total_pnl:>10.0f}"
         )
