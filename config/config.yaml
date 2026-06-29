@@ -524,11 +524,11 @@ strategies:
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150
 
-  # Sub-sprint 2.1: directional SPY swing (validated backtest edge). DRY-RUN —
-  # enabled so the loop runs the live signal evaluator each tick and LOGS what
-  # it would do (swing_signal_fired / swing_eval checkpoints), but places NOTHING
-  # while params.dry_run is true. Sub-sprint 2.2 adds the deep-ITM long-option
-  # entry and flips dry_run to false in a separate, deliberate commit.
+  # Directional SPY swing (validated backtest edge). LIVE on Alpaca PAPER as of
+  # sub-sprint 2.4b: full lifecycle shipped (signal → deep-ITM long entry →
+  # SPY-level exits → reconciler → dashboard), risk gate fixed (premium-based
+  # notional + regime-exempt). Places PAPER orders. Flip dry_run back to true to
+  # re-mute without disabling. Sizing = 1 contract.
   - id: spy_swing_opt
     display_name: "SPY Swing (deep-ITM options)"
     type: swing
@@ -536,7 +536,7 @@ strategies:
     max_concurrent: 1
     params:
       symbol: SPY
-      dry_run: true                 # 2.1: evaluate + log only. DO NOT flip until 2.2 ships entry+exits.
+      dry_run: false                # 2.4b GO-LIVE (paper): places real paper orders on signal.
       # Validated config (see backtest sub-sprint 1): deep-ITM long, ~60 DTE,
       # prior-day-level stop, 1.5R target, 1-day min-hold, 7-day time stop, NO
       # 5-min opposite-cross exit, 200-SMA regime gate. Consumed in 2.2.
