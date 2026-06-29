@@ -105,6 +105,17 @@ def _notional(proposal: Proposal | MultiLegProposal) -> float:
     if isinstance(proposal, MultiLegProposal):
         return proposal.max_loss_per_spread * proposal.quantity
     contract = proposal.contract
+    # A long-option OPEN (BUY_TO_OPEN — PMCC LEAP, swing long) risks only the
+    # DEBIT paid (the max loss), NOT the underlying notional. Without this a 1-
+    # contract deep-ITM SPY long looks like ~$73k of exposure and trips the
+    # per-position cap, even though we only put ~$4.5k at risk.
+    if proposal.order_type == OrderType.BUY_TO_OPEN:
+        mid = contract.mid
+        if mid is None and contract.bid is not None and contract.ask is not None:
+            mid = (contract.bid + contract.ask) / 2
+        if mid is not None and mid > 0:
+            return mid * 100 * proposal.quantity
+        # No quote — fall through to the conservative underlying bound.
     if contract.option_type == OptionType.PUT:
         return contract.strike * 100 * proposal.quantity
     underlying = contract.underlying_price or contract.strike
@@ -123,6 +134,12 @@ class RiskGate:
         self._repos = repos
         self._config = config
         self._universe = universe
+        # Ids of "swing"-type strategies — exempt from the CSP-oriented regime
+        # gate (they carry their own 200-SMA direction gate in the signal).
+        self._swing_ids = {
+            s.get("id") for s in (config.get("strategies", []) or [])
+            if s.get("type") == "swing"
+        }
 
     async def evaluate(
         self,
@@ -534,6 +551,13 @@ class RiskGate:
         # unfavorable regime. Parallel to the multi-leg fix in 35e73db.
         if proposal.order_type == OrderType.BUY_TO_CLOSE:
             result.add("regime", "skip", "closes bypass the regime gate")
+            return
+        # Sub-sprint 2.4: swing strategies carry their OWN 200-SMA regime gate
+        # inside the signal (direction = sign(close − 200SMA)). The CSP-oriented
+        # regime rule must not second-guess them — it would wrongly block a
+        # (bearish) swing PUT in a down regime, exactly when the signal wants it.
+        if getattr(proposal, "strategy_id", None) in self._swing_ids:
+            result.add("regime", "skip", "swing: regime handled by the strategy's own 200-SMA gate")
             return
         # CCs are about closing existing exposure — regime gate applies only to
         # new CSPs (spec §8 rule 7).

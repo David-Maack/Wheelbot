@@ -872,3 +872,40 @@ async def test_tier2_screen_skips_closes(db_repos, monkeypatch):
     res = await gate.evaluate(close_proposal, today=date(2025, 6, 1), raise_on_fail=False)
     statuses = {r.rule: r.status for r in res.results}
     assert statuses["tier2_screen"] == "skip"
+
+
+def _itm_call(strike: float = 700.0, bid: float = 45.0, ask: float = 45.2) -> OptionContract:
+    return OptionContract(
+        underlying="SPY", occ_symbol="SPY260821C00700000", strike=strike,
+        expiration=date(2026, 8, 21), option_type=OptionType.CALL,
+        bid=bid, ask=ask, delta=0.9, underlying_price=733.0,
+    )
+
+
+def _swing_proposal() -> Proposal:
+    return Proposal(
+        symbol="SPY", contract=_itm_call(), order_type=OrderType.BUY_TO_OPEN,
+        quantity=1, rationale="swing test", strategy_id="spy_swing_opt",
+    )
+
+
+def test_notional_long_option_is_premium_not_underlying():
+    # A deep-ITM SPY long: premium ~$45.10/sh → $4,510, NOT ~$73,300 underlying.
+    from risk.limits import _notional
+    assert _notional(_swing_proposal()) == pytest.approx(45.1 * 100)
+
+
+@pytest.mark.asyncio
+async def test_regime_gate_skips_swing(db_repos):
+    # Swing carries its own 200-SMA gate → the CSP regime rule must skip it.
+    from risk.limits import RiskCheckResult
+    cfg = {
+        "account": {"id": "test"}, "regime": {"enabled": True},
+        "strategies": [{"id": "spy_swing_opt", "type": "swing"}],
+    }
+    gate = RiskGate(PaperBroker(cash=100_000), db_repos, cfg, _universe())
+    p = _swing_proposal()
+    res = RiskCheckResult(proposal=p)
+    await gate._rule_regime(res, p, {})
+    assert res.results[-1].status == "skip"
+    assert "swing" in res.results[-1].detail
