@@ -53,6 +53,11 @@ class Proposal:
     # "bullish_long"), the router fires news_check on that open with the named
     # profile. Mirrors MultiLegProposal.news_check_profile.
     news_check_profile: str | None = None
+    # Sub-sprint 2.2b: arbitrary entry context plumbed onto the resulting Order's
+    # raw_request. Swing stashes its SPY-level exit anchors (entry_spot / stop /
+    # target / entry_date) here so the close orchestrator recovers them via
+    # latest_filled_order — keeping the exit math anchored to entry.
+    raw_request: dict[str, Any] | None = None
 
 
 def _tier_flags(symbol: str, universe: dict[str, Any]) -> tuple[bool, bool]:

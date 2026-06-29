@@ -5,17 +5,20 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 from backtest.engine import EngineConfig
-from core.models import OptionContract, OptionType
+from core.models import OptionContract, OptionType, Order, OrderStatus, OrderType
 from strategies.swing import (
+    build_swing_entry,
     evaluate_swing_signal,
     pick_deep_itm,
+    prior_day_level,
     swing_exit_decision,
+    swing_exit_from_order,
     swing_stop_target,
 )
-from strategies.swing_signal import SwingParams, TimeframeSpec
+from strategies.swing_signal import Signal, SwingParams, TimeframeSpec
 
 # 2-timeframe stack (daily direction + 5-min trigger) keeps the test self-contained.
 _PARAMS = SwingParams(timeframes=(
@@ -118,3 +121,70 @@ def test_swing_exit_target_and_time():
     e, r = swing_exit_decision(1, 600.0, 596.0, 606.0, hold_days=7.0,
                                min_hold_days=1.0, max_hold_days=7.0)
     assert e is True and r == "swing_time_stop"
+
+
+# --- entry/exit proposal builders (2.2b-ii) --------------------------------
+def _daily_frame():
+    idx = pd.DatetimeIndex(["2026-06-24", "2026-06-25", "2026-06-26"])
+    return pd.DataFrame({"open": 600, "high": [604, 605, 606], "low": [596, 597, 595],
+                         "close": 600, "volume": 1000}, index=idx)
+
+
+def test_prior_day_level_long_uses_prior_low():
+    daily = _daily_frame()
+    # "today" = 06-26 → prior completed bar is 06-25 (low 597 / high 605).
+    assert prior_day_level(daily, date(2026, 6, 26), direction=1) == 597.0
+    assert prior_day_level(daily, date(2026, 6, 26), direction=-1) == 605.0
+
+
+def _opt(strike, exp, ot):
+    return OptionContract(underlying="SPY", occ_symbol="SPY___", strike=strike,
+                          expiration=exp, option_type=ot, bid=20.0, ask=20.2, delta=0.9)
+
+
+def test_build_swing_entry_long_stashes_exit_anchors():
+    sig = Signal(ts=None, direction=1, spot=600.0)
+    contract = _opt(585.0, date(2026, 8, 21), OptionType.CALL)
+    prop = build_swing_entry("SPY", contract, sig, prior_level=596.0,
+                             params={"reward_risk": 1.5, "contracts": 1},
+                             universe={"tickers": []}, today=date(2026, 6, 26),
+                             strategy_id="spy_swing_opt")
+    assert prop.order_type == OrderType.BUY_TO_OPEN
+    assert prop.news_check_profile == "bullish_long"
+    sw = prop.raw_request["swing"]
+    assert sw["stop_px"] == 596.0
+    assert sw["target_px"] == 600.0 + 1.5 * 4.0  # 606
+    assert sw["direction"] == 1
+
+
+def test_build_swing_entry_short_has_no_bullish_news_profile():
+    sig = Signal(ts=None, direction=-1, spot=600.0)
+    contract = _opt(615.0, date(2026, 8, 21), OptionType.PUT)
+    prop = build_swing_entry("SPY", contract, sig, prior_level=604.0,
+                             params={}, universe={"tickers": []},
+                             today=date(2026, 6, 26), strategy_id="spy_swing_opt")
+    assert prop.news_check_profile is None
+    assert prop.raw_request["swing"]["target_px"] == 600.0 - 1.5 * 4.0  # 594
+
+
+def _entry_order(stop, target, entry_date, direction=1):
+    return Order(
+        account_id="t", symbol="SPY", order_type=OrderType.BUY_TO_OPEN,
+        contract_symbol="SPY___", strike=585.0, expiration=date(2026, 8, 21),
+        option_type=OptionType.CALL, quantity=1, status=OrderStatus.FILLED,
+        placed_at=datetime(2026, 6, 24, tzinfo=UTC).replace(tzinfo=None),
+        client_order_id="x", strategy_id="spy_swing_opt",
+        raw_request={"swing": {"stop_px": stop, "target_px": target,
+                               "entry_date": entry_date, "direction": direction}},
+    )
+
+
+def test_swing_exit_from_order_reads_anchors():
+    o = _entry_order(596.0, 606.0, "2026-06-24")
+    now = datetime(2026, 6, 26, tzinfo=UTC).replace(tzinfo=None)  # hold 2 days
+    assert swing_exit_from_order(o, 607.0, now, {}) == (True, "swing_target")
+    assert swing_exit_from_order(o, 595.0, now, {}) == (True, "swing_stop")
+    assert swing_exit_from_order(o, 600.0, now, {}) == (False, None)
+    # 8 days held → time stop.
+    later = datetime(2026, 7, 2, tzinfo=UTC).replace(tzinfo=None)
+    assert swing_exit_from_order(o, 600.0, later, {}) == (True, "swing_time_stop")

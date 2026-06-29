@@ -711,6 +711,8 @@ class OrderRouter:
             # into orders.trigger_reason so the dashboard + post-hoc analysis
             # can read it without parsing the rationale string.
             trigger_reason=proposal.trigger_reason,
+            # Sub-sprint 2.2b: optional entry context (swing exit anchors).
+            raw_request=getattr(proposal, "raw_request", None),
         )
 
     async def _submit_with_retry(

@@ -832,6 +832,17 @@ class Reconciler:
                 return  # state doesn't match what we'd expect for this order
             target_cycle_id = None  # no fill, no cycle opened
             reason_label = "cancel_open"
+        elif (
+            local.order_type == OrderType.BUY_TO_OPEN
+            and local.strategy_id in self._swing_strategy_ids
+        ):
+            # Sub-sprint 2.2b: a swing entry cancelled/rejected before fill must
+            # release the position back to IDLE, else it strands in SWING_PENDING.
+            if position.state != PositionState.SWING_PENDING:
+                return
+            target_state = PositionState.IDLE
+            target_cycle_id = None  # no fill, no cycle opened
+            reason_label = "cancel_open"
         else:
             # BUY_TO_CLOSE and other wheel order types: router doesn't move
             # position to a *_PENDING state on placement, so nothing to undo.

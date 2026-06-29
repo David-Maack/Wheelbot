@@ -24,10 +24,13 @@ from backtest.data import load_daily_yf, load_intraday_alpaca, load_vix_daily
 from backtest.engine import EngineConfig, generate_signals
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
-from core.models import OptionContract, OptionType
+from core.models import OptionContract, Order, OptionType, OrderType, PositionState
 from core.strategies import StrategyDefinition
 from data.chain import ChainFilters, fetch_filtered_chain
+from db.repo import Repos
+from strategies.pmcc import latest_filled_order
 from strategies.swing_signal import Signal, SwingParams, TimeframeSpec
+from strategies.wheel import Proposal, _tier_flags
 
 # Default 3-timeframe stack (weekly + daily direction, 5-min trigger), matching
 # the backtest. A strategy's `params.timeframes` can override (2 vs 3 TF).
@@ -180,24 +183,91 @@ def swing_exit_decision(
     return False, None
 
 
+def prior_day_level(daily, today: date, direction: int) -> float | None:
+    """Prior completed daily bar's low (long) / high (short) — the stop anchor."""
+    if daily is None or len(daily) == 0:
+        return None
+    prior = daily[daily.index.date < today]
+    if len(prior) == 0:
+        return None
+    row = prior.iloc[-1]
+    return float(row["low"] if direction > 0 else row["high"])
+
+
+def build_swing_entry(
+    symbol: str, contract: OptionContract, sig: Signal, prior_level: float,
+    params: dict[str, Any], universe: dict[str, Any], today: date, strategy_id: str,
+) -> Proposal:
+    """A deep-ITM long-option BUY_TO_OPEN with the SPY-level exit anchors stashed
+    on raw_request. Long call (direction +1) or long put (-1)."""
+    rr = float(params.get("reward_risk", 1.5))
+    stop_px, target_px = swing_stop_target(sig.spot, sig.direction, prior_level, rr)
+    side = "long" if sig.direction > 0 else "short"
+    dte = (contract.expiration - today).days
+    needs_screen, needs_human = _tier_flags(symbol, universe)
+    return Proposal(
+        symbol=symbol, contract=contract, order_type=OrderType.BUY_TO_OPEN,
+        quantity=int(params.get("contracts", 1)),
+        rationale=(f"swing[{symbol}] {side} {contract.strike} dte={dte} "
+                   f"stop={stop_px:.2f} tgt={target_px:.2f}"),
+        strategy_id=strategy_id, requires_screen=needs_screen, requires_human=needs_human,
+        # Long calls news-checked as bullish; long puts have no bearish profile
+        # yet, so rely on the macro-blackout gate (which fires on all proposals).
+        news_check_profile="bullish_long" if sig.direction > 0 else None,
+        raw_request={"swing": {
+            "entry_spot": sig.spot, "stop_px": stop_px, "target_px": target_px,
+            "entry_date": today.isoformat(), "direction": sig.direction,
+        }},
+    )
+
+
+def swing_exit_from_order(
+    entry_order: Order, current_spot: float, now: datetime, params: dict[str, Any]
+) -> tuple[bool, str | None]:
+    """Read the entry context off the entry order's raw_request and decide the
+    exit against the live SPY quote. Anchored to entry, like the backtest."""
+    ctx = (entry_order.raw_request or {}).get("swing", {}) if entry_order.raw_request else {}
+    stop_px, target_px, entry_date = ctx.get("stop_px"), ctx.get("target_px"), ctx.get("entry_date")
+    if stop_px is None or target_px is None or entry_date is None:
+        return False, None
+    direction = int(ctx.get("direction", 1 if entry_order.option_type == OptionType.CALL else -1))
+    hold_days = float((now.date() - date.fromisoformat(entry_date)).days)
+    return swing_exit_decision(
+        direction, current_spot, float(stop_px), float(target_px), hold_days,
+        min_hold_days=float(params.get("min_hold_days", 1)),
+        max_hold_days=float(params.get("max_hold_days", 7)),
+    )
+
+
+def _spot_from_quote(q) -> float | None:
+    return q.mid if getattr(q, "mid", None) else getattr(q, "last", None)
+
+
 async def propose_all_swings(
-    broker,
-    repos,
+    broker: Broker,
+    repos: Repos,
     config: dict[str, Any],
     universe: dict[str, Any] | None = None,
     *,
     strategy: StrategyDefinition,
     size_multiplier: float = 1.0,
     today: date | None = None,
-) -> list:
-    """DRY-RUN entry pass: compute + log the live signal, place nothing.
-
-    Returns [] so the router has nothing to execute. Sub-sprint 2.2 replaces the
-    log-only branch with a real deep-ITM long-option `Proposal`.
-    """
+) -> list[Proposal]:
+    """Entry pass: on a fresh signal with the position IDLE, propose a deep-ITM
+    long. The SWING_PENDING state (set by the router on place) guards against
+    duplicate opens next tick. In dry-run, log the full proposal and place none."""
+    today = today or date.today()
     p = strategy.params or {}
     symbol = str(p.get("symbol", "SPY"))
     dry_run = bool(p.get("dry_run", True))
+    account_id = config.get("account", {}).get("id", "primary")
+
+    position = await repos.positions.get_by_symbol(account_id, symbol, strategy_id=strategy.id)
+    state = position.state if position else PositionState.IDLE
+    if state != PositionState.IDLE:
+        log_checkpoint("swing_skip_state", status="ok", strategy=strategy.id, state=str(state))
+        return []
+
     try:
         bars5m, daily, weekly, _vix = fetch_swing_frames(symbol)
     except Exception as exc:  # network / keys / data — never crash the loop
@@ -206,23 +276,75 @@ async def propose_all_swings(
 
     sig = evaluate_swing_signal(bars5m, daily, weekly=weekly)
     if sig is None:
-        log_checkpoint(
-            "swing_eval", status="ok", strategy=strategy.id, symbol=symbol,
-            signal=0, bars5m=len(bars5m), daily=len(daily),
-        )
+        log_checkpoint("swing_eval", status="ok", strategy=strategy.id, symbol=symbol,
+                       signal=0, bars5m=len(bars5m), daily=len(daily))
         return []
 
+    contract = await select_swing_option(broker, symbol, sig.direction, p, today=today)
+    level = prior_day_level(daily, today, sig.direction)
+    if contract is None or level is None:
+        log_checkpoint("swing_no_entry", status="ok", strategy=strategy.id, symbol=symbol,
+                       have_contract=contract is not None, have_level=level is not None)
+        return []
+
+    proposal = build_swing_entry(symbol, contract, sig, level, p, universe or {"tickers": []},
+                                 today, strategy.id)
     log_checkpoint(
         "swing_signal_fired", status="ok", strategy=strategy.id, symbol=symbol,
-        direction=sig.direction, spot=round(sig.spot, 2), ts=str(sig.ts),
-        dry_run=dry_run,
+        direction=sig.direction, spot=round(sig.spot, 2), strike=contract.strike,
+        dte=(contract.expiration - today).days, stop=round(level, 2),
+        rationale=proposal.rationale, dry_run=dry_run,
     )
-    # 2.2: build a Proposal (deep-ITM long call/put) here when not dry_run.
-    return []
+    return [] if dry_run else [proposal]
 
 
 async def propose_all_swing_closes(
-    broker, repos, config: dict[str, Any], *, strategy: StrategyDefinition
-) -> list:
-    """No open swing positions until entries land in sub-sprint 2.2. Returns []."""
-    return []
+    broker: Broker, repos: Repos, config: dict[str, Any], *, strategy: StrategyDefinition
+) -> list[Proposal]:
+    """Exit pass: for a SWING_OPEN position, recover entry context, check the
+    live SPY quote against the stop/target/time rules, and propose SELL_TO_CLOSE.
+    In dry-run, log and place none."""
+    p = strategy.params or {}
+    symbol = str(p.get("symbol", "SPY"))
+    dry_run = bool(p.get("dry_run", True))
+    account_id = config.get("account", {}).get("id", "primary")
+
+    position = await repos.positions.get_by_symbol(account_id, symbol, strategy_id=strategy.id)
+    if position is None or position.state != PositionState.SWING_OPEN:
+        return []
+    entry_order = await latest_filled_order(repos, position.current_cycle_id, OrderType.BUY_TO_OPEN)
+    if entry_order is None:
+        log_checkpoint("swing_close_no_entry_order", status="fail", strategy=strategy.id)
+        return []
+
+    try:
+        spot = _spot_from_quote(await broker.get_quote(symbol))
+    except Exception as exc:
+        log_checkpoint("swing_close_quote_fail", status="fail", strategy=strategy.id, error=str(exc))
+        return []
+    if spot is None:
+        return []
+
+    should_exit, reason = swing_exit_from_order(entry_order, float(spot), datetime.now(UTC), p)
+    if not should_exit:
+        return []
+
+    try:
+        oq = await broker.get_quote(entry_order.contract_symbol)
+    except Exception as exc:
+        log_checkpoint("swing_close_option_quote_fail", status="fail", strategy=strategy.id, error=str(exc))
+        return []
+    close_contract = OptionContract(
+        underlying=symbol, occ_symbol=entry_order.contract_symbol, strike=entry_order.strike,
+        expiration=entry_order.expiration, option_type=entry_order.option_type,
+        bid=getattr(oq, "bid", None), ask=getattr(oq, "ask", None),
+    )
+    proposal = Proposal(
+        symbol=symbol, contract=close_contract, order_type=OrderType.SELL_TO_CLOSE,
+        quantity=entry_order.quantity or 1,
+        rationale=f"swing_close[{symbol}] {reason} spot={spot:.2f}",
+        strategy_id=strategy.id, trigger_reason=reason,
+    )
+    log_checkpoint("swing_close_fired", status="ok", strategy=strategy.id, symbol=symbol,
+                   reason=reason, spot=round(float(spot), 2), dry_run=dry_run)
+    return [] if dry_run else [proposal]

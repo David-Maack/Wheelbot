@@ -94,3 +94,21 @@ async def test_swing_sell_to_close_returns_to_idle_and_closes_cycle(db_repos):
     assert p.current_cycle_id is None
     assert summary.cycles_closed == 1
     assert len(await db_repos.cycles.list_open("test")) == 0
+
+
+@pytest.mark.asyncio
+async def test_swing_cancelled_entry_returns_to_idle(db_repos):
+    # A rejected/cancelled BUY_TO_OPEN must release SWING_PENDING → IDLE,
+    # otherwise the position is stranded and blocks future entries.
+    broker = PaperBroker(cash=20_000)
+    _pos, bo = await _seed_pending(db_repos, broker)
+    await broker.cancel_order(bo.broker_order_id)
+
+    rec = Reconciler(broker, db_repos, _swing_config())
+    summary = await rec.reconcile_once()
+
+    assert summary.cancellations_processed == 1
+    assert summary.fills_processed == 0
+    p = await db_repos.positions.get_by_symbol("test", "SPY", strategy_id="spy_swing_opt")
+    assert p is not None and p.state == PositionState.IDLE
+    assert p.current_cycle_id is None
