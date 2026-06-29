@@ -448,6 +448,47 @@ def build_app(deps: DashboardDeps) -> FastAPI:
 
 # --- View helpers -------------------------------------------------------------
 
+async def _swing_leg_summary(
+    deps: DashboardDeps, position: Any, today: datetime, cache: _QuoteCache,
+) -> dict[str, Any] | None:
+    """Single deep-ITM long (call or put) summary for a swing position: the
+    entry debit, current mid, the SPY-level stop/target anchors (from the entry
+    order's raw_request), and the LONG mark — gain = (mid − debit) × 100 × qty.
+    The generic helper assumes a SHORT option, which would invert the sign."""
+    from strategies.pmcc import latest_filled_order
+    if position.current_cycle_id is None:
+        return None
+    entry = await latest_filled_order(
+        deps.repos, position.current_cycle_id, OrderType.BUY_TO_OPEN,
+    )
+    if entry is None:
+        return None
+    ctx = (entry.raw_request or {}).get("swing", {}) if entry.raw_request else {}
+    debit = abs(entry.fill_price) if entry.fill_price is not None else None
+    mid = (
+        await cache.get(deps.broker, entry.contract_symbol)
+        if entry.contract_symbol else None
+    )
+    summary: dict[str, Any] = {
+        "strike": entry.strike,
+        "dte": (entry.expiration - today.date()).days if entry.expiration else None,
+        "entry_debit": debit,
+        "current_mid": mid,
+        "stop_px": ctx.get("stop_px"),
+        "target_px": ctx.get("target_px"),
+        "entry_spot": ctx.get("entry_spot"),
+        "direction": ctx.get("direction"),
+        "unrealized": None,
+        "unrealized_pct": None,
+    }
+    if debit is not None and mid is not None:
+        qty = entry.quantity or 1
+        summary["unrealized"] = (mid - debit) * 100 * qty
+        if debit > 0:
+            summary["unrealized_pct"] = (mid - debit) / debit * 100
+    return summary
+
+
 async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[str, Any]]:
     account_id = deps.config.get("account", {}).get("id", "primary")
     positions = await deps.repos.positions.list_all(account_id)
@@ -571,6 +612,17 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
         if p.strategy_id == "calendar" and p.state == PositionState.SPREAD_OPEN:
             calendar = await _calendar_leg_summary(deps, p, today)
 
+        # Sub-sprint 2.4: swing single deep-ITM long. Override the generic
+        # short-sign unrealized with the LONG mark (mid − debit).
+        swing = None
+        if p.state == PositionState.SWING_OPEN:
+            swing = await _swing_leg_summary(deps, p, today, cache)
+            if swing is not None and swing.get("unrealized") is not None:
+                unrealized = swing["unrealized"]
+                unrealized_pct = swing.get("unrealized_pct")
+                if swing.get("dte") is not None:
+                    dte = swing["dte"]
+
         out.append(
             {
                 "symbol": p.symbol,
@@ -587,6 +639,7 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 "earnings_date_iso": earnings_date_iso,
                 "pmcc": pmcc,
                 "calendar": calendar,
+                "swing": swing,
             }
         )
     return out

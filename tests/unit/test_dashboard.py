@@ -907,3 +907,48 @@ async def test_missing_password_returns_503(db_repos):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/", headers=_auth_header("wheelbot", "anything"))
         assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_positions_table_swing_long_marks_long_sign(app_client):
+    """A SWING_OPEN long shows the LONG mark (mid > entry → positive) and its
+    SPY-level stop/target — not the generic short-option sign that would invert it."""
+    from dashboard.app import _positions_rows, _QuoteCache
+    _client, deps, broker = app_client
+    OptionType = __import__("core.models", fromlist=["OptionType"]).OptionType
+    Quote = __import__("core.models", fromlist=["Quote"]).Quote
+    today = datetime.now(UTC).date()
+    expiration = today + timedelta(days=60)
+    occ = f"SPY{expiration.strftime('%y%m%d')}C00585000"
+    cycle_id = await deps.repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="SPY", strategy_id="spy_swing_opt",
+                   started_at=datetime.now(UTC).replace(tzinfo=None))
+    )
+    await deps.repos.orders.insert(Order(
+        account_id="test", symbol="SPY", strategy_id="spy_swing_opt", cycle_id=cycle_id,
+        order_type=OrderType.BUY_TO_OPEN, contract_symbol=occ, strike=585.0,
+        expiration=expiration, option_type=OptionType.CALL, quantity=1,
+        fill_price=20.0, status=OrderStatus.FILLED,
+        placed_at=datetime.now(UTC).replace(tzinfo=None),
+        filled_at=datetime.now(UTC).replace(tzinfo=None),
+        raw_request={"swing": {"entry_spot": 600.0, "stop_px": 596.0,
+                               "target_px": 606.0, "direction": 1,
+                               "entry_date": today.isoformat()}},
+    ))
+    await deps.repos.positions.insert(Position(
+        account_id="test", symbol="SPY", strategy_id="spy_swing_opt",
+        state=PositionState.SWING_OPEN, shares=0, current_cycle_id=cycle_id,
+        state_changed_at=datetime.now(UTC).replace(tzinfo=None),
+    ))
+    broker.seed_quote(Quote(symbol=occ, bid=23.9, ask=24.1))  # mid 24.0
+
+    rows = await _positions_rows(deps, _QuoteCache(0.0))
+    row = next(r for r in rows if r["strategy_id"] == "spy_swing_opt")
+    assert row["state"] == "SWING_OPEN"
+    # LONG mark: (24 - 20) * 100 * 1 = +400 (a short-sign would show -400).
+    assert row["unrealized"] == pytest.approx(400.0)
+    assert row["unrealized_pct"] == pytest.approx(20.0)
+    assert row["dte"] == 60
+    assert row["swing"]["stop_px"] == 596.0
+    assert row["swing"]["target_px"] == 606.0
+    assert row["swing"]["strike"] == 585.0

@@ -35,6 +35,16 @@
             <span class="caption">debit {{ "%.2f"|format(r.calendar.debit) }}</span>
           </div>
         {% endif %}
+        {% if r.swing %}
+          <div class="swing-legs">
+            <span title="Swing — deep-ITM long {{ 'call (bullish)' if r.swing.direction == 1 else 'put (bearish)' }}">
+              {{ r.swing.strike }}{{ "c" if r.swing.direction == 1 else "p" }}
+              {% if r.swing.dte is not none %}({{ r.swing.dte }}d){% endif %}</span>
+            {% if r.swing.stop_px is not none and r.swing.target_px is not none %}
+              <span class="caption">stop {{ "%.2f"|format(r.swing.stop_px) }} / tgt {{ "%.2f"|format(r.swing.target_px) }}</span>
+            {% endif %}
+          </div>
+        {% endif %}
       </td>
       <td><code>{{ r.state }}</code></td>
       <td>{{ r.days_in_state }}</td>
