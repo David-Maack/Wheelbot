@@ -209,6 +209,16 @@ def test_option_limit_price_nickels_at_or_above_three_dollars():
     assert _option_limit_price(7.97, 8.05) == pytest.approx(8.00)
 
 
+def test_option_limit_price_crosses_to_fill():
+    from execution.router import _option_limit_price
+    # A mid limit on a directional buy never fills — cross to the ask (buy) /
+    # bid (exit-sell); patient sells stay at mid.
+    assert _option_limit_price(9.10, 9.20) == pytest.approx(9.15)             # mid (default)
+    assert _option_limit_price(9.10, 9.20, cross="ask") == pytest.approx(9.20)  # pay the offer
+    assert _option_limit_price(9.10, 9.20, cross="bid") == pytest.approx(9.10)  # hit the bid
+    assert _option_limit_price(0.50, 0.54, cross="ask") == pytest.approx(0.54)  # penny tick
+
+
 def test_option_limit_price_returns_none_on_missing_quote():
     from execution.router import _option_limit_price
     assert _option_limit_price(None, 0.50) is None

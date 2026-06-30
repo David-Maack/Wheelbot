@@ -832,14 +832,13 @@ class Reconciler:
                 return  # state doesn't match what we'd expect for this order
             target_cycle_id = None  # no fill, no cycle opened
             reason_label = "cancel_open"
-        elif (
-            local.order_type == OrderType.BUY_TO_OPEN
-            and local.strategy_id in self._swing_strategy_ids
+        elif local.order_type == OrderType.BUY_TO_OPEN and position.state in (
+            PositionState.SWING_PENDING,
+            PositionState.PMCC_LONG_PENDING,
         ):
-            # Sub-sprint 2.2b: a swing entry cancelled/rejected before fill must
-            # release the position back to IDLE, else it strands in SWING_PENDING.
-            if position.state != PositionState.SWING_PENDING:
-                return
+            # A long-option ENTRY cancelled/rejected/expired before fill must
+            # release the position back to IDLE (swing OR PMCC long), else it
+            # strands in *_PENDING and blocks every future entry on that symbol.
             target_state = PositionState.IDLE
             target_cycle_id = None  # no fill, no cycle opened
             reason_label = "cancel_open"

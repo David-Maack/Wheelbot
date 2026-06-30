@@ -94,26 +94,37 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _option_limit_price(bid: float | None, ask: float | None) -> float | None:
-    """Mid-price rounded to a valid options tick.
+def _option_limit_price(
+    bid: float | None, ask: float | None, *, cross: str | None = None
+) -> float | None:
+    """Limit price rounded to a valid options tick.
 
-    OCC tick rules: penny increments below $3, nickel increments at/above $3.
-    Alpaca enforces this at submission time — sending 3-decimal mids triggers
-    `limit price must be limited to 2 decimal places`. Tastytrade is more
-    forgiving but still rejects sub-penny on cheap options.
+    `cross` decides aggressiveness — a MID limit on a directional BUY rests
+    between bid/ask and never fills, so we cross the spread to actually trade:
+      - "ask": buy at the offer  (BUY_TO_OPEN — PMCC long, swing entry).
+      - "bid": sell at the bid   (SELL_TO_CLOSE — swing/PMCC exits must fill).
+      - None : mid                (default; patient premium SELL_TO_OPEN).
+    The 5% liquidity gate caps how far this cross can be (≤5% of mid), so paying
+    up is a small, bounded concession in exchange for a reliable fill.
 
-    Returns None when bid/ask aren't both present.
+    OCC tick rules: penny increments below $3, nickel at/above $3 (Alpaca
+    enforces this at submission). Returns None when bid/ask aren't both present.
     """
     if bid is None or ask is None:
         return None
-    mid = (bid + ask) / 2
-    if mid <= 0:
-        return None
-    if mid >= 3.0:
-        # Nearest $0.05.
-        snapped = round(mid * 20) / 20
+    if cross == "ask":
+        target = ask
+    elif cross == "bid":
+        target = bid
     else:
-        snapped = round(mid, 2)
+        target = (bid + ask) / 2
+    if target <= 0:
+        return None
+    if target >= 3.0:
+        # Nearest $0.05.
+        snapped = round(target * 20) / 20
+    else:
+        snapped = round(target, 2)
     # Floor at $0.01 — Alpaca rejects $0.00 limit on a SELL.
     return max(snapped, 0.01)
 
@@ -703,7 +714,14 @@ class OrderRouter:
             expiration=contract.expiration,
             option_type=contract.option_type,
             quantity=proposal.quantity,
-            limit_price=_option_limit_price(contract.bid, contract.ask),
+            limit_price=_option_limit_price(
+                contract.bid, contract.ask,
+                # Cross the spread on directional fills so they actually trade:
+                # buy at the ask, exit-sell at the bid; patient sells stay at mid.
+                cross=("ask" if proposal.order_type == OrderType.BUY_TO_OPEN
+                       else "bid" if proposal.order_type == OrderType.SELL_TO_CLOSE
+                       else None),
+            ),
             status=OrderStatus.PENDING,
             placed_at=_utcnow(),
             client_order_id=client_order_id or _client_order_id(proposal, today),
