@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
@@ -178,6 +178,7 @@ def in_blackout(
     days_after: int,
     today: date | None = None,
     block_if_spans: bool = True,
+    entry_avoid_days: int | None = None,
 ) -> bool | None:
     """True if opening a position expiring on `expiration` conflicts with the
     symbol's next earnings date. Two independent triggers (either one → True):
@@ -200,6 +201,14 @@ def in_blackout(
         return None
     today = today or datetime.now(timezone.utc).date()
     earnings = lookup.next_date
+    # Entry-proximity mode (when entry_avoid_days is set): only avoid OPENING
+    # when earnings is imminent from TODAY. The 21-DTE time-close means defined-
+    # risk spreads exit well before an expiry-date earnings, so the expiry-based
+    # triggers below are over-cautious in earnings season (they block nearly
+    # every 30-45 DTE spread whose life merely reaches late-July earnings). Here
+    # we block only when earnings lands within the next `entry_avoid_days` days.
+    if entry_avoid_days is not None:
+        return today < earnings <= today + timedelta(days=entry_avoid_days)
     near_expiry = (earnings - expiration).days <= days_before and (
         expiration - earnings
     ).days <= days_after

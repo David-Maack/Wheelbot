@@ -329,6 +329,18 @@ class RiskGate:
         else:
             result.add("concurrent_total_cap", "pass")
 
+    def _earnings_avoid_days(self) -> int | None:
+        """Global earnings entry-proximity window (risk.earnings_blackout.
+        entry_avoid_days). When set, the earnings gate blocks only when earnings
+        is within this many days of TODAY — instead of the expiry-based triggers,
+        which block nearly every 30-45 DTE spread during earnings season even
+        though the 21-DTE time-close exits before an expiry-date earnings. None
+        → legacy (expiry-window + spans) behavior."""
+        v = ((self._config.get("risk", {}) or {}).get("earnings_blackout", {}) or {}).get(
+            "entry_avoid_days"
+        )
+        return int(v) if v is not None else None
+
     # --- Rule 4 ----------------------------------------------------------------
     async def _rule_earnings(
         self,
@@ -350,6 +362,7 @@ class RiskGate:
             days_after=days_after,
             today=today,
             block_if_spans=block_if_spans,
+            entry_avoid_days=self._earnings_avoid_days(),
         )
         if in_window is None:
             result.add("earnings_blackout", "skip", "no earnings data")
@@ -392,6 +405,7 @@ class RiskGate:
             days_after=days_after,
             today=today,
             block_if_spans=block_if_spans,
+            entry_avoid_days=self._earnings_avoid_days(),
         )
         if in_window is None:
             result.add("earnings_blackout", "skip", "no earnings data")

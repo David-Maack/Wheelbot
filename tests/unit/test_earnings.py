@@ -76,3 +76,26 @@ def test_no_earnings_data_returns_none(monkeypatch):
         in_blackout("X", date(2026, 7, 31), days_before=5, days_after=2, today=TODAY)
         is None
     )
+
+
+def test_entry_proximity_blocks_imminent_earnings(monkeypatch):
+    # entry_avoid_days mode: earnings 4 days out (within 7) → block the open.
+    _stub_next_earnings(monkeypatch, date(2026, 6, 27))
+    assert (
+        in_blackout("X", date(2026, 8, 7), days_before=5, days_after=2,
+                    today=TODAY, entry_avoid_days=7)
+        is True
+    )
+
+
+def test_entry_proximity_allows_weeks_away_earnings_even_at_expiry(monkeypatch):
+    # The case that sidelined the spreads: expiry == earnings (7/31), 38 days out.
+    _stub_next_earnings(monkeypatch, date(2026, 7, 31))
+    # Legacy expiry-based gate blocks (near_expiry).
+    assert in_blackout("X", date(2026, 7, 31), days_before=5, days_after=2, today=TODAY) is True
+    # Entry-proximity (7d) allows it — the 21-DTE close exits before that earnings.
+    assert (
+        in_blackout("X", date(2026, 7, 31), days_before=5, days_after=2,
+                    today=TODAY, entry_avoid_days=7)
+        is False
+    )

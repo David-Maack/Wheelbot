@@ -193,6 +193,16 @@ risk:
     days_before: 5
     days_after: 2
 
+  # Earnings ENTRY gate (risk/limits.py rule 4). entry_avoid_days switches the
+  # gate from expiry-based (block any 30-45 DTE position whose life reaches
+  # earnings — which sidelined the spread strategies for ~6 weeks every earnings
+  # season) to ENTRY-PROXIMITY: only avoid OPENING when earnings is within this
+  # many days of today. Defined-risk + the 21-DTE time-close make this safe —
+  # spreads exit well before an expiry-date earnings. Remove this key to revert
+  # to the legacy expiry-window + spans behavior.
+  earnings_blackout:
+    entry_avoid_days: 7
+
   # TICKET-009: win-rate floor per strategy. Catches the "still net-positive
   # in dollars but bleeding by frequency" failure mode the drawdown breaker
   # can't see. Looks at the most-recent N closed cycles; if win rate drops
