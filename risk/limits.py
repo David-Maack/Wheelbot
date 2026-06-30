@@ -855,10 +855,12 @@ class RiskGate:
             return
 
         event_types = list(cfg.get("event_types", []) or [])
+        avoid = cfg.get("entry_avoid_days")
         decision = await calendar.is_blackout(
             today=today or _today_nyse(),
             short_expiration=short_exp,
             event_types=event_types,
+            entry_avoid_days=int(avoid) if avoid is not None else None,
         )
         if decision.in_blackout:
             result.add("macro_blackout", "fail", decision.reason or "in macro blackout")

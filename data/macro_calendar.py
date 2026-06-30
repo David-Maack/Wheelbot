@@ -142,24 +142,35 @@ class MacroCalendar:
         today: date,
         short_expiration: date,
         event_types: list[str],
+        entry_avoid_days: int | None = None,
     ) -> BlackoutDecision:
-        """True when ANY day in `[today, short_expiration]` falls within the
-        configured `[event_date - days_before, event_date + days_after]`
-        window for any event whose `event_type` is in `event_types`.
+        """True when ANY day in the considered window falls within the configured
+        `[event_date - days_before, event_date + days_after]` window for any event
+        whose `event_type` is in `event_types`.
 
-        Returns the FIRST matching event (events sorted by event_date), with a
-        reason string encoding both the blocking event AND the blocked
-        expiration:
+        The considered window is `[today, short_expiration]` (legacy: blocks if any
+        macro event falls anywhere in the position's life). When `entry_avoid_days`
+        is set, it shrinks to `[today, today + entry_avoid_days]` — entry-proximity:
+        only avoid OPENING right before an imminent event, instead of refusing any
+        30-45 DTE position whose life merely reaches a routine monthly macro event.
+        Mirrors the earnings entry-proximity gate.
+
+        Returns the FIRST matching event with a reason string encoding the event
+        AND the blocked expiration:
             macro_blackout_FOMC_2026-06-17_blocks_expiration_2026-07-18
         """
         cfg = (self._config.get("risk", {}) or {}).get("macro_blackout", {}) or {}
         days_before = int(cfg.get("blackout_days_before", 1))
         days_after = int(cfg.get("blackout_days_after", 0))
-        # Pull a slightly-wider window than [today, short_expiration] so any
-        # event whose blackout window touches the position life is considered.
+        horizon = (
+            today + timedelta(days=entry_avoid_days)
+            if entry_avoid_days is not None else short_expiration
+        )
+        # Pull a slightly-wider window than [today, horizon] so any event whose
+        # blackout window touches the considered window is considered.
         events = await self._repos.macro_events.between(
             today - timedelta(days=days_after),
-            short_expiration + timedelta(days=days_before),
+            horizon + timedelta(days=days_before),
         )
         wanted = {t.upper() for t in event_types}
         for evt in sorted(events, key=lambda e: e.event_date):
@@ -167,8 +178,8 @@ class MacroCalendar:
                 continue
             window_start = evt.event_date - timedelta(days=days_before)
             window_end = evt.event_date + timedelta(days=days_after)
-            # Lifespan [today, short_expiration] overlaps [window_start, window_end]?
-            if today <= window_end and short_expiration >= window_start:
+            # Considered window [today, horizon] overlaps [window_start, window_end]?
+            if today <= window_end and horizon >= window_start:
                 reason = (
                     f"macro_blackout_{evt.event_type}_{evt.event_date}"
                     f"_blocks_expiration_{short_expiration}"

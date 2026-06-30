@@ -573,3 +573,28 @@ def test_apply_pending_raises_on_missing_db(tmp_path, monkeypatch):
     )
     with pytest.raises(FileNotFoundError):
         run_migration.apply_pending()
+
+
+@pytest.mark.asyncio
+async def test_entry_proximity_allows_event_weeks_away(db_repos):
+    # Event 10 days out + 35-DTE position: legacy blocks (lifespan overlap), but
+    # entry_avoid_days=7 → event is outside the entry window → allowed.
+    await _seed_event(db_repos, day=_today() + timedelta(days=10), etype="NFP")
+    cal = MacroCalendar(db_repos, _config())
+    decision = await cal.is_blackout(
+        today=_today(), short_expiration=_today() + timedelta(days=35),
+        event_types=["FOMC", "CPI", "NFP"], entry_avoid_days=7,
+    )
+    assert decision.in_blackout is False
+
+
+@pytest.mark.asyncio
+async def test_entry_proximity_blocks_imminent_event(db_repos):
+    # Event 2 days out → within entry_avoid_days=7 → still blocked.
+    await _seed_event(db_repos, day=_today() + timedelta(days=2), etype="NFP")
+    cal = MacroCalendar(db_repos, _config())
+    decision = await cal.is_blackout(
+        today=_today(), short_expiration=_today() + timedelta(days=35),
+        event_types=["FOMC", "CPI", "NFP"], entry_avoid_days=7,
+    )
+    assert decision.in_blackout is True

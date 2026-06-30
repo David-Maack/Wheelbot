@@ -50,8 +50,8 @@ wheel:
   # Entry gates
   ivr_min: 30                    # don't sell premium when premium is cheap
   bid_ask_spread_max_pct: 5      # skip illiquid contracts (spread > 5% of mid)
-  open_interest_min: 500
-  volume_min: 100                # contract daily volume
+  open_interest_min: 0           # Alpaca PAPER feed returns no OI/volume (always 0), so any >0 floor blocks every single-leg entry (e.g. the PMCC long). bid_ask_spread_max_pct above is the liquidity proxy. RESTORE 500 for a live broker that populates OI (Tastytrade).
+  volume_min: 0                  # ^ same — RESTORE 100 before live
 
   # Earnings handling
   earnings_blackout_days_before: 5
@@ -164,6 +164,12 @@ risk:
     event_types: [FOMC, CPI, NFP]
     blackout_days_before: 1
     blackout_days_after: 0
+    # Entry-proximity (mirrors risk.earnings_blackout.entry_avoid_days): only
+    # avoid OPENING when a macro event is within this many days of today, instead
+    # of blocking any 30-45 DTE spread whose life merely reaches a routine
+    # monthly NFP/CPI. Defined-risk + the 21-DTE close make this safe. Remove to
+    # revert to the legacy full-life span behavior.
+    entry_avoid_days: 7
     refresh_interval_hours: 24
     stale_threshold_hours: 48
     finnhub_impact_min: "high"
