@@ -284,6 +284,14 @@ async def propose_for_symbol(
         requires_screen=needs_screen,
         requires_human=needs_human,
         direction=direction,
+        # 2026-07-01 audit: bull-put OPENS previously bypassed news_check
+        # entirely (profile None → router skips), while condor/calendar/pmcc/
+        # swing were checked — backwards relative to risk. A bull put has the
+        # same negative-catalyst exposure as a CSP; the negative-news veto is
+        # the most robust surviving LLM-sentiment effect (Lopez-Lira v6), and
+        # "block" cancels even in advisory mode. Bear calls stay unchecked
+        # (bearish structure; the bullish prompt doesn't apply).
+        news_check_profile="bullish_csp" if direction == "bull_put" else None,
     )
 
 

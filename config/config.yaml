@@ -169,7 +169,11 @@ risk:
     # of blocking any 30-45 DTE spread whose life merely reaches a routine
     # monthly NFP/CPI. Defined-risk + the 21-DTE close make this safe. Remove to
     # revert to the legacy full-life span behavior.
-    entry_avoid_days: 7
+    # 2026-07-01 audit: at 7, NFP+CPI+FOMC each blocked ~8 calendar days -> only
+    # ~7-8 open trading days per month. At 2 (+ blackout_days_before 1) each
+    # event blocks ~2-3 trading days -> ~14+ open days. Further option if still
+    # too tight: drop NFP/CPI from event_types and keep only FOMC.
+    entry_avoid_days: 2
     refresh_interval_hours: 24
     stale_threshold_hours: 48
     finnhub_impact_min: "high"
@@ -377,7 +381,11 @@ strategies:
       # accounts where a single max-loss spread is 7-17% of the bankroll.
       stop_loss_mult: 2.0
       # Sprint 12 sub-sprint 5: IVR soft filter — see monthly_wheel.
-      ivr_min: 30
+      # 2026-07-01 audit: 30 was a de-facto pause — the whole mega-cap universe
+      # sits at IVR 13-25 in a calm bull, so the floor skipped ~every name ~every
+      # day. 20 re-opens the universe; the (hidden, selector-level) 25%-of-width
+      # min-credit floor still directly gates whether the premium is worth it.
+      ivr_min: 20
       # Drawdown circuit breaker — see monthly_wheel.
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150
@@ -405,7 +413,7 @@ strategies:
       profit_close_pct: 50
       time_close_dte: 21
       stop_loss_mult: 2.0
-      ivr_min: 30
+      ivr_min: 20                      # 2026-07-01 audit: 30 was a de-facto pause (see put_spread)
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150
 
@@ -464,9 +472,11 @@ strategies:
       time_close_dte: 21               # close when either short ≤ 21 DTE
       max_capital_per_condor_usd: 500  # $5k sim: ~10% of the account per condor (was 1000)
       ivr_min: 30
-      # Regime gate uses AND-combine of csps_allowed + bear_calls_allowed —
-      # see risk/limits.py::_rule_regime_multi_leg. Both wings must be
-      # independently allowed by the current regime snapshot.
+      # Regime gate (2026-07-01 audit): condor/calendar are allowed whenever
+      # bullish premium is (BULL_TREND or NEUTRAL, i.e. csps_allowed); blocked
+      # only in BEAR_TREND/HIGH_VOL. The old AND-combine required NEUTRAL, which
+      # a grinding bull never produces — both strategies were structurally
+      # zero-trade. See risk/limits.py::_rule_regime_multi_leg.
       # Drawdown circuit breaker — see monthly_wheel.
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150

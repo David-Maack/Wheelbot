@@ -440,24 +440,20 @@ class RiskGate:
             result.add("regime", "skip", "regime gating disabled in config")
             return
 
-        # Which column(s) to read depends on direction. For iron_condor we
-        # AND-combine csps_allowed + bear_calls_allowed (both wings must be
-        # independently allowed by the regime). This fallback is semantically
-        # correct for the current 4-bucket regime: BULL_TREND fails the call
-        # wing, BEAR_TREND fails the put wing, NEUTRAL allows both, HIGH_VOL
-        # fails both. When TICKET-013's 6-bucket regime adds an explicit
-        # `iron_condor_allowed` column (matrix can diverge from AND in
-        # NEUTRAL_HIGH_IV etc.), swap this branch to read that column.
-        # TICKET-016: a calendar wants a NEUTRAL, range-bound regime — which in
-        # the 4-bucket scheme is exactly "both directional wings allowed", the
-        # same AND-combine as iron_condor. (The LOW-IV requirement is enforced
-        # separately by the selector's inverted IVR gate, not here.) When
-        # TICKET-013's 6-bucket regime lands, swap to BULL_TREND_LOW_IV /
-        # NEUTRAL_LOW_IV.
+        # Iron condor / calendar regime. The original AND-combine (csps_allowed
+        # AND bear_calls_allowed) required NEUTRAL — which a grinding bull market
+        # never produces (choppiness < 61.8), making both strategies STRUCTURAL
+        # ZERO-trade for the entire tape (2026-07-01 audit). Relaxed: allow in
+        # any regime that permits bullish premium (BULL_TREND or NEUTRAL, i.e.
+        # csps_allowed) and block only BEAR_TREND / HIGH_VOL. Rationale: the
+        # dangerous condor wing in a bull drift is the call side, which the 25%
+        # profit-take + 21-DTE time-close + defined wings already manage; a
+        # calendar's max loss is its debit. When TICKET-013's 6-bucket regime
+        # adds an explicit iron_condor_allowed column, read that instead.
         if proposal.direction in ("iron_condor", "calendar"):
             c = await self._repos.db.connect()
             async with c.execute(
-                "SELECT csps_allowed, bear_calls_allowed FROM regime_snapshots "
+                "SELECT csps_allowed FROM regime_snapshots "
                 "ORDER BY snapshot_date DESC LIMIT 1"
             ) as cur:
                 row = await cur.fetchone()
@@ -465,18 +461,13 @@ class RiskGate:
                 result.add("regime", "skip", "no regime snapshots yet")
                 return
             csps_ok = bool(row["csps_allowed"]) if row["csps_allowed"] is not None else True
-            bear_ok = bool(row["bear_calls_allowed"]) if row["bear_calls_allowed"] is not None else True
-            if csps_ok and bear_ok:
+            if csps_ok:
                 result.add("regime", "pass")
             else:
-                missing = []
-                if not csps_ok:
-                    missing.append("put side (csps_allowed=False)")
-                if not bear_ok:
-                    missing.append("call side (bear_calls_allowed=False)")
                 result.add(
                     "regime", "fail",
-                    f"{proposal.direction} requires a range-bound regime; blocked: {', '.join(missing)}",
+                    f"{proposal.direction} blocked: BEAR_TREND/HIGH_VOL regime "
+                    "(csps_allowed=False)",
                 )
             return
 

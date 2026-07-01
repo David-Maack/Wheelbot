@@ -445,10 +445,8 @@ async def test_regime_gate_passes_bear_call_when_bear_calls_allowed(
 async def test_regime_gate_iron_condor_passes_when_both_wings_allowed(
     db_repos, monkeypatch
 ):
-    """TICKET-014 precursor #2: iron_condor AND-combines csps_allowed +
-    bear_calls_allowed. Both True → pass. Locked semantic: a condor only
-    runs in a regime where BOTH directional wings are independently
-    allowed (NEUTRAL in the current 4-bucket scheme)."""
+    """2026-07-01 audit: condor allowed wherever bullish premium is (csps_allowed
+    — BULL_TREND or NEUTRAL). NEUTRAL (both flags) passes."""
     monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
     await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=1)
 
@@ -482,14 +480,16 @@ async def test_regime_gate_iron_condor_blocked_when_put_wing_disallowed(
     )
     rule_results = {r.rule: r for r in res.results}
     assert rule_results["regime"].status == "fail"
-    assert "put side" in rule_results["regime"].detail
+    assert "BEAR_TREND/HIGH_VOL" in rule_results["regime"].detail
 
 
 @pytest.mark.asyncio
-async def test_regime_gate_iron_condor_blocked_when_call_wing_disallowed(
+async def test_regime_gate_iron_condor_passes_in_bull_trend(
     db_repos, monkeypatch
 ):
-    """bear_calls_allowed=0 (call wing blocked) → condor fails even if csps=1."""
+    """2026-07-01 audit fix: BULL_TREND (csps=1, bear_calls=0) now PASSES a
+    condor — the old AND-combine required NEUTRAL, which a grinding bull never
+    produces, making the strategy structurally zero-trade."""
     monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
     await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=0)
 
@@ -501,15 +501,13 @@ async def test_regime_gate_iron_condor_blocked_when_call_wing_disallowed(
         today=date(2025, 6, 1),
         raise_on_fail=False,
     )
-    rule_results = {r.rule: r for r in res.results}
-    assert rule_results["regime"].status == "fail"
-    assert "call side" in rule_results["regime"].detail
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["regime"] == "pass"
 
 
 @pytest.mark.asyncio
 async def test_regime_gate_calendar_passes_when_range_bound(db_repos, monkeypatch):
-    """TICKET-016: a calendar wants a range-bound (NEUTRAL) regime = both
-    directional flags allowed (same AND-combine as iron_condor)."""
+    """Calendar passes wherever bullish premium is allowed (NEUTRAL here)."""
     monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
     await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=1)
     cfg = _config()
@@ -524,10 +522,11 @@ async def test_regime_gate_calendar_passes_when_range_bound(db_repos, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_regime_gate_calendar_blocked_when_trending(db_repos, monkeypatch):
-    """A trending regime (one wing disallowed) blocks the calendar."""
+async def test_regime_gate_calendar_blocked_when_bearish(db_repos, monkeypatch):
+    """BEAR_TREND/HIGH_VOL (csps_allowed=0) still blocks the calendar; BULL_TREND
+    no longer does (2026-07-01 audit fix)."""
     monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=0)
+    await _seed_regime(db_repos, csps_allowed=0, bear_calls_allowed=1)
     cfg = _config()
     cfg["regime"] = {"enabled": True}
     gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
@@ -537,7 +536,7 @@ async def test_regime_gate_calendar_blocked_when_trending(db_repos, monkeypatch)
     )
     rule_results = {r.rule: r for r in res.results}
     assert rule_results["regime"].status == "fail"
-    assert "calendar requires a range-bound regime" in rule_results["regime"].detail
+    assert "BEAR_TREND/HIGH_VOL" in rule_results["regime"].detail
 
 
 @pytest.mark.asyncio

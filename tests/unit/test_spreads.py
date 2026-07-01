@@ -255,6 +255,10 @@ async def test_orchestrator_builds_multi_leg_proposal_for_idle_position():
     assert long_leg.strike == 9.0
     assert proposal.strategy_id == "put_spread"
     assert proposal.quantity >= 1
+    # 2026-07-01 audit: bull-put OPENS are news-checked like a CSP (they carry
+    # the same negative-catalyst exposure); previously profile=None bypassed
+    # the check entirely.
+    assert proposal.news_check_profile == "bullish_csp"
 
 
 @pytest.mark.asyncio
