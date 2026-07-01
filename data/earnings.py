@@ -207,12 +207,14 @@ def in_blackout(
     # triggers below are over-cautious in earnings season (they block nearly
     # every 30-45 DTE spread whose life merely reaches late-July earnings). Here
     # we block only when earnings lands within the next `entry_avoid_days` days.
+    # `today <= earnings`, NOT `<`: a same-day report (e.g. AMC tonight) must
+    # block — the strict comparison let the bot sell premium hours before the gap.
     if entry_avoid_days is not None:
-        return today < earnings <= today + timedelta(days=entry_avoid_days)
+        return today <= earnings <= today + timedelta(days=entry_avoid_days)
     near_expiry = (earnings - expiration).days <= days_before and (
         expiration - earnings
     ).days <= days_after
-    spans = block_if_spans and today < earnings <= expiration
+    spans = block_if_spans and today <= earnings <= expiration
     return near_expiry or spans
 
 

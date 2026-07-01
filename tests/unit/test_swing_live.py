@@ -7,6 +7,8 @@ import pandas as pd
 
 from datetime import UTC, date, datetime
 
+import pytest
+
 from backtest.engine import EngineConfig
 from core.models import OptionContract, OptionType, Order, OrderStatus, OrderType
 from strategies.swing import (
@@ -177,6 +179,56 @@ def _entry_order(stop, target, entry_date, direction=1):
         raw_request={"swing": {"stop_px": stop, "target_px": target,
                                "entry_date": entry_date, "direction": direction}},
     )
+
+
+@pytest.mark.asyncio
+async def test_swing_exit_anchors_survive_broker_round_trip(db_repos, monkeypatch):
+    """CRITICAL regression: brokers REPLACE Order.raw_request with their own
+    request dump on placement (alpaca model_copy / paper dump). The router must
+    merge the proposal's swing exit anchors back before persisting, else the
+    DB row has no {swing: stop/target/...} and stops/targets/time exits NEVER
+    fire. This test runs the REAL router->PaperBroker->DB path."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    monkeypatch.setattr("execution.router.within_entry_window", lambda **k: True)
+    from core.config import UniverseEntry
+    from execution.router import OrderRouter
+    from platforms.paper_broker import PaperBroker
+    from strategies.swing import build_swing_entry
+
+    config = {
+        "account": {"id": "test", "broker": "paper"},
+        "strategies": [{"id": "spy_swing_opt", "type": "swing", "enabled": True,
+                        "max_concurrent": 1, "params": {"symbol": "SPY"}}],
+    }
+    universe = {"tickers": [UniverseEntry(symbol="SPY", name="SPDR", tier=1, overrides={})],
+                "banned": [], "banned_rules": []}
+    router = OrderRouter(PaperBroker(cash=100_000), db_repos, config, universe)
+
+    contract = OptionContract(
+        underlying="SPY", occ_symbol="SPY260828C00590000", strike=590.0,
+        expiration=date(2026, 8, 28), option_type=OptionType.CALL,
+        bid=19.9, ask=20.1, delta=0.9,
+    )
+    prop = build_swing_entry(
+        "SPY", contract, Signal(ts=None, direction=1, spot=600.0), prior_level=596.0,
+        params={}, universe=universe, today=date(2026, 6, 30), strategy_id="spy_swing_opt",
+    )
+
+    async def _noop(_s):
+        return None
+
+    result = await router.place(prop, sleep=_noop, today=date(2026, 6, 30))
+    assert result.placed is not None
+
+    persisted = [o for o in await db_repos.orders.list_recent("test", limit=10)
+                 if o.symbol == "SPY" and o.order_type == OrderType.BUY_TO_OPEN]
+    assert persisted, "swing entry order not persisted"
+    row = persisted[0]
+    # The anchors must survive the broker round-trip into the DB row...
+    assert (row.raw_request or {}).get("swing", {}).get("stop_px") == 596.0
+    # ...and the exit logic must be able to fire from that row.
+    now = datetime(2026, 7, 2, tzinfo=UTC).replace(tzinfo=None)
+    assert swing_exit_from_order(row, 610.0, now, {}) == (True, "swing_target")
 
 
 def test_swing_exit_from_order_reads_anchors():

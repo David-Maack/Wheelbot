@@ -462,6 +462,20 @@ class OrderRouter:
         order = self._build_order(proposal, today=today, client_order_id=effective_client_id)
         placed = await self._submit_with_retry(order, sleep=sleep)
 
+        # Preserve the proposal's entry context through the broker round-trip.
+        # Brokers REPLACE raw_request with their own request dump on the returned
+        # order (alpaca_broker.place_order model_copy; paper_broker likewise),
+        # which destroyed the swing exit anchors {stop_px, target_px, ...} before
+        # they ever reached the DB — leaving swing positions with NO working
+        # stop/target/time exit. Merge the proposal's context back on top,
+        # keeping the broker dump's other keys (mirrors the multi-leg
+        # width_dollars re-stamp above).
+        prop_ctx = getattr(proposal, "raw_request", None)
+        if prop_ctx:
+            merged = dict(placed.raw_request or {})
+            merged.update(prop_ctx)
+            placed = placed.model_copy(update={"raw_request": merged})
+
         # DB writes. Order first; position state second.
         await self._persist_order(placed)
         await self._upsert_position_pending(proposal, placed)
@@ -716,9 +730,12 @@ class OrderRouter:
             quantity=proposal.quantity,
             limit_price=_option_limit_price(
                 contract.bid, contract.ask,
-                # Cross the spread on directional fills so they actually trade:
-                # buy at the ask, exit-sell at the bid; patient sells stay at mid.
-                cross=("ask" if proposal.order_type == OrderType.BUY_TO_OPEN
+                # Cross the spread on fills that MUST happen: any BUY pays the
+                # ask (entries AND defensive buybacks — a stop-loss BTC at mid
+                # rests behind a rising option and never fills), exit-sells hit
+                # the bid. Only patient premium SELL_TO_OPEN stays at mid.
+                cross=("ask" if proposal.order_type in (
+                            OrderType.BUY_TO_OPEN, OrderType.BUY_TO_CLOSE)
                        else "bid" if proposal.order_type == OrderType.SELL_TO_CLOSE
                        else None),
             ),
