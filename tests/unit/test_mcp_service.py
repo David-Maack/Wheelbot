@@ -83,6 +83,22 @@ async def test_get_account_risk_reports_cap(db_repos, tmp_path):
     assert "equity" in res and "net_position_value" in res
 
 
+@pytest.mark.asyncio
+async def test_get_performance_reads_closed_cycles(db_repos, tmp_path):
+    # Regression: the service read `self._repos.wheel_cycles` (no such attr on
+    # Repos — it's `.cycles`), so this tool raised AttributeError in prod.
+    from core.models import CycleOutcome, WheelCycle
+    await db_repos.cycles.insert(WheelCycle(
+        account_id="test", symbol="F", strategy_id="monthly_wheel",
+        started_at=_utcnow(), ended_at=_utcnow(),
+        final_pnl=42.0, cycle_outcome=CycleOutcome.CSP_EXPIRED, days_held=10,
+    ))
+    res = await _service(db_repos, tmp_path).get_performance()
+    assert res["by_strategy"]["monthly_wheel"]["closed"] == 1
+    assert res["by_strategy"]["monthly_wheel"]["pnl"] == pytest.approx(42.0)
+    assert res["total_realized_pnl"] == pytest.approx(42.0)
+
+
 async def _seed_regime(db_repos) -> None:
     await db_repos.regime.insert(RegimeSnapshot(
         snapshot_date=date(2026, 6, 24),

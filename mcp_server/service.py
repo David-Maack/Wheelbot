@@ -131,7 +131,7 @@ class WheelbotMcpService:
         """Realized P&L and win rate by strategy from closed cycles, plus the most recent closes."""
         by_strat: dict[str, dict] = {}
         recent: list[dict] = []
-        for c in await self._repos.wheel_cycles.list_closed(self._account_id, limit=limit):
+        for c in await self._repos.cycles.list_closed(self._account_id, limit=limit):
             sid = c.strategy_id or "?"
             agg = by_strat.setdefault(sid, {"closed": 0, "wins": 0, "pnl": 0.0})
             agg["closed"] += 1
