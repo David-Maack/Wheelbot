@@ -57,7 +57,18 @@ def build_server(service: WheelbotMcpService, *, host: str, port: int) -> FastMC
         """Why a symbol may not be trading: owning strategies, regime gate, cap, earnings, recent orders."""
         return await service.diagnose_symbol(symbol)
 
+    @mcp.tool()
+    async def get_watchlists() -> dict:
+        """Applied universe-refresh watchlists per strategy + latest pending proposal diff."""
+        return await service.get_watchlists()
+
     # ---- guarded control tools (require mcp.controls_enabled) ----
+    @mcp.tool()
+    async def approve_watchlist(run_id: int, approve: bool = True,
+                                reason: str = "operator review via MCP") -> dict:
+        """[control] Apply (approve=true) or reject a PROPOSED universe-refresh watchlist run."""
+        return await service.approve_watchlist(run_id, approve=approve, reason=reason)
+
     @mcp.tool()
     async def pause_strategy(strategy: str, reason: str = "operator pause via MCP") -> dict:
         """[control] Pause NEW entries for a strategy; existing positions stay managed."""

@@ -131,3 +131,62 @@ async def test_diagnose_symbol_reads_regime(db_repos, tmp_path):
     assert res["symbol"] == "SPY"
     assert res["regime"] is not None
     assert res["regime"]["regime"] == "BULL_TREND"
+
+
+@pytest.mark.asyncio
+async def test_get_watchlists_empty(db_repos, tmp_path):
+    svc = _service(db_repos, tmp_path)
+    res = await svc.get_watchlists()
+    assert res["applied"] is None and res["latest_proposal"] is None
+    assert res["refresh_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_watchlists_shows_proposal_diff_and_applied(db_repos, tmp_path):
+    from core.models import WatchlistEntry, WatchlistRun
+
+    svc = _service(db_repos, tmp_path)
+    run_id = await db_repos.watchlists.insert_run(WatchlistRun(
+        run_date=date(2026, 7, 4), summary="swap", created_at=_utcnow(),
+    ))
+    for sym, action in (("AAA", "keep"), ("BBB", "drop"), ("CCC", "add")):
+        await db_repos.watchlists.insert_entry(WatchlistEntry(
+            run_id=run_id, strategy_id="put_spread", symbol=sym, action=action, score=50.0,
+        ))
+    res = await svc.get_watchlists()
+    assert res["applied"] is None
+    prop = res["latest_proposal"]
+    assert prop["run_id"] == run_id and prop["unchanged_keeps"] == 1
+    changes = prop["changes"]["put_spread"]
+    assert [c["symbol"] for c in changes["adds"]] == ["CCC"]
+    assert [c["symbol"] for c in changes["drops"]] == ["BBB"]
+
+    applied = await svc.approve_watchlist(run_id, approve=True)
+    assert applied["ok"] is True and applied["status"] == "applied"
+    res2 = await svc.get_watchlists()
+    assert res2["latest_proposal"] is None
+    assert sorted(res2["applied"]["watchlists"]["put_spread"]) == ["AAA", "CCC"]
+
+
+@pytest.mark.asyncio
+async def test_approve_watchlist_guards(db_repos, tmp_path):
+    from core.models import WatchlistRun
+
+    svc = _service(db_repos, tmp_path)
+    missing = await svc.approve_watchlist(999)
+    assert missing["ok"] is False
+
+    run_id = await db_repos.watchlists.insert_run(WatchlistRun(
+        run_date=date(2026, 7, 4), created_at=_utcnow(),
+    ))
+    rejected = await svc.approve_watchlist(run_id, approve=False, reason="not this week")
+    assert rejected["status"] == "rejected"
+    # A non-proposed run can't be approved after the fact.
+    again = await svc.approve_watchlist(run_id, approve=True)
+    assert again["ok"] is False
+
+    svc_off = _service(db_repos, tmp_path, controls_enabled=False)
+    with pytest.raises(ControlsDisabled):
+        await svc_off.approve_watchlist(run_id)
+    # get_watchlists is a read tool — works with controls off.
+    assert "applied" in await svc_off.get_watchlists()

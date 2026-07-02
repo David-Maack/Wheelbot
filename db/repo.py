@@ -28,6 +28,9 @@ from core.models import (
     PositionState,
     RegimeSnapshot,
     StateLog,
+    WatchlistEntry,
+    WatchlistRun,
+    WatchlistRunStatus,
     WheelCycle,
 )
 
@@ -1001,6 +1004,92 @@ class BrokerParityLogRepo(_Repo):
             return [dict(r) for r in await cur.fetchall()]
 
 
+class WatchlistsRepo(_Repo):
+    """Universe-refresh runs + per-strategy watchlist entries (migration 014).
+
+    Invariant: at most ONE run has status='applied'. `apply_run` enforces it
+    inside a transaction by marking any previously-applied run 'superseded'.
+    """
+
+    table = "watchlist_runs"
+
+    async def insert_run(self, run: WatchlistRun) -> int:
+        return await self._insert(self._serialize(run))
+
+    async def insert_entry(self, entry: WatchlistEntry) -> int:
+        data = entry.model_dump(mode="json", exclude_none=True)
+        data.pop("id", None)
+        cols = ", ".join(data)
+        placeholders = ", ".join(["?"] * len(data))
+        c = await self.db.connect()
+        async with c.execute(
+            f"INSERT INTO watchlist_entries ({cols}) VALUES ({placeholders})",
+            tuple(data.values()),
+        ) as cur:
+            new_id = cur.lastrowid
+        await c.commit()
+        assert new_id is not None
+        return new_id
+
+    async def get_run(self, run_id: int) -> WatchlistRun | None:
+        row = await self._fetch_one(
+            "SELECT * FROM watchlist_runs WHERE id = ?", (run_id,)
+        )
+        return WatchlistRun(**row) if row else None
+
+    async def latest_run(self, status: str | None = None) -> WatchlistRun | None:
+        if status is not None:
+            row = await self._fetch_one(
+                "SELECT * FROM watchlist_runs WHERE status = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (status,),
+            )
+        else:
+            row = await self._fetch_one(
+                "SELECT * FROM watchlist_runs ORDER BY created_at DESC, id DESC LIMIT 1"
+            )
+        return WatchlistRun(**row) if row else None
+
+    async def entries_for_run(self, run_id: int) -> list[WatchlistEntry]:
+        rows = await self._fetch_all(
+            "SELECT * FROM watchlist_entries WHERE run_id = ? "
+            "ORDER BY strategy_id, action, symbol",
+            (run_id,),
+        )
+        return [WatchlistEntry(**r) for r in rows]
+
+    async def applied_membership(self) -> dict[str, list[str]]:
+        """Membership map {strategy_id: [symbols]} from the currently-applied
+        run (entries with action != 'drop'). Empty dict when no run is applied."""
+        run = await self.latest_run(status=WatchlistRunStatus.APPLIED.value)
+        if run is None or run.id is None:
+            return {}
+        out: dict[str, list[str]] = {}
+        for e in await self.entries_for_run(run.id):
+            if e.action == "drop":
+                continue
+            out.setdefault(e.strategy_id, []).append(e.symbol.upper())
+        return out
+
+    async def apply_run(self, run_id: int, *, applied_by: str) -> None:
+        """Mark run applied; supersede any previously-applied run. Transactional
+        so the one-applied-run invariant can't be violated by a crash between
+        the two writes."""
+        now = datetime.now(UTC).isoformat()
+        async with self.db.transaction() as c:
+            await c.execute(
+                "UPDATE watchlist_runs SET status = ? WHERE status = ? AND id != ?",
+                (WatchlistRunStatus.SUPERSEDED.value, WatchlistRunStatus.APPLIED.value, run_id),
+            )
+            await c.execute(
+                "UPDATE watchlist_runs SET status = ?, applied_at = ?, applied_by = ? WHERE id = ?",
+                (WatchlistRunStatus.APPLIED.value, now, applied_by, run_id),
+            )
+
+    async def set_status(self, run_id: int, status: str) -> None:
+        await self._update(run_id, {"status": status})
+
+
 class Repos:
     """Convenience bundle so callers can pass a single object."""
 
@@ -1020,3 +1109,4 @@ class Repos:
         self.macro_events = MacroEventsRepo(db)
         self.alert_rate_limits = AlertRateLimitsRepo(db)
         self.broker_parity_log = BrokerParityLogRepo(db)
+        self.watchlists = WatchlistsRepo(db)

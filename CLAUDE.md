@@ -103,6 +103,14 @@ cron entries in LXC-local MDT (e.g. the daily macro-calendar refresh at
 - `account.max_concurrent_total`: `6` during testing (2026-07-01: virtual book
   re-based to $12k assumed live funding; worst-case simultaneous ~= $10.9k).
   Drop to 4 for the quarter-size live ramp, back to 6 at full funding.
+- `universe_refresh.enabled`: `false` (shipped OFF). Weekly two-tier watchlist
+  refresh (quant pre-filter + Opus rank) — proposes per-strategy add/keep/drop
+  diffs; apply via the MCP `approve_watchlist` tool. `auto_apply: false` keeps
+  spec §6's human-review gate; flip only after several trusted cycles. Arm by
+  setting `enabled: true` AND installing the cron
+  (`0 7 * * 6 python -m scripts.run_universe_refresh`, LXC-local MDT).
+  Watchlist membership only changes what strategies LOOK AT — all risk gates
+  still apply at trade time; auto-added symbols enter at tier 2.
 
 ## Live-deployment authority
 

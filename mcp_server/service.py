@@ -253,7 +253,77 @@ class WheelbotMcpService:
                      "logs; this reports persisted gating state."),
         }
 
+    async def get_watchlists(self) -> dict:
+        """Currently-applied watchlist membership + the latest pending proposal
+        (as an adds/drops diff with scores and rationales)."""
+        ur = self._config.get("universe_refresh", {}) or {}
+        applied = None
+        run = await self._repos.watchlists.latest_run(status="applied")
+        if run is not None and run.id is not None:
+            by_strategy: dict[str, list[str]] = {}
+            for e in await self._repos.watchlists.entries_for_run(run.id):
+                if e.action != "drop":
+                    by_strategy.setdefault(e.strategy_id, []).append(e.symbol)
+            applied = {
+                "run_id": run.id,
+                "run_date": _iso(run.run_date),
+                "applied_at": _iso(run.applied_at),
+                "applied_by": run.applied_by,
+                "watchlists": by_strategy,
+            }
+
+        proposal = None
+        prop = await self._repos.watchlists.latest_run(status="proposed")
+        if prop is not None and prop.id is not None:
+            changes: dict[str, dict[str, list[dict]]] = {}
+            keeps = 0
+            for e in await self._repos.watchlists.entries_for_run(prop.id):
+                if e.action == "keep":
+                    keeps += 1
+                    continue
+                bucket = changes.setdefault(e.strategy_id, {"adds": [], "drops": []})
+                bucket["adds" if e.action == "add" else "drops"].append({
+                    "symbol": e.symbol, "score": e.score, "rationale": e.rationale,
+                })
+            proposal = {
+                "run_id": prop.id,
+                "run_date": _iso(prop.run_date),
+                "summary": prop.summary,
+                "cost_usd": prop.cost_usd,
+                "changes": changes,
+                "unchanged_keeps": keeps,
+                "hint": "approve_watchlist(run_id, approve=true) to apply",
+            }
+
+        return {
+            "refresh_enabled": bool(ur.get("enabled", False)),
+            "auto_apply": bool(ur.get("auto_apply", False)),
+            "applied": applied,
+            "latest_proposal": proposal,
+            "note": ("no watchlist run applied — strategies use universe.yaml membership"
+                     if applied is None else
+                     "strategies use the applied run's membership; universe.yaml is the fallback"),
+        }
+
     # ----------------------------------------------------------- control tools
+    async def approve_watchlist(self, run_id: int, approve: bool = True,
+                                reason: str = "operator review via MCP") -> dict:
+        """Apply (or reject) a PROPOSED universe-refresh run. Applying makes its
+        membership live on the bot's next tick and supersedes the previous run."""
+        self._require_controls("approve_watchlist")
+        run = await self._repos.watchlists.get_run(run_id)
+        if run is None:
+            return {"ok": False, "error": f"no watchlist run {run_id}"}
+        if str(run.status) != "proposed":
+            return {"ok": False, "error": f"run {run_id} is '{_iso(run.status)}', not 'proposed'"}
+        if approve:
+            await self._repos.watchlists.apply_run(run_id, applied_by="mcp")
+        else:
+            await self._repos.watchlists.set_status(run_id, "rejected")
+        self._audit("approve_watchlist", run_id=run_id, approve=approve, reason=reason)
+        return {"ok": True, "run_id": run_id,
+                "status": "applied" if approve else "rejected", "reason": reason}
+
     async def pause_strategy(self, strategy: str, reason: str = "operator pause via MCP") -> dict:
         """Pause NEW entries for a strategy (existing positions keep being managed)."""
         self._require_controls("pause_strategy")

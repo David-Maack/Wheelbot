@@ -60,6 +60,7 @@ from core.logs import setup_logging
 from core.models import OptionType, Order, OrderType, Position
 from core.notify import make_notifier, set_dispatcher
 from core.strategies import StrategyDefinition, load_strategies, universe_for_strategy
+from core.watchlists import effective_universe
 from data.ivr import IVRProvider
 from db.repo import Database, Repos
 from execution.kill_switch import KillSwitchResult
@@ -625,6 +626,17 @@ async def main(argv: list[str] | None = None) -> int:
 
     async def _post_tick(_loop: ReconcilerLoop, ks: KillSwitchResult | None):
         kill_switch_tripped = ks is not None and ks.tripped
+        # Universe-refresh overlay: when enabled and a watchlist run is APPLIED,
+        # refresh strategy membership each tick. Mutates the SHARED universe
+        # dict in place — router, risk gate, and reconciler all hold this same
+        # object, so membership stays consistent everywhere. Fail-open: any
+        # error leaves the previous tick's membership untouched.
+        if bool((config.get("universe_refresh") or {}).get("enabled", False)):
+            try:
+                refreshed = await effective_universe(repos, config)
+                universe["tickers"] = refreshed["tickers"]
+            except Exception as exc:  # noqa: BLE001 — overlay must never break the loop
+                log_checkpoint("bot_universe_overlay_fail", status="fail", error=str(exc))
         # TICKET-006: earnings recheck runs even when the kill switch is
         # tripped — for action='flag_manual' it MUST run (state annotation
         # the operator needs to see), and for action='close' the function

@@ -271,3 +271,33 @@ CREATE TABLE IF NOT EXISTS alert_rate_limits (
     alert_key      TEXT PRIMARY KEY,
     last_fired_at  DATETIME NOT NULL
 );
+
+-- Dynamic universe refresh (migration 014). A refresh run proposes per-strategy
+-- watchlists; exactly one run is APPLIED at a time and the bot overlays its
+-- membership onto universe.yaml at tick time (core/watchlists.py). Runs default
+-- to PROPOSED — spec §6: never auto-add tickers without human review.
+CREATE TABLE IF NOT EXISTS watchlist_runs (
+    id               INTEGER PRIMARY KEY,
+    run_date         DATE    NOT NULL,
+    status           TEXT    NOT NULL DEFAULT 'proposed',  -- proposed | applied | rejected | superseded | failed
+    llm_decision_id  INTEGER REFERENCES llm_decisions(id),
+    cost_usd         REAL,
+    summary          TEXT,
+    created_at       DATETIME NOT NULL,
+    applied_at       DATETIME,
+    applied_by       TEXT                                  -- 'auto' | 'mcp' | 'manual'
+);
+CREATE INDEX IF NOT EXISTS idx_watchlist_runs_status ON watchlist_runs(status);
+CREATE INDEX IF NOT EXISTS idx_watchlist_runs_run_date ON watchlist_runs(run_date);
+
+CREATE TABLE IF NOT EXISTS watchlist_entries (
+    id           INTEGER PRIMARY KEY,
+    run_id       INTEGER NOT NULL REFERENCES watchlist_runs(id),
+    strategy_id  TEXT    NOT NULL,
+    symbol       TEXT    NOT NULL,
+    action       TEXT    NOT NULL DEFAULT 'keep',          -- add | keep | drop
+    score        REAL,                                     -- LLM conviction 0-100
+    rationale    TEXT,
+    UNIQUE(run_id, strategy_id, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_watchlist_entries_run ON watchlist_entries(run_id);

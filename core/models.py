@@ -127,6 +127,16 @@ class LlmDecisionType(StrEnum):
     ROLL_ADVISE = "ROLL_ADVISE"
     # 2026-07-01: daily reduce-only regime exception veto (intelligence/regime_veto.py)
     REGIME_VETO = "REGIME_VETO"
+    # Weekly universe refresh — per-strategy watchlist ranking (intelligence/universe_refresh.py)
+    UNIVERSE_REFRESH = "UNIVERSE_REFRESH"
+
+
+class WatchlistRunStatus(StrEnum):
+    PROPOSED = "proposed"
+    APPLIED = "applied"
+    REJECTED = "rejected"
+    SUPERSEDED = "superseded"
+    FAILED = "failed"
 
 
 class Regime(StrEnum):
@@ -389,3 +399,31 @@ class UniverseEntry(_Base):
     strategies: list[str] = Field(default_factory=lambda: ["monthly_wheel"])
     notes: str | None = None
     overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class WatchlistRun(_Base):
+    """One universe-refresh run (migration 014). Exactly one run is APPLIED at
+    a time; the bot overlays its membership onto universe.yaml at tick time."""
+
+    id: int | None = None
+    run_date: date
+    status: WatchlistRunStatus = WatchlistRunStatus.PROPOSED
+    llm_decision_id: int | None = None
+    cost_usd: float | None = None
+    summary: str | None = None
+    created_at: datetime
+    applied_at: datetime | None = None
+    applied_by: str | None = None  # 'auto' | 'mcp' | 'manual'
+
+
+class WatchlistEntry(_Base):
+    """One (strategy, symbol) row of a refresh run. `action` records the diff
+    against the membership that was current when the run was produced."""
+
+    id: int | None = None
+    run_id: int
+    strategy_id: str
+    symbol: str
+    action: str = "keep"  # add | keep | drop
+    score: float | None = None
+    rationale: str | None = None

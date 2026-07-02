@@ -160,6 +160,40 @@ intelligence:
   #     input_per_mtok: 15.0
   #     output_per_mtok: 75.0
 
+# Weekly dynamic universe refresh (two-tier: quant pre-filter + LLM rank).
+# Proposes per-strategy watchlist changes as add/keep/drop diffs; the bot only
+# consumes a run once it is APPLIED. Spec §6 ("never auto-add tickers without
+# human review") is preserved by default: runs land as PROPOSED and are applied
+# via the MCP approve_watchlist tool. Watchlist membership only controls what a
+# strategy LOOKS AT — every entry still passes the full risk gate at trade
+# time, and symbols the refresh introduces that have no universe.yaml entry are
+# synthesized at tier 2 (require a same-day screener score to trade).
+# Cron: 0 7 * * 6 (Saturday 07:00 MDT) — python -m scripts.run_universe_refresh
+universe_refresh:
+  enabled: false                # master switch: the cron no-ops AND the overlay is ignored
+  auto_apply: false             # true = apply proposals without human review (earn trust first)
+  model: claude-opus-4-7
+  max_output_tokens: 4096
+  # Churn guardrails (enforced in code, not just prompted).
+  max_adds_per_strategy: 2
+  max_drops_per_strategy: 2
+  min_symbols_per_strategy: 3
+  # Strategies the refresh never touches (single-symbol / signal-driven).
+  exclude_strategies: [spy_swing_opt]
+  # Tier-1 quant ADD gates. min_median_volume mirrors spec §6's tier-2
+  # admission bar (median daily volume > 5M).
+  min_price: 5.0
+  max_price: 1200.0
+  min_median_volume: 5000000
+  earnings_min_days: 7
+  # Extra symbols to consider beyond universe.yaml (parked names are always
+  # considered). Add liquid optionable tickers here as the account grows.
+  candidate_pool: []
+  # Operator pins: never droppable, per strategy. Open-position symbols are
+  # always protected regardless of this list.
+  pinned: {}
+  #  monthly_wheel: [F, T]
+
 risk:
   daily_loss_kill_switch_pct: 5  # if account drops 5% in a day, halt new trades
   consecutive_losses_pause: 3    # 3 losses in a row → pause for human review

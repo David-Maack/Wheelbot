@@ -37,8 +37,8 @@ from typing import Any
 
 from core.broker import Broker
 from core.checkpoint import checkpoint, log_checkpoint
-from core.config import load_universe
 from core.models import Candidate, LlmDecisionType, OptionType
+from core.watchlists import effective_universe
 from data.earnings import next_earnings
 from data.ivr import IVRProvider
 from data.yf_helpers import safe_history
@@ -278,7 +278,11 @@ async def run_screener(
         return {"skipped": "disabled"}
 
     run_date = run_date or datetime.now(UTC).date()
-    universe = load_universe()
+    # Watchlist-aware: symbols the universe refresh added (synthesized at
+    # tier 2) must get a daily screener row, or the tier2_screen risk-gate rule
+    # would block them forever. Falls back to plain universe.yaml when the
+    # refresh feature is disabled or nothing is applied.
+    universe = await effective_universe(repos, config)
     tickers = [t for t in universe["tickers"] if t.tier in (1, 2)]
     if not tickers:
         log_checkpoint("screener_no_tickers", status="skip")
