@@ -125,6 +125,8 @@ class LlmDecisionType(StrEnum):
     SCREEN = "SCREEN"
     NEWS_CHECK = "NEWS_CHECK"
     ROLL_ADVISE = "ROLL_ADVISE"
+    # 2026-07-01: daily reduce-only regime exception veto (intelligence/regime_veto.py)
+    REGIME_VETO = "REGIME_VETO"
 
 
 class Regime(StrEnum):
@@ -236,6 +238,10 @@ class RegimeSnapshot(_Base):
     csps_allowed: bool | None = None
     bear_calls_allowed: bool | None = None
     notes: str | None = None
+    # Migration 013: daily LLM exception veto (reduce-only). True → the bot
+    # halves entry sizes for the day. None/False → no effect.
+    llm_risk_veto: bool | None = None
+    llm_veto_reason: str | None = None
 
 
 class MacroEvent(_Base):

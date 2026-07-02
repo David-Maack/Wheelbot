@@ -94,6 +94,14 @@ intelligence:
   # 1-lot caution => block) before going live on the real bankroll.
   news_check_advisory: true
   llm_roll_advisor_enabled: false   # turn on after collecting 3+ months of data
+  # 2026-07-01 AI audit item #2: daily reduce-only regime exception veto. Once
+  # a day (run_regime cron) the LLM reads the NUMERIC regime dossier + general
+  # headlines and may flag "material risk the numbers can't see" — which halves
+  # all entry sizes for the day. It can never increase risk; every failure
+  # fails open to no-veto. ~1 Haiku call/day. Ships OFF (new-knob convention);
+  # flip to true to arm.
+  llm_regime_veto_enabled: false
+  regime_veto_model: claude-haiku-4-5
   llm_provider: anthropic
   screener_model: claude-opus-4-7
   news_check_model: claude-haiku-4-5

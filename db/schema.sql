@@ -130,7 +130,9 @@ CREATE TABLE IF NOT EXISTS regime_snapshots (
     regime          TEXT,                              -- BULL_TREND, NEUTRAL, BEAR_TREND, HIGH_VOL
     csps_allowed    BOOLEAN,
     bear_calls_allowed BOOLEAN,                         -- mirrored gate for bear_call_spread (Sprint 10)
-    notes           TEXT
+    notes           TEXT,
+    llm_risk_veto   BOOLEAN,                            -- migration 013: daily reduce-only LLM exception veto
+    llm_veto_reason TEXT
 );
 
 -- Audit trail of LLM decisions (so we can backtest "would the LLM have helped?")

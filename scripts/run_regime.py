@@ -27,6 +27,22 @@ async def main() -> int:
     async with Database(db_path) as db:
         repos = Repos(db)
         result = await run_regime(repos, config)
+        # 2026-07-01 AI audit item #2: daily LLM exception veto (reduce-only) —
+        # stamps llm_risk_veto on today's snapshot; the bot halves entry sizes
+        # for the day. Gated by config (ships false); EVERY failure fails open.
+        if result is not None and bool(
+            (config.get("intelligence", {}) or {}).get("llm_regime_veto_enabled", False)
+        ):
+            try:
+                from intelligence.anthropic_client import AnthropicClient
+                from intelligence.budget import BudgetTracker
+                from intelligence.regime_veto import run_regime_veto
+
+                budget = BudgetTracker(repos.llm_decisions, config, strict=True)
+                anthropic = AnthropicClient(repos.llm_decisions, budget)
+                await run_regime_veto(repos, config, anthropic)
+            except Exception as exc:  # noqa: BLE001 — never block the snapshot
+                log_checkpoint("regime_veto_wiring_fail", status="fail", error=str(exc))
     log_checkpoint(
         "run_regime_done",
         status="ok" if result else "skip",

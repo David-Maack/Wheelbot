@@ -290,6 +290,19 @@ async def _propose_and_route(
     total_proposals = 0
     total_placed = 0
     total_blocked = 0
+    # 2026-07-01 AI audit item #2: daily LLM exception veto (reduce-only). If
+    # today's regime snapshot carries llm_risk_veto, halve ALL strategies' entry
+    # sizes for the day (closes unaffected, like every other gate). Read once
+    # per tick; any failure reads as no-veto.
+    veto_multiplier = 1.0
+    try:
+        from intelligence.regime_veto import veto_size_multiplier
+        veto_multiplier = veto_size_multiplier(await repos.regime.latest())
+        if veto_multiplier < 1.0:
+            log_checkpoint("bot_llm_risk_veto_active", status="ok",
+                           size_multiplier=veto_multiplier)
+    except Exception:  # noqa: BLE001 — reduce-only: never let the veto read break the loop
+        veto_multiplier = 1.0
     for strategy in strategies:
         # TICKET-029: existing positions are MANAGED (closes / stops / rolls)
         # on EVERY tick regardless of the gates below — disabling a strategy, or
@@ -330,7 +343,7 @@ async def _propose_and_route(
                     )
                     opens_allowed = False
                 else:
-                    size_multiplier = drawdown_state.size_multiplier
+                    size_multiplier = drawdown_state.size_multiplier * veto_multiplier
                     if drawdown_state is auto_disable.DrawdownState.WARNING:
                         log_checkpoint(
                             "bot_strategy_warning_size_halved",
