@@ -100,8 +100,9 @@ cron entries in LXC-local MDT (e.g. the daily macro-calendar refresh at
 - `intelligence.llm_screener_enabled`: `true`. Opus runs daily via cron.
 - `intelligence.llm_roll_advisor_enabled`: `false`. Re-enable after 3+ months
   of paper data.
-- `account.max_concurrent_total`: `14` during testing (= sum of per-strategy
-  caps so the per-strategy limits actually bind). Tighten to ~4 before live.
+- `account.max_concurrent_total`: `6` during testing (2026-07-01: virtual book
+  re-based to $12k assumed live funding; worst-case simultaneous ~= $10.9k).
+  Drop to 4 for the quarter-size live ramp, back to 6 at full funding.
 
 ## Live-deployment authority
 

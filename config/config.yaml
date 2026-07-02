@@ -14,7 +14,11 @@ account:
   # $5k; pmcc LEAPs cost more than the whole account; bear_call out of scope).
   # Tightened to 4 — on $5-wide spreads, 4 simultaneous positions ≈ $1400 max
   # exposure on a $5,000 paper account. Pair with an Alpaca paper reset to $5k.
-  max_concurrent_total: 4
+  # 2026-07-01: virtual book re-based $5k -> $12k (assumed live funding).
+  # Worst-case simultaneous at 6 slots ~= $10.9k (swing 4.5k + wheel CSPs ~3.9k
+  # + pmcc 1.5k + condor 0.5k + spread 0.5k) - bounded under $12k; live, the
+  # buying-power floor binds first.
+  max_concurrent_total: 6
 
 database:
   path: "/mnt/wheelbot-storage/wheelbot.db"
@@ -283,7 +287,7 @@ strategies:
   - id: monthly_wheel
     display_name: "Monthly Wheel"
     type: wheel
-    enabled: false              # $5k sim: wheel is too capital-heavy — re-enable when bankroll grows
+    enabled: true               # $12k book (2026-07-01): cheap-name CSPs (F ~$1.1k, NOK ~$0.5k) fit; was disabled on $5k — re-enable when bankroll grows
     max_concurrent: 2
     params:
       dte_min: 30
@@ -294,9 +298,11 @@ strategies:
       cc_delta_max: 0.30
       profit_close_pct: 50
       # Sprint 12 sub-sprint 5: IVR soft filter. Skip entry when IV rank is
-      # below 30 (premium too low, edge thin). Falls through silently when
-      # iv_history has < 20 days (paper bring-up safety).
-      ivr_min: 30
+      # below the floor (premium too low, edge thin). Falls through silently
+      # when iv_history has < 20 days (paper bring-up safety).
+      # 2026-07-01: 30 -> 20 alongside the re-enable — same rationale as the
+      # spreads (universe IVR 13-25 in a calm bull made 30 a de-facto pause).
+      ivr_min: 20
       # Sprint 13 sub-sprint 1: drawdown circuit breaker. If realized P&L
       # over the last 7 days drops below this threshold, the strategy is
       # auto-disabled for 30 days (manual re-enable available). Set to 0
@@ -523,7 +529,7 @@ strategies:
       profit_close_pct_short: 50       # close short at 50% of premium captured
       short_time_close_dte: 1          # close/roll short when it reaches 1 DTE
       long_roll_dte: 30                # roll the long forward when DTE < this
-      max_capital_per_position_usd: 1000   # $5k sim: cap the LEAP debit (was 10000) — a 0.80Δ LEAP on CCL/INTC/SOFI/BAC is $300-700
+      max_capital_per_position_usd: 1500   # $12k book (2026-07-01, was 1000 on $5k): opens a 2nd affordable LEAP tier (was 10000) — a 0.80Δ LEAP on CCL/INTC/SOFI/BAC is $300-700
       # $5k sim: reject illiquid LEAPs. The 0.80Δ long is the most expensive leg,
       # so a bad fill hurts most — and a 2026-06-18 probe showed CCL/BAC/SOFI
       # LEAPs at 12-72% spreads. At 10% those are filtered out, so PMCC stays
@@ -554,7 +560,7 @@ strategies:
       long_dte_min: 45
       long_dte_max: 75
       option_type: call                # v1: call only
-      max_debit_per_spread_usd: 250
+      max_debit_per_spread_usd: 400        # $12k book (2026-07-01, was 250): $250 blocked nearly every calendar
       bid_ask_spread_max_pct: 20       # $5k sim: two-leg, naturally wider — reject the worst cheap-name fills (indices are tight, unaffected)
       profit_close_pct: 25             # of the net debit
       time_close_short_dte: 2          # force-close when front ≤ 2 DTE

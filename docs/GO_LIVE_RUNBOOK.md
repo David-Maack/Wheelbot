@@ -115,7 +115,7 @@ This is the highest-stakes transition in the runbook: first real money on a new 
 | Key | From | To |
 |---|---|---|
 | `account.broker` | `alpaca_paper` | `tastytrade` |
-| `account.max_concurrent_total` | 14 | 4 |
+| `account.max_concurrent_total` | 6 (paper, $12k virtual book) | 4 for the quarter-size ramp, back to 6 once funded at ~$12k |
 | per-strategy `max_position_pct_of_account` | base (30) | 5 |
 | `wheel.open_interest_min` | 0 (paper override) | 500 (remove override) |
 | `wheel.volume_min` | 0 (paper override) | 100 (remove override) |
@@ -198,7 +198,7 @@ Every checklist below is and-gated. Every item must be true. Do not reason "four
 - [ ] `bash scripts/migrate_check.sh` reports no drift between host `db/migrations/` and the container.
 - [ ] Dashboard `/risk` is reachable on `127.0.0.1:8889` behind basic auth and renders the kill-switch panel without errors.
 - [ ] `intelligence.daily_budget_usd` is `2.00` and `intelligence.news_check_advisory` is `true` (paper defaults).
-- [ ] `account.max_concurrent_total` is `14` (testing) — the per-strategy caps will bind.
+- [ ] `account.max_concurrent_total` is `6` (testing - $12k virtual book, 2026-07-01) — the per-strategy caps will bind.
 - [ ] Discord webhook posts a test message from the bot's first heartbeat.
 
 ### Enter Stage 2
