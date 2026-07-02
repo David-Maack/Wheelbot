@@ -842,6 +842,21 @@ class Reconciler:
             target_state = PositionState.IDLE
             target_cycle_id = None  # no fill, no cycle opened
             reason_label = "cancel_open"
+        elif (
+            local.order_type == OrderType.SELL_TO_CLOSE
+            and position.state == PositionState.PMCC_CLOSING
+        ):
+            # 2026-07-01 audit HIGH: a PMCC long-close that cancels/expires
+            # unfilled (e.g. a DAY order auto-cancelled at EOD) left the
+            # position in PMCC_CLOSING forever — no _on_cancel branch, in the
+            # _diff_one no-act set, and pmcc_close only walks BOTH_OPEN/
+            # LONG_OPEN, so no retry was ever proposed and the LEAP sat
+            # unmanaged. Restore PMCC_LONG_OPEN (the long is still held, cycle
+            # still open) so the close orchestrator re-proposes next tick.
+            # Swing needs no equivalent: its close keeps state SWING_OPEN.
+            target_state = PositionState.PMCC_LONG_OPEN
+            target_cycle_id = position.current_cycle_id  # cycle still open
+            reason_label = "cancel_close"
         else:
             # BUY_TO_CLOSE and other wheel order types: router doesn't move
             # position to a *_PENDING state on placement, so nothing to undo.
@@ -952,14 +967,24 @@ class Reconciler:
         for p in broker_positions:
             rows_by_symbol.setdefault(p.symbol.upper(), []).append(p)
         local_positions = await self._repos.positions.list_all(self._account_id)
-        local_by_symbol = {p.symbol.upper(): p for p in local_positions}
+        # 2026-07-01 audit HIGH: positions are keyed (account, symbol, strategy)
+        # — SPY alone runs five strategies — but this used to collapse locals to
+        # ONE row per symbol (last-wins dict), so only one strategy's position
+        # ever got diffed and the others' expirations/assignments were never
+        # inferred. Diff EVERY local row against the symbol's broker rows.
+        # Known limitation (documented, pre-existing): broker rows are per
+        # SYMBOL, not per strategy — when two strategies hold similar legs on
+        # the same underlying (e.g. two short calls), shape inference can
+        # attribute a leg to the wrong strategy; _diff_one stays conservative.
+        local_symbols = {p.symbol.upper() for p in local_positions}
 
         # Detect transitions implied purely by *position state* that fills alone
         # don't surface — assignments and worthless expirations.
         # TICKET-014.5: per-symbol isolation — same rationale as the per-order
-        # wrap in _process_orders. One symbol's _diff_one raising must not abort
-        # reconciliation for every other position.
-        for symbol, local in local_by_symbol.items():
+        # wrap in _process_orders. One position's _diff_one raising must not
+        # abort reconciliation for every other position.
+        for local in local_positions:
+            symbol = local.symbol.upper()
             try:
                 await self._diff_one(symbol, local, rows_by_symbol.get(symbol, []), summary)
             except Exception as exc:  # noqa: BLE001 — deliberate catch-all
@@ -967,6 +992,7 @@ class Reconciler:
                     "reconcile_diff_error",
                     status="fail",
                     symbol=symbol,
+                    strategy=local.strategy_id,
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 await self._flag_manual_intervention(
@@ -977,7 +1003,7 @@ class Reconciler:
 
         # Symbols at broker we don't track at all.
         for symbol, rows in rows_by_symbol.items():
-            if symbol in local_by_symbol:
+            if symbol in local_symbols:
                 continue
             # Newly discovered position — treat as MANUAL_INTERVENTION rather
             # than guess at state. Spec §10: "do NOT auto-correct."
