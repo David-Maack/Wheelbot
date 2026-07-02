@@ -803,6 +803,30 @@ async def test_runbook_view_requires_auth(app_client):
 
 
 @pytest.mark.asyncio
+async def test_how_it_works_view_renders(app_client):
+    """GET /how-it-works returns 200 + docs/HOW_IT_WORKS.md rendered to HTML.
+    Same locking rationale as the runbook test."""
+    client, _deps, _broker = app_client
+    resp = await client.get("/how-it-works", headers=_auth_header("wheelbot", "hunter2"))
+    assert resp.status_code == 200
+    body = resp.text
+    # H1 from the doc — confirms file was found and rendered.
+    assert "How WheelBot Trades" in body
+    # Late-section H2 — confirms rendering didn't truncate.
+    assert "Human touchpoints" in body
+    # Went through the markdown renderer, not dumped as raw text.
+    assert "<h2>" in body
+
+
+@pytest.mark.asyncio
+async def test_how_it_works_view_requires_auth(app_client):
+    """Same authorize gate as the rest of the dashboard."""
+    client, _deps, _broker = app_client
+    resp = await client.get("/how-it-works")
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_parity_view_empty(app_client):
     """TICKET-022: /parity renders the empty state when no parity_log rows
     exist (which is the case until the cron has run at least once)."""

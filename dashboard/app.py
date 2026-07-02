@@ -424,6 +424,28 @@ def build_app(deps: DashboardDeps) -> FastAPI:
             {"rendered_html": rendered_html},
         )
 
+    @app.get("/how-it-works", response_class=HTMLResponse)
+    async def how_it_works_view(request: Request, _user: str = Depends(authorize)) -> Any:
+        """Render docs/HOW_IT_WORKS.md as HTML — the living overview of how the
+        bot trades and where the AI is involved.
+
+        Same pattern as /runbook: read from disk on each request (no caching)
+        so doc edits show without a restart. The maintenance rule (update the
+        doc in the same commit as any trading-behavior change) lives in
+        CLAUDE.md "Workflow conventions"."""
+        import mistune
+        from pathlib import Path as _Path
+        doc_path = _Path(__file__).resolve().parent.parent / "docs" / "HOW_IT_WORKS.md"
+        if not doc_path.exists():
+            raise HTTPException(404, f"doc not found at {doc_path}")
+        markdown = doc_path.read_text(encoding="utf-8")
+        rendered_html = mistune.html(markdown)
+        return TEMPLATES.TemplateResponse(
+            request,
+            "how_it_works.html",
+            {"rendered_html": rendered_html},
+        )
+
     @app.post("/risk/manual_stop")
     async def manual_stop(
         action: str = Form(...),

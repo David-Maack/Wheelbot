@@ -87,6 +87,10 @@ cron entries in LXC-local MDT (e.g. the daily macro-calendar refresh at
 
 - **One sprint / ticket at a time.** Propose scope before scaffolding, wait
   for explicit ack before commit/push.
+- **`docs/HOW_IT_WORKS.md` is the living overview** (rendered at
+  `/how-it-works` on the dashboard). Any commit that changes trading behavior
+  — a strategy, a gate, an exit rule, an AI touchpoint, a cron — must update
+  it in the same commit (same convention as the go-live runbook).
 - Every new module that mutates state writes a `core.checkpoint.log_checkpoint(...)`.
 - All Anthropic calls go through `intelligence.anthropic_client.AnthropicClient`.
 - All DB migrations go in `db/migrations/NNNN_description.sql`.
