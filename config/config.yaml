@@ -170,7 +170,7 @@ intelligence:
 # synthesized at tier 2 (require a same-day screener score to trade).
 # Cron: 0 7 * * 6 (Saturday 07:00 MDT) — python -m scripts.run_universe_refresh
 universe_refresh:
-  enabled: false                # master switch: the cron no-ops AND the overlay is ignored
+  enabled: true                 # armed 2026-07-02 — cron runs Saturdays; proposals still need human approval
   auto_apply: false             # true = apply proposals without human review (earn trust first)
   model: claude-opus-4-7
   max_output_tokens: 4096
