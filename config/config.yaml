@@ -98,9 +98,10 @@ intelligence:
   # a day (run_regime cron) the LLM reads the NUMERIC regime dossier + general
   # headlines and may flag "material risk the numbers can't see" — which halves
   # all entry sizes for the day. It can never increase risk; every failure
-  # fails open to no-veto. ~1 Haiku call/day. Ships OFF (new-knob convention);
-  # flip to true to arm.
-  llm_regime_veto_enabled: false
+  # fails open to no-veto. ~1 Haiku call/day. Armed 2026-07-01 per David
+  # (reduce-only, so the conservative-default convention is satisfied by
+  # construction — it can only ever make the bot more careful).
+  llm_regime_veto_enabled: true
   regime_veto_model: claude-haiku-4-5
   llm_provider: anthropic
   screener_model: claude-opus-4-7
