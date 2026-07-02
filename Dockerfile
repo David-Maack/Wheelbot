@@ -25,6 +25,10 @@ COPY db/ ./db/
 COPY mcp_server/ ./mcp_server/
 COPY scripts/ ./scripts/
 COPY config/ ./config/
+# The dashboard renders these live at /runbook and /how-it-works — without
+# this COPY both routes 404 in the container (they read from disk at request
+# time, resolved relative to the package root).
+COPY docs/ ./docs/
 
 RUN pip install --upgrade pip \
  && pip install -e ".[broker,dashboard,intelligence,data,mcp]"
