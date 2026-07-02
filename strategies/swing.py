@@ -72,12 +72,20 @@ _DAILY_CACHE: dict[tuple[str, date], tuple] = {}
 def _cached_daily(symbol: str, today: date) -> tuple:
     key = (symbol, today)
     if key not in _DAILY_CACHE:
-        _DAILY_CACHE.clear()  # drop yesterday's
-        _DAILY_CACHE[key] = (
+        frames = (
             load_daily_yf(symbol, period="2y"),
             load_daily_yf(symbol, period="2y", weekly=True),
             load_vix_daily(period="2y"),
         )
+        # Only cache a GOOD fetch (2026-07-01 audit MED-9a): safe_history returns
+        # an EMPTY frame on any yfinance hiccup, and caching that at the 09:30
+        # tick killed the signal for the whole session. On failure return the
+        # empty frames uncached so the next tick retries.
+        if any(len(f) == 0 for f in frames[:2]):
+            log_checkpoint("swing_daily_fetch_empty", status="fail", symbol=symbol)
+            return frames
+        _DAILY_CACHE.clear()  # drop yesterday's
+        _DAILY_CACHE[key] = frames
     return _DAILY_CACHE[key]
 
 
@@ -87,6 +95,15 @@ def fetch_swing_frames(symbol: str = "SPY", *, lookback_days: int = 10, feed: st
     end = datetime.now(UTC).replace(tzinfo=None)
     start = end - timedelta(days=lookback_days)
     bars5m = load_intraday_alpaca(symbol, start, end, feed=feed)
+    # Drop the in-progress 5-min bar (2026-07-01 audit MED-7): Alpaca returns
+    # the currently-forming bar, so the last row is almost always partial — an
+    # EMA/VWAP cross computed on it can un-cross by bar close, and the backtest
+    # only ever saw COMPLETED bars. A bar starting at t covers [t, t+5m); keep
+    # rows whose window has fully closed. Index is ET-naive (backtest/data.py).
+    if len(bars5m):
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+        bars5m = bars5m[bars5m.index <= now_et - timedelta(minutes=5)]
     daily, weekly, vix = _cached_daily(symbol, end.date())
     return bars5m, daily, weekly, vix
 
@@ -197,27 +214,38 @@ def prior_day_level(daily, today: date, direction: int) -> float | None:
 def build_swing_entry(
     symbol: str, contract: OptionContract, sig: Signal, prior_level: float,
     params: dict[str, Any], universe: dict[str, Any], today: date, strategy_id: str,
+    *, entry_ts: datetime | None = None, ctx_extra: dict[str, Any] | None = None,
 ) -> Proposal:
     """A deep-ITM long-option BUY_TO_OPEN with the SPY-level exit anchors stashed
-    on raw_request. Long call (direction +1) or long put (-1)."""
+    on raw_request. Long call (direction +1) or long put (-1).
+
+    `entry_ts` (UTC-naive) enables FRACTIONAL hold-day exits (audit MED-8: the
+    date-only fallback armed stops a full session earlier than the backtest).
+    `ctx_extra` lets special entries (e.g. the pre-FOMC tilt) override per-
+    position exit params like max_hold_days."""
     rr = float(params.get("reward_risk", 1.5))
     stop_px, target_px = swing_stop_target(sig.spot, sig.direction, prior_level, rr)
     side = "long" if sig.direction > 0 else "short"
     dte = (contract.expiration - today).days
     needs_screen, needs_human = _tier_flags(symbol, universe)
+    ctx: dict[str, Any] = {
+        "entry_spot": sig.spot, "stop_px": stop_px, "target_px": target_px,
+        "entry_date": today.isoformat(), "direction": sig.direction,
+        "entry_ts": (entry_ts or datetime.now(UTC).replace(tzinfo=None)).isoformat(),
+    }
+    if ctx_extra:
+        ctx.update(ctx_extra)
     return Proposal(
         symbol=symbol, contract=contract, order_type=OrderType.BUY_TO_OPEN,
         quantity=int(params.get("contracts", 1)),
         rationale=(f"swing[{symbol}] {side} {contract.strike} dte={dte} "
-                   f"stop={stop_px:.2f} tgt={target_px:.2f}"),
+                   f"stop={stop_px:.2f} tgt={target_px:.2f}"
+                   + (" [fomc_tilt]" if (ctx_extra or {}).get("fomc_tilt") else "")),
         strategy_id=strategy_id, requires_screen=needs_screen, requires_human=needs_human,
         # Long calls news-checked as bullish; long puts have no bearish profile
         # yet, so rely on the macro-blackout gate (which fires on all proposals).
         news_check_profile="bullish_long" if sig.direction > 0 else None,
-        raw_request={"swing": {
-            "entry_spot": sig.spot, "stop_px": stop_px, "target_px": target_px,
-            "entry_date": today.isoformat(), "direction": sig.direction,
-        }},
+        raw_request={"swing": ctx},
     )
 
 
@@ -231,16 +259,63 @@ def swing_exit_from_order(
     if stop_px is None or target_px is None or entry_date is None:
         return False, None
     direction = int(ctx.get("direction", 1 if entry_order.option_type == OptionType.CALL else -1))
-    hold_days = float((now.date() - date.fromisoformat(entry_date)).days)
+    # FRACTIONAL hold like the backtest (audit MED-8) — the date-only fallback
+    # (kept for pre-fix orders) armed the stop a full session early.
+    entry_ts = ctx.get("entry_ts")
+    if entry_ts:
+        hold_days = (now - datetime.fromisoformat(entry_ts)).total_seconds() / 86400.0
+    else:
+        hold_days = float((now.date() - date.fromisoformat(entry_date)).days)
+    # Per-position ctx overrides (the pre-FOMC tilt sets max_hold_days=1).
     return swing_exit_decision(
         direction, current_spot, float(stop_px), float(target_px), hold_days,
-        min_hold_days=float(params.get("min_hold_days", 1)),
-        max_hold_days=float(params.get("max_hold_days", 7)),
+        min_hold_days=float(ctx.get("min_hold_days", params.get("min_hold_days", 1))),
+        max_hold_days=float(ctx.get("max_hold_days", params.get("max_hold_days", 7))),
     )
 
 
 def _spot_from_quote(q) -> float | None:
     return q.mid if getattr(q, "mid", None) else getattr(q, "last", None)
+
+
+async def _fomc_tilt_signal(
+    broker, repos, params: dict[str, Any], symbol: str, today: date, strategy_id: str,
+    account_id: str = "primary",
+) -> Signal | None:
+    """AI audit item #1: pre-FOMC drift tilt. Long bias the ~24h before an FOMC
+    decision (drift documented through 2024; in-market only ~5% of days). Fires
+    only when: enabled, an FOMC event is TOMORROW, and we haven't already opened
+    a swing entry today (one tilt per event). Gated by fomc_tilt_enabled (ships
+    false). Returns a synthetic long Signal; the caller stamps max_hold_days=1
+    so the position time-exits on decision day. Fails closed (None) on any error."""
+    if not bool(params.get("fomc_tilt_enabled", False)):
+        return None
+    try:
+        tomorrow = today + timedelta(days=1)
+        events = await repos.macro_events.between(tomorrow, tomorrow)
+        if not any(str(e.event_type).upper() == "FOMC" for e in events):
+            return None
+        # One entry per event: any swing BUY_TO_OPEN placed today means we've
+        # already tilted (or the technical signal already traded — either way,
+        # don't stack).
+        recent = await repos.orders.list_recent(account_id, limit=50)
+        for o in recent:
+            if (
+                o.strategy_id == strategy_id
+                and o.order_type == OrderType.BUY_TO_OPEN
+                and o.placed_at is not None
+                and o.placed_at.date() == today
+            ):
+                return None
+        spot = _spot_from_quote(await broker.get_quote(symbol))
+        if spot is None:
+            return None
+        log_checkpoint("swing_fomc_tilt_signal", status="ok", symbol=symbol,
+                       event_date=str(tomorrow), spot=round(float(spot), 2))
+        return Signal(ts=None, direction=1, spot=float(spot))
+    except Exception as exc:  # noqa: BLE001 — experiment: never break the pass
+        log_checkpoint("swing_fomc_tilt_fail", status="fail", error=str(exc))
+        return None
 
 
 async def propose_all_swings(
@@ -274,7 +349,23 @@ async def propose_all_swings(
         log_checkpoint("swing_fetch_fail", status="fail", strategy=strategy.id, error=str(exc))
         return []
 
-    sig = evaluate_swing_signal(bars5m, daily, weekly=weekly)
+    try:
+        sig = evaluate_swing_signal(bars5m, daily, weekly=weekly)
+    except Exception as exc:  # audit MED-9b: a data-shape edge (e.g. NaN from a
+        # lagged daily frame) must degrade to "no signal", not abort the pass.
+        log_checkpoint("swing_eval_fail", status="fail", strategy=strategy.id, error=str(exc))
+        return []
+
+    ctx_extra: dict[str, Any] | None = None
+    if sig is None:
+        # AI audit item #1 (pre-FOMC drift, evidence through 2024, Sharpe ~0.6
+        # while in-market ~5% of the time): with no technical signal, if an FOMC
+        # decision lands TOMORROW, take a small long tilt and time-exit after
+        # ~24h (ctx max_hold_days=1 → out on decision day before drift decays).
+        # Normal stop/target still apply; one entry per event (order-log guard).
+        sig = await _fomc_tilt_signal(broker, repos, p, symbol, today, strategy.id, account_id)
+        if sig is not None:
+            ctx_extra = {"fomc_tilt": True, "min_hold_days": 0.0, "max_hold_days": 1.0}
     if sig is None:
         log_checkpoint("swing_eval", status="ok", strategy=strategy.id, symbol=symbol,
                        signal=0, bars5m=len(bars5m), daily=len(daily))
@@ -288,7 +379,7 @@ async def propose_all_swings(
         return []
 
     proposal = build_swing_entry(symbol, contract, sig, level, p, universe or {"tickers": []},
-                                 today, strategy.id)
+                                 today, strategy.id, ctx_extra=ctx_extra)
     log_checkpoint(
         "swing_signal_fired", status="ok", strategy=strategy.id, symbol=symbol,
         direction=sig.direction, spot=round(sig.spot, 2), strike=contract.strike,

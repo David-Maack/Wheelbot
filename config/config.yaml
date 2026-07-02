@@ -103,6 +103,11 @@ intelligence:
   # construction — it can only ever make the bot more careful).
   llm_regime_veto_enabled: true
   regime_veto_model: claude-haiku-4-5
+  # AI audit item #5: adversarial bull/bear second read of the screener's top-3
+  # (one extra Haiku call/day, adjusts scores ±15, annotates rationales; every
+  # failure fails open to the single-pass scores). Ships OFF; flip to arm.
+  adversarial_screener_enabled: false
+  adversarial_model: claude-haiku-4-5
   llm_provider: anthropic
   screener_model: claude-opus-4-7
   news_check_model: claude-haiku-4-5
@@ -581,4 +586,11 @@ strategies:
       reward_risk: 1.5
       min_hold_days: 1
       max_hold_days: 7
+      # AI audit item #1: pre-FOMC drift tilt — when NO technical signal fires
+      # and an FOMC decision is TOMORROW, take a small long (1 contract, normal
+      # stop, max_hold_days=1 → time-exit on decision day). Drift documented
+      # through 2024 (Sharpe ~0.6, in-market ~5% of days) but regime-dependent;
+      # ships OFF (it ADDS risk, unlike the veto) — arm after reviewing, and
+      # judge it over 8-10 meetings before trusting. Next FOMC: 2026-07-28.
+      fomc_tilt_enabled: false
       auto_disable_drawdown_usd: -300

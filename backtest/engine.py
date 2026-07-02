@@ -113,7 +113,11 @@ def asof_daily_direction(intraday_index: pd.DatetimeIndex, daily_dir: pd.Series)
     """
     prior = daily_dir.shift(1).fillna(0)
     dates = pd.to_datetime(intraday_index).normalize()
-    mapped = prior.reindex(dates.unique())
+    # fillna AFTER the reindex too: an intraday date missing from the daily
+    # frame (Yahoo lag at the open) reindexes to NaN, which used to flow through
+    # to int(...) as ValueError and abort the whole proposal pass (2026-07-01
+    # audit MED-9b). Unknown day → neutral, same as the pre-history case.
+    mapped = prior.reindex(dates.unique()).fillna(0)
     lookup = mapped.to_dict()
     return pd.Series([lookup.get(d, 0) for d in dates], index=intraday_index)
 

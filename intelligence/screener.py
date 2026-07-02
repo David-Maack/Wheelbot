@@ -157,6 +157,72 @@ def _payload_from(snapshots: list[TickerSnapshot]) -> dict[str, Any]:
     }
 
 
+ADVERSARIAL_SYSTEM_PROMPT = """You are the risk review desk for an options
+screener. For EACH candidate below, argue the strongest BULL case, then the
+strongest BEAR case, then give a conviction adjustment between -15 and +15
+(negative = the bear case dominates). Be adversarial with the given score —
+your job is to catch single-pass overconfidence, not to agree.
+
+Return ONLY JSON: {"reviews": [{"symbol": "T", "bull_case": "<=120 chars",
+"bear_case": "<=120 chars", "adjust": -15..15}]}"""
+
+
+def _apply_adversarial(parsed: dict[str, Any], reviews: Any) -> dict[str, Any]:
+    """Apply clamped score adjustments + annotate rationales. Pure, fail-open:
+    malformed reviews leave the original parsed untouched."""
+    if not isinstance(reviews, list):
+        return parsed
+    by_symbol = {}
+    for r in reviews:
+        if isinstance(r, dict) and r.get("symbol"):
+            by_symbol[str(r["symbol"]).upper()] = r
+    for item in parsed.get("candidates") or []:
+        if not isinstance(item, dict):
+            continue
+        r = by_symbol.get(str(item.get("symbol", "")).upper())
+        if r is None:
+            continue
+        try:
+            adjust = max(-15.0, min(15.0, float(r.get("adjust", 0))))
+        except (TypeError, ValueError):
+            continue
+        if item.get("score") is not None:
+            item["score"] = max(0.0, min(100.0, float(item["score"]) + adjust))
+        bear = str(r.get("bear_case") or "")[:120]
+        if bear:
+            item["rationale"] = f"{item.get('rationale') or ''} | adv({adjust:+.0f}): {bear}"[:240]
+    return parsed
+
+
+async def _adversarial_pass(
+    anthropic: AnthropicClient, intel: dict[str, Any], parsed: dict[str, Any], run_date: date,
+) -> dict[str, Any]:
+    """AI audit item #5 (the one TradingAgents component worth stealing): a
+    bull/bear adversarial second read of the screener's TOP-3, adjusting scores
+    ±15. One extra cheap call; every failure fails open to the original scores."""
+    try:
+        cands = [c for c in (parsed.get("candidates") or [])
+                 if isinstance(c, dict) and c.get("score") is not None]
+        top = sorted(cands, key=lambda c: float(c["score"]), reverse=True)[:3]
+        if not top:
+            return parsed
+        result = await anthropic.call(
+            decision_type=LlmDecisionType.SCREEN,
+            model=str(intel.get("adversarial_model", "claude-haiku-4-5")),
+            system=ADVERSARIAL_SYSTEM_PROMPT,
+            user_payload={"candidates": [
+                {"symbol": c.get("symbol"), "score": c.get("score"),
+                 "rationale": c.get("rationale")} for c in top
+            ]},
+            max_output_tokens=600,
+            context={"run_date": str(run_date), "adversarial": True},
+        )
+        return _apply_adversarial(parsed, (result.get("parsed") or {}).get("reviews"))
+    except Exception as exc:  # noqa: BLE001 — advisory layer: never break the screen
+        log_checkpoint("screener_adversarial_fail", status="fail", error=str(exc))
+        return parsed
+
+
 async def _persist_candidates(
     repos: Repos,
     snapshots: list[TickerSnapshot],
@@ -237,7 +303,12 @@ async def run_screener(
             log_checkpoint("screener_budget_skip", status="skip", error=str(exc))
             return {"skipped": "budget_exceeded"}
 
-        n_written = await _persist_candidates(repos, snapshots, result["parsed"], run_date)
+        parsed = result["parsed"]
+        # AI audit item #5: adversarial bull/bear second pass on the top-3
+        # (gated; fails open to the single-pass scores).
+        if bool(intel.get("adversarial_screener_enabled", False)):
+            parsed = await _adversarial_pass(anthropic, intel, parsed, run_date)
+        n_written = await _persist_candidates(repos, snapshots, parsed, run_date)
         ctx["candidates_written"] = n_written
         ctx["cost_usd"] = round(result["cost_usd"], 4)
         # A successful API call that yields ZERO candidates is a silent failure:
