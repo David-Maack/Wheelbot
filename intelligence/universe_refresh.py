@@ -39,6 +39,7 @@ from core.models import LlmDecisionType, WatchlistEntry, WatchlistRun, Watchlist
 from core.notify import notify
 from core.strategies import load_strategies, universe_for_strategy
 from core.watchlists import effective_universe
+from data.discovery import discover_candidates, has_tradable_chain
 from data.earnings import next_earnings
 from data.ivr import IVRProvider
 from data.yf_helpers import safe_history
@@ -55,10 +56,18 @@ capital caps, IV-rank gates) and its CURRENT watchlist. For each candidate
 symbol you receive: price, median daily volume, IV rank / percentile, days to
 next earnings, and whether it passed the quant ADD gate.
 
-Propose the best watchlist for each strategy. Judge fit against the strategy's
-spec: premium sellers want rich-but-not-broken IV and prices whose collateral
-fits the capital caps; the low-price strategies need cheap underlyings; PMCC
-needs names with liquid, affordable LEAPs; calendars want LOW IV rank.
+Propose the best watchlist for each strategy. Your core job is MATCHING
+candidates to strategy profiles: rich-but-not-broken IV and collateral that
+fits the capital caps for premium sellers; cheap underlyings for the low-price
+strategies; liquid, affordable LEAPs for PMCC; range-bound liquid names for
+iron condors; LOW IV rank for calendars. Think "which strategy, if any, is
+this symbol FOR?" — a great put-spread name is usually a terrible calendar
+name, and vice versa.
+
+Candidates with newly_discovered=true came from a market-wide most-actives
+scan, not the curated universe. Their ivr is often null (no IV history yet) —
+judge them on price, volume, and strategy fit, and be selective: a discovered
+add must clearly beat an incumbent, not merely match it.
 
 Rules:
 - Respect the churn limits in `limits` — a watchlist should evolve, not churn.
@@ -98,6 +107,10 @@ class CandidateSnapshot:
     add_eligible: bool = False
     ineligible_reason: str | None = None
     member_of: list[str] = field(default_factory=list)
+    # True = came from the market-wide most-actives scan, not universe.yaml
+    # or the manual candidate_pool. These get an extra option-chain
+    # tradability gate and a per-run cap.
+    newly_discovered: bool = False
 
 
 async def _fetch_candidate(
@@ -346,6 +359,18 @@ async def run_universe_refresh(
         pool = {t.symbol.upper() for t in yaml_universe.get("tickers", []) if t.tier in (1, 2)}
         pool |= {str(s).upper() for s in (ur.get("candidate_pool") or [])}
         pool -= banned | tier3
+
+        # Tier 0 — market discovery: fold in the top most-active US stocks so
+        # the LLM can match fresh names to strategy profiles, not just shuffle
+        # the hand-curated set. Fail-open: a broken screener shrinks the pool
+        # back to hand-curated, never blocks the refresh.
+        disc = ur.get("discovery", {}) or {}
+        discovered_new: set[str] = set()
+        if bool(disc.get("enabled", False)):
+            found = {s for s in await discover_candidates(config)}
+            discovered_new = found - pool - banned - tier3
+            pool |= discovered_new
+            ctx["n_discovered_new"] = len(discovered_new)
         ctx["n_candidates"] = len(pool)
 
         snapshots = await asyncio.gather(*(_fetch_candidate(broker, ivr, s) for s in sorted(pool)))
@@ -355,7 +380,37 @@ async def run_universe_refresh(
                 member_of.setdefault(sym, []).append(sid)
         for snap in snapshots:
             snap.member_of = sorted(member_of.get(snap.symbol, []))
+            snap.newly_discovered = snap.symbol in discovered_new
             _apply_quant_gate(snap, ur)
+
+        # Discovered names face two extra hurdles: an options market must
+        # actually exist (one chain fetch each — per-contract liquidity is
+        # still enforced at entry time), and only the top max_new_candidates
+        # by dollar volume go to the LLM. Everything that fails is dropped
+        # from the payload entirely — no point spending Opus tokens on names
+        # that can never be added.
+        if discovered_new:
+            spread_max = float(disc.get("chain_spread_max_pct", 15.0))
+            max_new = int(disc.get("max_new_candidates", 25))
+            new_snaps = [s for s in snapshots if s.newly_discovered and s.add_eligible]
+            tradable = await asyncio.gather(
+                *(has_tradable_chain(broker, s.symbol, spread_max) for s in new_snaps)
+            )
+            for snap, ok in zip(new_snaps, tradable, strict=True):
+                if not ok:
+                    snap.add_eligible = False
+                    snap.ineligible_reason = "no tradable option chain"
+            survivors = sorted(
+                (s for s in new_snaps if s.add_eligible),
+                key=lambda s: (s.price or 0.0) * (s.median_volume or 0.0),
+                reverse=True,
+            )
+            for snap in survivors[max_new:]:
+                snap.add_eligible = False
+                snap.ineligible_reason = f"discovery cap {max_new}"
+            snapshots = [s for s in snapshots if not s.newly_discovered or s.add_eligible]
+            ctx["n_discovered_kept"] = sum(1 for s in snapshots if s.newly_discovered)
+
         eligible_adds = {s.symbol for s in snapshots if s.add_eligible}
         ctx["n_add_eligible"] = len(eligible_adds)
 
@@ -380,6 +435,7 @@ async def run_universe_refresh(
                     "add_eligible": s.add_eligible,
                     "ineligible_reason": s.ineligible_reason,
                     "currently_on": s.member_of,
+                    "newly_discovered": s.newly_discovered,
                 }
                 for s in snapshots
             ],

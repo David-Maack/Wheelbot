@@ -189,6 +189,19 @@ universe_refresh:
   # Extra symbols to consider beyond universe.yaml (parked names are always
   # considered). Add liquid optionable tickers here as the account grows.
   candidate_pool: []
+  # Tier 0 — market discovery (armed 2026-07-02 per David): fold the top-N
+  # most-active US stocks (Alpaca screener) into the candidate pool each run
+  # so the LLM can match fresh names to strategy profiles. Discovered names
+  # face extra hurdles beyond the quant gate: an option chain with at least
+  # one quote tighter than chain_spread_max_pct must exist, only the top
+  # max_new_candidates by dollar volume reach the LLM, and (like every add)
+  # they enter at tier 2 + need your approval. Fail-open: screener errors
+  # shrink the pool back to hand-curated.
+  discovery:
+    enabled: true
+    top_n: 100
+    max_new_candidates: 25
+    chain_spread_max_pct: 15
   # Operator pins: never droppable, per strategy. Open-position symbols are
   # always protected regardless of this list.
   pinned: {}

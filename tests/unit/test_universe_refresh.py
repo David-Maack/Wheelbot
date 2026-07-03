@@ -411,3 +411,127 @@ async def test_run_refresh_parse_failure_marks_run_failed(db_repos, config_dir, 
     assert str(run.status) == "failed"
     # Fail-open: nothing applied, membership untouched.
     assert await db_repos.watchlists.applied_membership() == {}
+
+
+# ------------------------------------------------------------- discovery ----
+
+def _discovery_config(**disc_over):
+    disc = {"enabled": True, "top_n": 10, "max_new_candidates": 2, "chain_spread_max_pct": 15.0}
+    disc.update(disc_over)
+    return {**CONFIG, "universe_refresh": {**CONFIG["universe_refresh"], "discovery": disc}}
+
+
+def _keep_all_response():
+    return {
+        "decision": "refresh_complete",
+        "summary": "no changes",
+        "watchlists": [{
+            "strategy_id": "strat_a",
+            "symbols": [
+                {"symbol": "AAA", "action": "keep", "score": 70},
+                {"symbol": "BBB", "action": "keep", "score": 60},
+                {"symbol": "DDD", "action": "keep", "score": 60},
+            ],
+        }],
+    }
+
+
+class _TradableChainBroker(_StubBroker):
+    """Every symbol has a tight-quoted option chain."""
+
+    async def get_option_chain(self, underlying, expiration=None, option_type=None):
+        from datetime import date as _date
+
+        from core.models import OptionContract, OptionType
+
+        return [OptionContract(
+            underlying=underlying, occ_symbol=f"{underlying}260717P00010000",
+            strike=10.0, expiration=_date(2026, 7, 17), option_type=OptionType.PUT,
+            bid=1.00, ask=1.05,
+        )]
+
+
+class _NoChainBroker(_StubBroker):
+    async def get_option_chain(self, underlying, expiration=None, option_type=None):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_discovery_feeds_capped_new_names_to_payload(
+    db_repos, config_dir, patched_data, monkeypatch
+):
+    async def fake_discover(config, **kw):
+        return ["NEW1", "NEW2", "NEW3", "GME", "PARKED3", "AAA"]
+
+    monkeypatch.setattr("intelligence.universe_refresh.discover_candidates", fake_discover)
+    stub = _StubAnthropic(_keep_all_response())
+    result = await run_universe_refresh(
+        broker=_TradableChainBroker(), repos=db_repos, ivr=_StubIvr(),
+        anthropic=stub, config=_discovery_config(), run_date=date(2026, 7, 4),
+    )
+    assert result["status"] in ("no_changes", "proposed")
+    sent = stub.calls[0]["user_payload"]
+    by_symbol = {c["symbol"]: c for c in sent["candidates"]}
+    # Banned (GME), tier-3 (PARKED3) never entered; AAA was already in the pool
+    # so it is NOT flagged as discovered.
+    assert "GME" not in by_symbol and "PARKED3" not in by_symbol
+    assert by_symbol["AAA"]["newly_discovered"] is False
+    # max_new_candidates=2 → exactly two discovered names survive, flagged.
+    discovered = [s for s, c in by_symbol.items() if c["newly_discovered"]]
+    assert len(discovered) == 2
+    assert set(discovered) <= {"NEW1", "NEW2", "NEW3"}
+    assert all(by_symbol[s]["add_eligible"] for s in discovered)
+
+
+@pytest.mark.asyncio
+async def test_discovery_requires_tradable_chain(db_repos, config_dir, patched_data, monkeypatch):
+    async def fake_discover(config, **kw):
+        return ["NEW1"]
+
+    monkeypatch.setattr("intelligence.universe_refresh.discover_candidates", fake_discover)
+    stub = _StubAnthropic(_keep_all_response())
+    await run_universe_refresh(
+        broker=_NoChainBroker(), repos=db_repos, ivr=_StubIvr(),
+        anthropic=stub, config=_discovery_config(), run_date=date(2026, 7, 4),
+    )
+    sent = stub.calls[0]["user_payload"]
+    # No options market → dropped from the payload entirely.
+    assert "NEW1" not in {c["symbol"] for c in sent["candidates"]}
+
+
+@pytest.mark.asyncio
+async def test_discovery_failure_falls_back_to_curated_pool(
+    db_repos, config_dir, patched_data, monkeypatch
+):
+    async def boom(config, **kw):
+        return []  # discover_candidates itself fails open to []
+
+    monkeypatch.setattr("intelligence.universe_refresh.discover_candidates", boom)
+    stub = _StubAnthropic(_keep_all_response())
+    result = await run_universe_refresh(
+        broker=_TradableChainBroker(), repos=db_repos, ivr=_StubIvr(),
+        anthropic=stub, config=_discovery_config(), run_date=date(2026, 7, 4),
+    )
+    assert result["status"] in ("no_changes", "proposed")
+    sent = stub.calls[0]["user_payload"]
+    # The curated pool still went through.
+    assert {"AAA", "BBB", "CCC", "DDD"} <= {c["symbol"] for c in sent["candidates"]}
+
+
+@pytest.mark.asyncio
+async def test_discovery_disabled_by_default(db_repos, config_dir, patched_data, monkeypatch):
+    called = False
+
+    async def fake_discover(config, **kw):
+        nonlocal called
+        called = True
+        return ["NEW1"]
+
+    monkeypatch.setattr("intelligence.universe_refresh.discover_candidates", fake_discover)
+    stub = _StubAnthropic(_keep_all_response())
+    # CONFIG has no discovery block → tier 0 must not run at all.
+    await run_universe_refresh(
+        broker=_TradableChainBroker(), repos=db_repos, ivr=_StubIvr(),
+        anthropic=stub, config=CONFIG, run_date=date(2026, 7, 4),
+    )
+    assert called is False
