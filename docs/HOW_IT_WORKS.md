@@ -63,7 +63,7 @@ strategy comes from `universe.yaml` plus the weekly watchlist overlay.
 | `narrow_put_spread` | Same, $2 wide, ≤$250 risk | Low-price names ($15–40) | Same as put_spread |
 | `bear_call_spread` | 30–45 DTE bear call spreads | Weak tape (regime-gated) | 35% profit, DTE-21, 1.5× stop |
 | `iron_condor` | Both wings, Δ0.16 shorts, $5 wings | Range-bound, credit ≥ 30% of width | 25% profit, DTE-21 |
-| `pmcc` | Deep-ITM LEAP + short OTM calls | Cheap names with liquid LEAPs (≤$1,500) | Short: 50%/1-DTE; long rolls at 30 DTE |
+| `pmcc` | Deep-ITM LEAP + short OTM calls | Cheap names with liquid LEAPs (≤$1,500) | Short: 50%/1-DTE; long rolls at 60 DTE or Δ < 0.70 (below that it stops acting like stock) |
 | `calendar` | Same-strike front/back calls, net debit | **LOW** IV (IVR ≤ 35 — inverted gate) | 25% of debit, force-close front ≤ 2 DTE |
 | `spy_swing_opt` | Directional deep-ITM SPY calls/puts (Δ0.90, ~60 DTE) | MTF VWAP/EMA9 signal + 200-SMA gate | Prior-day-level stop, 1.5R target, 7-day time stop |
 

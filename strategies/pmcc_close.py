@@ -8,12 +8,23 @@ Two close paths:
     Builds a BUY_TO_CLOSE on the short. The reconciler returns the position
     to PMCC_LONG_OPEN; the cycle continues (the long persists).
 
-  PMCC_LONG_OPEN → long roll. Trigger:
-      long DTE < long_roll_dte
-    Builds a SELL_TO_CLOSE on the long with trigger_reason="pmcc_roll_dte".
-    The reconciler closes the cycle as PMCC_LONG_ROLLED; the next IDLE tick
-    opens a fresh long (new cycle). v1 rolls on DTE only — delta-roll is a
-    future enhancement.
+  PMCC_LONG_OPEN → long roll. Triggers (either fires):
+      time:  long DTE < long_roll_dte
+      delta: current long delta < long_roll_delta (param absent/0 = off)
+    Builds a SELL_TO_CLOSE on the long with trigger_reason="pmcc_roll_dte" /
+    "pmcc_roll_delta" (the reconciler matches the "pmcc_roll" prefix and
+    closes the cycle as PMCC_LONG_ROLLED); the next IDLE tick opens a fresh
+    long (new cycle).
+
+    The delta trigger is the research-backed roll rule: below ~0.70 delta the
+    long loses its stock-substitute behavior and theta decay accelerates.
+    Delta is computed fresh from broker quotes + BS (same recipe as the
+    TICKET-005 wheel delta stop — see wheel_close._current_short_delta), so
+    the DTE trigger is the quote-outage backstop: if quotes stay dead the
+    roll still fires on time. Delta is only checked from PMCC_LONG_OPEN —
+    rolling the long out from under an open short (PMCC_BOTH_OPEN) would
+    leave the short naked, so a decayed long waits for the short to close
+    first.
 
 These proposals route through the standard single-leg path. Closes bypass
 the entry-window gate and (for the short BUY_TO_CLOSE) the PMCC pending-state
@@ -28,8 +39,9 @@ from typing import Any
 
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
-from core.models import OptionContract, OptionType, OrderType, PositionState
+from core.models import OptionContract, OptionType, Order, OrderType, PositionState
 from core.strategies import StrategyDefinition
+from data.greeks import fill_greeks
 from db.repo import Repos
 from strategies.pmcc import _build_proposal, latest_filled_order
 from strategies.wheel import Proposal
@@ -63,6 +75,57 @@ def _mid(c: OptionContract) -> float | None:
         return None
     m = (c.bid + c.ask) / 2
     return m if m > 0 else None
+
+
+async def _current_long_delta(
+    broker: Broker, symbol: str, long_order: Order, today: date,
+) -> float | None:
+    """Current delta of the long call via fresh quotes + BS.
+
+    Same recipe (and same r=0.045 default) as wheel_close._current_short_delta
+    so PMCC delta thresholds mean the same thing as wheel ones. Returns None
+    when any input is unavailable — the caller logs and skips the trigger for
+    this tick; the DTE trigger remains the backstop.
+    """
+    if (
+        long_order.strike is None
+        or long_order.expiration is None
+        or long_order.contract_symbol is None
+    ):
+        return None
+    try:
+        underlying = await broker.get_quote(symbol)
+    except Exception:  # noqa: BLE001
+        return None
+    spot = (
+        underlying.mid
+        if underlying.mid is not None
+        else (underlying.last or underlying.bid or underlying.ask)
+    )
+    if spot is None:
+        return None
+    try:
+        opt = await broker.get_quote(long_order.contract_symbol)
+    except Exception:  # noqa: BLE001
+        return None
+    contract_mid = (
+        opt.mid
+        if opt.mid is not None
+        else (opt.last or (((opt.bid or 0) + (opt.ask or 0)) / 2 if opt.bid and opt.ask else None))
+    )
+    if contract_mid is None or contract_mid <= 0:
+        return None
+    greeks = fill_greeks(
+        underlying_price=float(spot),
+        strike=float(long_order.strike),
+        expiration=long_order.expiration,
+        option_type=long_order.option_type or OptionType.CALL,
+        market_price=float(contract_mid),
+        today=today,
+    )
+    if greeks is None:
+        return None
+    return abs(greeks.delta)
 
 
 async def propose_close_for_symbol(
@@ -128,21 +191,48 @@ async def propose_close_for_symbol(
         if long_order is None or long_order.expiration is None:
             return None
         long_dte = (long_order.expiration - today).days
-        if long_dte >= int(params.get("long_roll_dte", 30)):
+        roll_dte = int(params.get("long_roll_dte", 30))
+        dte_hit = long_dte < roll_dte
+
+        # Delta roll — checked only when the cheap DTE trigger hasn't already
+        # fired (avoids two quote round-trips per tick on healthy positions).
+        delta_hit = False
+        current_delta: float | None = None
+        threshold_raw = params.get("long_roll_delta")
+        if not dte_hit and threshold_raw is not None and float(threshold_raw) > 0:
+            current_delta = await _current_long_delta(broker, symbol, long_order, today)
+            if current_delta is None:
+                log_checkpoint(
+                    "pmcc_long_delta_unavailable", status="skip",
+                    symbol=symbol, long_dte=long_dte,
+                )
+            elif current_delta < float(threshold_raw):
+                delta_hit = True
+
+        if not (dte_hit or delta_hit):
             return None
         long = await _requote(broker, long_order)
         if long is None:
             return None
-        rationale = (
-            f"pmcc_roll_long[{symbol}] dte={long_dte} < "
-            f"{int(params.get('long_roll_dte', 30))} — roll forward"
-        )
+        if dte_hit:
+            reason = "pmcc_roll_dte"
+            rationale = (
+                f"pmcc_roll_long[{symbol}] dte={long_dte} < {roll_dte} — roll forward"
+            )
+        else:
+            reason = "pmcc_roll_delta"
+            rationale = (
+                f"pmcc_roll_long[{symbol}] delta={current_delta:.2f} < "
+                f"{float(threshold_raw):.2f} (dte={long_dte}) — long lost "
+                f"stock-substitute behavior, roll"
+            )
         log_checkpoint(
-            "pmcc_long_roll_triggered", status="ok", symbol=symbol, long_dte=long_dte,
+            "pmcc_long_roll_triggered", status="ok", symbol=symbol,
+            trigger=reason, long_dte=long_dte, current_delta=current_delta,
         )
         return _build_proposal(
             symbol, long, OrderType.SELL_TO_CLOSE, universe, rationale,
-            trigger_reason="pmcc_roll_dte",
+            trigger_reason=reason,
         )
 
     return None

@@ -575,7 +575,16 @@ strategies:
       # risk gate (_rule_pmcc_short_above_breakeven).
       profit_close_pct_short: 50       # close short at 50% of premium captured
       short_time_close_dte: 1          # close/roll short when it reaches 1 DTE
-      long_roll_dte: 30                # roll the long forward when DTE < this
+      # Long-leg roll (2026-07-06 sprint): 30 DTE was far past the theta
+      # cliff — at 90-180 DTE entries, extrinsic decay accelerates well
+      # before 60 DTE, so by 30 the long has bled for weeks. Roll at 60 DTE,
+      # or earlier if delta decays below 0.70 (below that the long stops
+      # behaving like stock and the structure loses its covered-call
+      # economics). The 0.80 entry delta vs 0.70 roll floor is the churn
+      # buffer. Delta needs live quotes; on quote outage the DTE trigger is
+      # the backstop.
+      long_roll_dte: 60                # roll the long forward when DTE < this
+      long_roll_delta: 0.70            # ...or when current long delta < this (0/absent = off)
       max_capital_per_position_usd: 1500   # $12k book (2026-07-01, was 1000 on $5k): opens a 2nd affordable LEAP tier (was 10000) — a 0.80Δ LEAP on CCL/INTC/SOFI/BAC is $300-700
       # $5k sim: reject illiquid LEAPs. The 0.80Δ long is the most expensive leg,
       # so a bad fill hurts most — and a 2026-06-18 probe showed CCL/BAC/SOFI

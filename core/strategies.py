@@ -112,24 +112,39 @@ def _validate(strategies: list[StrategyDefinition]) -> None:
     evaluator's trigger must fire AT OR BEFORE the delta-stop threshold —
     otherwise the delta stop wins and the "let the roll handle it" branch is
     unreachable. We raise here rather than silently misordering the triggers.
+
+    PMCC long-roll (2026-07-06): `long_roll_delta` must sit strictly below
+    `long_delta_target` — a roll floor at or above the entry delta would roll
+    every fresh long on its first tick (perpetual churn, one losing
+    commission per tick loop).
     """
     for s in strategies:
-        if s.type != "wheel":
-            continue
-        action = str(s.params.get("delta_stop_action", "")).lower()
-        if action != "roll":
-            continue
-        threshold = s.params.get("delta_stop_threshold")
-        trigger = s.params.get("roll_trigger_delta")
-        if threshold is None or trigger is None:
-            continue  # the feature isn't fully configured for this strategy
-        if float(trigger) > float(threshold):
-            raise ValueError(
-                f"strategy {s.id!r}: roll_trigger_delta ({trigger}) must be "
-                f"<= delta_stop_threshold ({threshold}) when "
-                f"delta_stop_action='roll' — otherwise the delta stop would "
-                f"fire before the roll evaluator gets a chance to act."
-            )
+        if s.type == "wheel":
+            action = str(s.params.get("delta_stop_action", "")).lower()
+            if action != "roll":
+                continue
+            threshold = s.params.get("delta_stop_threshold")
+            trigger = s.params.get("roll_trigger_delta")
+            if threshold is None or trigger is None:
+                continue  # the feature isn't fully configured for this strategy
+            if float(trigger) > float(threshold):
+                raise ValueError(
+                    f"strategy {s.id!r}: roll_trigger_delta ({trigger}) must be "
+                    f"<= delta_stop_threshold ({threshold}) when "
+                    f"delta_stop_action='roll' — otherwise the delta stop would "
+                    f"fire before the roll evaluator gets a chance to act."
+                )
+        elif s.type == "pmcc":
+            roll_delta = s.params.get("long_roll_delta")
+            entry_delta = s.params.get("long_delta_target")
+            if roll_delta is None or float(roll_delta) <= 0 or entry_delta is None:
+                continue  # delta-roll off or entry target unset
+            if float(roll_delta) >= float(entry_delta):
+                raise ValueError(
+                    f"strategy {s.id!r}: long_roll_delta ({roll_delta}) must be "
+                    f"< long_delta_target ({entry_delta}) — otherwise every "
+                    f"fresh long rolls immediately."
+                )
 
 
 def universe_for_strategy(
