@@ -444,10 +444,15 @@ strategies:
       # produces the bulk of max-loss outcomes. tastytrade 200K+ trade
       # analysis + Option Alpha independent backtest agree.
       time_close_dte: 21
-      # Sprint 12 sub-sprint 2: stop-loss at 2× credit received. Caps the
-      # tail at ~60% of max loss on a $5-wide spread. Critical on small
-      # accounts where a single max-loss spread is 7-17% of the bankroll.
-      stop_loss_mult: 2.0
+      # 2026-07-06 backtest (scripts/backtest_spread_stops): the Sprint-12 2×
+      # stop was giving up more than half the strategy's expectancy — 58% of
+      # its stop-outs recovered by the DTE-21 close ($4.06 vs $9.62/trade
+      # over 1,136 paired trades; same verdict in the 5y bear-inclusive
+      # window). On a defined-risk spread the DTE-21 close already caps the
+      # tail, so the stop mostly converts recoverable drawdowns into realized
+      # losses. Loosened 2.0 → 3.0 (evidence-backed half-step, $8.09/trade);
+      # 0 = width-as-stop is the full step if 3.0 proves out live.
+      stop_loss_mult: 3.0
       # Sprint 12 sub-sprint 5: IVR soft filter — see monthly_wheel.
       # 2026-07-01 audit: 30 was a de-facto pause — the whole mega-cap universe
       # sits at IVR 13-25 in a calm bull, so the floor skipped ~every name ~every
@@ -480,7 +485,7 @@ strategies:
       bid_ask_spread_max_pct: 15       # $5k sim: cheaper names quote wider than mega-caps — reject the worst fills
       profit_close_pct: 50
       time_close_dte: 21
-      stop_loss_mult: 2.0
+      stop_loss_mult: 3.0              # 2026-07-06: loosened with put_spread — see the rationale there
       ivr_min: 20                      # 2026-07-01 audit: 30 was a de-facto pause (see put_spread)
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150

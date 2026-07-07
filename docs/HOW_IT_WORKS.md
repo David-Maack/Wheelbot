@@ -59,7 +59,7 @@ strategy comes from `universe.yaml` plus the weekly watchlist overlay.
 |---|---|---|---|
 | `monthly_wheel` | 30–45 DTE cash-secured puts → assignment → covered calls | Cheap, ownable names; IVR ≥ 20 | 50% profit, DTE-21, 2× stop, Δ0.55 stop→roll |
 | `weekly_wheel` | 7–14 DTE CSPs, tighter deltas | High-IV liquid weeklies | 50% profit, 2× stop, Δ0.55 stop→close |
-| `put_spread` | 30–45 DTE bull put spreads, $5 wide, ≤$500 risk | Mega-caps, IVR ≥ 20 | 50% profit, DTE-21, 2× stop |
+| `put_spread` | 30–45 DTE bull put spreads, $5 wide, ≤$500 risk | Mega-caps, IVR ≥ 20 | 50% profit, DTE-21, 3× stop (was 2× — a paired backtest showed 58% of 2× stop-outs recovered by DTE-21) |
 | `narrow_put_spread` | Same, $2 wide, ≤$250 risk | Low-price names ($15–40) | Same as put_spread |
 | `bear_call_spread` | 30–45 DTE bear call spreads | Weak tape (regime-gated) | 35% profit, DTE-21, 1.5× stop |
 | `iron_condor` | Both wings, Δ0.16 shorts, $5 wings | Range-bound, credit ≥ 30% of width | 25% profit, DTE-21 |
