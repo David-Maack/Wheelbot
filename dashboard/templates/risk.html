@@ -99,6 +99,46 @@
 </section>
 
 <section class="panel">
+  <h2>Expectancy status {% if not expectancy_enabled %}<small>(observe-only — floor not armed)</small>{% endif %}</h2>
+  {% if expectancy %}
+    <table class="grid">
+      <thead><tr><th>Strategy</th><th>State</th><th>Expectancy ($/cycle)</th><th>Sample</th><th>Floor</th><th>Paused at</th></tr></thead>
+      <tbody>
+      {% for sid, info in expectancy.items() %}
+        <tr class="row-expectancy-{{ info.state }}">
+          <td><code>{{ sid }}</code></td>
+          <td>
+            {% if info.state == "NEGATIVE_EXPECTANCY" %}
+              <span class="trigger trigger-winrate_paused">🔴 PAUSED</span>
+            {% else %}
+              <span class="trigger trigger-winrate_normal">🟢 NORMAL</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if info.expectancy is not none %}
+              {% if info.expectancy > 0 %}<span class="ok">${{ "%.2f"|format(info.expectancy) }}</span>
+              {% else %}<span class="bad">${{ "%.2f"|format(info.expectancy) }}</span>{% endif %}
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if info.action == "insufficient_data" %}
+              N/A ({{ info.sample_size }}/10)
+            {% else %}
+              {{ info.sample_size }}
+            {% endif %}
+          </td>
+          <td>{% if info.threshold is not none %}${{ "%.2f"|format(info.threshold) }}{% else %}—{% endif %}</td>
+          <td>{% if info.paused_at %}{{ info.paused_at }}{% else %}—{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No strategies loaded.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
   <h2>Regime</h2>
   {% if regime %}
     <dl class="kv">

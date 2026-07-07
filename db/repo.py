@@ -690,11 +690,17 @@ class StrategyRuntimeStateRepo(_Repo):
         reason: str,
         now: datetime | None = None,
         eligible_in_days: int = 14,
+        state: str = "LOW_WIN_RATE",
     ) -> None:
-        """TICKET-009: persist a LOW_WIN_RATE pause. Independent of drawdown
+        """TICKET-009: persist a pause. Independent of drawdown
         columns — if a row already exists (e.g. drawdown WARNING was set
         first), only the pause_* columns are touched. The disabled_* columns
         and drawdown_state column are NOT modified.
+
+        `state` is the pause_state literal: 'LOW_WIN_RATE' (win-rate floor,
+        TICKET-009) or 'NEGATIVE_EXPECTANCY' (expectancy floor, 2026-07-06).
+        The floors guard against overwriting each other's pause BEFORE
+        calling this — this method last-writer-wins on the pause_* columns.
 
         paused_reenable_eligible_at is advisory (cached `paused_at +
         eligible_in_days`) — the bot does NOT auto-clear when this passes.
@@ -707,13 +713,13 @@ class StrategyRuntimeStateRepo(_Repo):
             "INSERT INTO strategy_runtime_state "
             "(strategy_id, pause_state, paused_at, paused_reason, "
             " paused_reenable_eligible_at) "
-            "VALUES (?, 'LOW_WIN_RATE', ?, ?, ?) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(strategy_id) DO UPDATE SET "
-            "  pause_state = 'LOW_WIN_RATE', "
+            "  pause_state = excluded.pause_state, "
             "  paused_at = excluded.paused_at, "
             "  paused_reason = excluded.paused_reason, "
             "  paused_reenable_eligible_at = excluded.paused_reenable_eligible_at",
-            (strategy_id, now.isoformat(), reason, eligible_at.isoformat()),
+            (strategy_id, state, now.isoformat(), reason, eligible_at.isoformat()),
         )
         await c.commit()
 
@@ -744,13 +750,13 @@ class StrategyRuntimeStateRepo(_Repo):
         await c.commit()
 
     async def list_paused(self) -> list[dict]:
-        """TICKET-009: rows currently in LOW_WIN_RATE pause. Independent of
-        list_disabled (which only returns rows with an active disabled_until).
-        A strategy in BOTH drawdown DISABLED and LOW_WIN_RATE pause appears
-        in both lists — by design, so reenable_strategy.py --list surfaces
-        every active gate."""
+        """TICKET-009: rows currently paused (any pause_state literal —
+        LOW_WIN_RATE or NEGATIVE_EXPECTANCY). Independent of list_disabled
+        (which only returns rows with an active disabled_until). A strategy
+        in BOTH drawdown DISABLED and a pause appears in both lists — by
+        design, so reenable_strategy.py --list surfaces every active gate."""
         return await self._fetch_all(
-            "SELECT * FROM strategy_runtime_state WHERE pause_state = 'LOW_WIN_RATE'",
+            "SELECT * FROM strategy_runtime_state WHERE pause_state IS NOT NULL",
         )
 
     async def is_disabled(

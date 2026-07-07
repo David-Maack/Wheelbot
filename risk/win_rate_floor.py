@@ -195,6 +195,23 @@ async def check_and_apply(
 
     prior = await current_pause_state(repos, strategy.id)
 
+    # 2026-07-06: the expectancy floor shares the pause_state column. If a
+    # DIFFERENT gauge owns the pause, hold — entries are already suppressed
+    # (run_bot gates on ANY non-NULL pause_state); don't overwrite its reason.
+    if prior is WinRateState.NORMAL:
+        row = await repos.strategy_runtime.get(strategy.id) or {}
+        if row.get("pause_state"):
+            if target_pause:
+                log_checkpoint(
+                    "win_rate_pause_deferred_other_pause",
+                    status="skip",
+                    strategy=strategy.id,
+                    win_rate=rate,
+                    threshold=threshold,
+                    other_pause=row.get("pause_state"),
+                )
+            return WinRateResult(action="normal", win_rate=rate, sample_size=sample)
+
     if target_pause and prior is WinRateState.NORMAL:
         eligible_in = int(block.get("pause_duration_days", DEFAULT_PAUSE_DURATION_DAYS))
         reason = (

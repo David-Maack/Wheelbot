@@ -97,6 +97,7 @@ an open position.
 | Drawdown breaker | Strategy's 7-day realized P&L ≤ −$300 | Strategy disabled 30 days (auto-clears; manual reenable available) |
 | Drawdown WARNING | 7-day P&L ≤ −$150 | New spreads at half size |
 | Win-rate floor | < 60% over last 10+ cycles | Strategy paused, **manual** reenable only |
+| Expectancy floor | Mean $/cycle < $0 over last 10+ cycles (currently observe-only — `risk.expectancy_floor.enabled: false`; the `/risk` panel shows what it would do) | Strategy paused, **manual** reenable only — catches a strategy that wins often but loses big, which the win-rate floor can't see |
 | Regime veto (AI) | LLM flags headline risk the numbers can't see | All entry sizes halved for the day — reduce-only |
 | Earnings recheck | Earnings date moves inside an open position's window | Flag MANUAL_INTERVENTION + Discord |
 

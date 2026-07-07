@@ -289,12 +289,16 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         # TICKET-008 + TICKET-009: per-strategy drawdown + win-rate panels.
         from core.strategies import load_strategies
         from risk import auto_disable as _auto_disable
+        from risk import expectancy_floor as _expectancy_floor
         from risk import win_rate_floor as _win_rate_floor
         strategies = load_strategies(deps.config)
         drawdown = await _auto_disable.get_drawdown_overview(
             deps.repos, strategies, deps.config,
         )
         win_rate = await _win_rate_floor.get_win_rate_overview(
+            deps.repos, strategies, deps.config,
+        )
+        expectancy = await _expectancy_floor.get_expectancy_overview(
             deps.repos, strategies, deps.config,
         )
         return TEMPLATES.TemplateResponse(
@@ -309,6 +313,10 @@ def build_app(deps: DashboardDeps) -> FastAPI:
                 "stop_file": deps.config.get("risk", {}).get("stop_file_path"),
                 "drawdown": drawdown,
                 "win_rate": win_rate,
+                "expectancy": expectancy,
+                "expectancy_enabled": (
+                    (deps.config.get("risk") or {}).get("expectancy_floor") or {}
+                ).get("enabled", False),
             },
         )
 

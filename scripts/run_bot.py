@@ -84,7 +84,7 @@ from strategies.spreads import (
     propose_all as propose_all_spreads,
     propose_all_closes as propose_all_spread_closes,
 )
-from risk import auto_disable, win_rate_floor
+from risk import auto_disable, expectancy_floor, win_rate_floor
 from strategies.swing import propose_all_swing_closes, propose_all_swings
 from strategies.wheel import propose_all
 from strategies.wheel_close import propose_all_closes as propose_all_wheel_closes
@@ -330,17 +330,20 @@ async def _propose_and_route(
                 )
                 opens_allowed = False
             else:
-                # TICKET-009: independent pause gate. Both gates are
-                # independent; PAUSE suppresses entries while drawdown is
-                # NORMAL or WARNING. Notify fires once on the NORMAL→PAUSED
-                # transition inside win_rate_floor.check_and_apply (24h limit).
-                pause_state = await win_rate_floor.current_pause_state(repos, strategy.id)
-                if pause_state is win_rate_floor.WinRateState.PAUSED_LOW_WIN_RATE:
+                # TICKET-009 + expectancy floor (2026-07-06): independent
+                # pause gate. ANY non-NULL pause_state (LOW_WIN_RATE from the
+                # win-rate floor, NEGATIVE_EXPECTANCY from the expectancy
+                # floor) suppresses entries while drawdown is NORMAL or
+                # WARNING. Notify fires once on the NORMAL→PAUSED transition
+                # inside the owning floor's check_and_apply (24h limit).
+                runtime_row = await repos.strategy_runtime.get(strategy.id) or {}
+                pause_state = runtime_row.get("pause_state")
+                if pause_state:
                     log_checkpoint(
-                        "bot_strategy_runtime_paused_low_win_rate",
+                        "bot_strategy_runtime_paused",
                         status="skip",
                         strategy=strategy.id,
-                        state=pause_state.value,
+                        state=pause_state,
                     )
                     opens_allowed = False
                 else:
@@ -510,6 +513,18 @@ async def _propose_and_route(
         except Exception as exc:
             log_checkpoint(
                 "win_rate_floor_check_failed",
+                status="fail",
+                strategy=strategy.id,
+                error=str(exc),
+            )
+        # 2026-07-06: expectancy floor — same cadence, same defensive catch.
+        # Runs after the win-rate floor; whichever trips first owns the pause
+        # (neither overwrites the other).
+        try:
+            await expectancy_floor.check_and_apply(repos, strategy, config)
+        except Exception as exc:
+            log_checkpoint(
+                "expectancy_floor_check_failed",
                 status="fail",
                 strategy=strategy.id,
                 error=str(exc),

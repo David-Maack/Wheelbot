@@ -301,6 +301,26 @@ risk:
     min_win_rate_pct: 60
     pause_duration_days: 14
 
+  # 2026-07-06 sprint: expectancy floor — the win-rate floor's companion,
+  # catching what it structurally can't. Win rate is the wrong pause metric
+  # for asymmetric payoffs: at the time of writing put_spread was LOSING
+  # money at a passing 57% win rate ($54 avg wins vs -$150 stops) while
+  # profitable monthly_wheel (+$150) sat one cycle from a win-rate pause at
+  # 56%. This gauge pauses on mean $/cycle over the last N closed cycles
+  # instead. Same contract as win_rate_floor: pause = manual reenable only
+  # (scripts/reenable_strategy.py); shares the pause_state column
+  # ('NEGATIVE_EXPECTANCY'); first floor to trip owns the pause.
+  #
+  # Per-strategy override: `expectancy_floor_usd` in strategy params.
+  # Ships DISABLED (new-knob convention). Arm after eyeballing /risk's
+  # expectancy panel for a few days — with only ~10 cycles per strategy on
+  # the book, one refit changes the mean a lot.
+  expectancy_floor:
+    enabled: false
+    min_closed_cycles: 10
+    min_expectancy_usd: 0        # pause when mean $/cycle < this
+    pause_duration_days: 14
+
 notifications:
   # NullNotifier when false (events still logged via core/checkpoint).
   enabled: true
