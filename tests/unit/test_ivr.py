@@ -12,7 +12,7 @@ from typing import Iterable
 import pytest
 
 from core.models import IvHistory
-from data.ivr import IVRProvider
+from data.ivr import IVRProvider, effective_ivr_min
 
 
 class FakeIvHistoryRepo:
@@ -78,3 +78,74 @@ async def test_constant_series_yields_50_rank():
     provider = IVRProvider(FakeIvHistoryRepo([0.25] * 30), min_points=20)
     rank = await provider.iv_rank("F")
     assert rank == pytest.approx(50.0)
+
+
+# -- regime-aware floor relax (2026-07-06 sprint) ----------------------------
+
+
+def _relax_provider(**kwargs) -> IVRProvider:
+    return IVRProvider(
+        FakeIvHistoryRepo([]),
+        relax_vix_threshold=kwargs.pop("relax_vix_threshold", 25.0),
+        relax_floor_delta=kwargs.pop("relax_floor_delta", 10.0),
+    )
+
+
+def test_effective_min_calm_vix_keeps_base():
+    p = _relax_provider()
+    p.set_regime_vix(15.0)
+    assert p.effective_ivr_min({"ivr_min": 20}) == 20.0
+
+
+def test_effective_min_stressed_vix_relaxes():
+    p = _relax_provider()
+    p.set_regime_vix(28.0)
+    assert p.effective_ivr_min({"ivr_min": 20}) == 10.0
+
+
+def test_effective_min_clamps_at_zero():
+    p = _relax_provider()
+    p.set_regime_vix(40.0)
+    assert p.effective_ivr_min({"ivr_min": 5}) == 0.0
+
+
+def test_effective_min_unknown_vix_keeps_base():
+    p = _relax_provider()
+    p.set_regime_vix(None)
+    assert p.effective_ivr_min({"ivr_min": 20}) == 20.0
+
+
+def test_effective_min_feature_off_by_default():
+    """No relax config at construction (the new-knob convention) = never
+    modulates, even in a stressed regime."""
+    p = IVRProvider(FakeIvHistoryRepo([]))
+    p.set_regime_vix(40.0)
+    assert p.effective_ivr_min({"ivr_min": 20}) == 20.0
+
+
+def test_effective_min_gate_off_stays_off():
+    p = _relax_provider()
+    p.set_regime_vix(40.0)
+    assert p.effective_ivr_min({"ivr_min": 0}) == 0.0
+    assert p.effective_ivr_min({}) == 0.0
+
+
+def test_effective_min_per_strategy_override_beats_defaults():
+    p = _relax_provider()  # provider defaults: threshold 25, delta 10
+    p.set_regime_vix(22.0)
+    params = {"ivr_min": 30, "ivr_relax_vix": 20, "ivr_relax_delta": 15}
+    assert p.effective_ivr_min(params) == 15.0
+
+
+def test_module_helper_delegates_to_provider():
+    p = _relax_provider()
+    p.set_regime_vix(30.0)
+    assert effective_ivr_min(p, {"ivr_min": 20}) == 10.0
+
+
+def test_module_helper_falls_back_for_bare_stubs():
+    class _StubIvr:
+        async def iv_rank(self, symbol):
+            return 50.0
+
+    assert effective_ivr_min(_StubIvr(), {"ivr_min": 30}) == 30.0

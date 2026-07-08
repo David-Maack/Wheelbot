@@ -178,6 +178,36 @@ async def test_selector_rejects_when_ivr_below_min():
 
 
 @pytest.mark.asyncio
+async def test_selector_relaxes_ivr_floor_in_stressed_regime():
+    """2026-07-06 regime-aware floor: the same IVR-22 entry that the flat
+    floor of 30 blocks (test above) PASSES when VIX >= the relax threshold —
+    effective floor 30 - 10 = 20."""
+    class _RelaxStubIvr:
+        async def iv_rank(self, symbol):
+            return 22.0
+
+        def effective_ivr_min(self, params):
+            # Mirrors IVRProvider.effective_ivr_min with vix=28 vs threshold 25.
+            return float(params.get("ivr_min", 0)) - 10.0
+
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F", bid=10.0, ask=10.04))
+    broker.seed_chain(
+        "F",
+        [
+            _put(10.0, bid=0.39, ask=0.41, delta=-0.25),
+            _put(9.0, bid=0.10, ask=0.12, delta=-0.10),
+        ],
+    )
+    candidate = await select_bull_put_spread(
+        broker, "F",
+        _strategy(ivr_min=30).params,
+        today=date(2025, 6, 1), ivr=_RelaxStubIvr(),
+    )
+    assert candidate is not None
+
+
+@pytest.mark.asyncio
 async def test_selector_passes_when_ivr_unavailable():
     """No iv_history yet → iv_rank returns None → skip the filter."""
     class _StubIvr:

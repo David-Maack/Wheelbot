@@ -46,7 +46,7 @@ from core.checkpoint import log_checkpoint
 from core.models import OptionContract, OptionType, OrderLeg, OrderType, PositionState
 from core.strategies import StrategyDefinition
 from data.chain import ChainFilters, fetch_filtered_chain
-from data.ivr import IVRProvider
+from data.ivr import IVRProvider, effective_ivr_min
 from db.repo import Repos
 from strategies.spreads import (
     DIRECTION_IRON_CONDOR,
@@ -158,7 +158,7 @@ async def select_iron_condor(
 
     if ivr is not None:
         rank = await ivr.iv_rank(symbol)
-        ivr_min = float(params.get("ivr_min", 0))
+        ivr_min = effective_ivr_min(ivr, params)  # regime-aware (relaxes when VIX elevated)
         if rank is not None and rank < ivr_min:
             log_checkpoint(
                 "condor_skip_ivr",

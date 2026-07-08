@@ -33,7 +33,7 @@ from data.chain import (
     annualized_yield,
     fetch_filtered_chain,
 )
-from data.ivr import IVRProvider
+from data.ivr import IVRProvider, effective_ivr_min
 
 ChainRecorder = Callable[[str, str, list[OptionContract]], Awaitable[None]]
 
@@ -104,7 +104,7 @@ async def select_bull_put_spread(
     # rank available, or threshold not set — matches csp_selector behavior.
     if ivr is not None:
         rank = await ivr.iv_rank(symbol)
-        ivr_min = float(params.get("ivr_min", 0))
+        ivr_min = effective_ivr_min(ivr, params)  # regime-aware (relaxes when VIX elevated)
         if rank is not None and rank < ivr_min:
             log_checkpoint(
                 "spread_skip_ivr",

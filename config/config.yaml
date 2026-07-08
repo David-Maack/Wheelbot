@@ -321,6 +321,22 @@ risk:
     min_expectancy_usd: 0        # pause when mean $/cycle < this
     pause_duration_days: 14
 
+  # 2026-07-06 sprint: regime-aware IVR entry floor. IVR is a RELATIVE
+  # measure — in a sustained high-vol regime (2022-style) it reads "low"
+  # for weeks while absolute premium is rich everywhere, because the rank
+  # compares against an elevated 52-week high. When the latest regime
+  # snapshot's VIX close is at/above vix_threshold, every strategy's
+  # ivr_min drops by floor_delta (clamped at 0) so the bot doesn't skip
+  # rich premium on a technicality. Calm-regime behavior is deliberately
+  # UNCHANGED (the 2026-07-01 audit set the calm floors; the selector-level
+  # min-credit rule already gates thin premium directly). Research basis:
+  # regime-conditional IVR thresholds (NexusFi/VolatilityBox regime-filter
+  # writeups). Per-strategy override: ivr_relax_vix / ivr_relax_delta in
+  # strategy params. Remove this block (or floor_delta: 0) to disable.
+  ivr_regime_relax:
+    vix_threshold: 25            # VIX close >= this = "stressed" regime
+    floor_delta: 10              # ivr_min -= this when stressed (min 0)
+
 notifications:
   # NullNotifier when false (events still logged via core/checkpoint).
   enabled: true

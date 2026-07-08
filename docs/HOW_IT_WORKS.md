@@ -74,7 +74,12 @@ Every proposed entry passes, in order:
 1. **Universe membership** — symbol must be on the strategy's watchlist and
    not banned (GME, AMC, tier-3 names — hard-coded, AI cannot override).
 2. **Strategy selector** — finds a contract in the delta/DTE band with
-   acceptable bid-ask spread and enough credit (spreads: ≥25% of width).
+   acceptable bid-ask spread and enough credit (spreads: ≥25% of width). The
+   selector-level IVR floor is **regime-aware**: when the latest VIX close is
+   ≥ 25, each strategy's `ivr_min` relaxes by 10 points (IVR reads "low" in
+   sustained high-vol because the rank compares against an elevated 52-week
+   high — don't skip rich premium on a technicality). Calm-regime floors are
+   unchanged.
 3. **Risk gate** (deterministic, `risk/limits.py`) — regime allows the
    direction; global (6) and per-strategy concurrent caps; buying-power floor;
    per-position capital caps; IVR floor/ceiling; earnings blackout (no opens

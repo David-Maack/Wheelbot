@@ -296,14 +296,25 @@ async def _propose_and_route(
     # sizes for the day (closes unaffected, like every other gate). Read once
     # per tick; any failure reads as no-veto.
     veto_multiplier = 1.0
+    regime_snap = None
     try:
         from intelligence.regime_veto import veto_size_multiplier
-        veto_multiplier = veto_size_multiplier(await repos.regime.latest())
+        regime_snap = await repos.regime.latest()
+        veto_multiplier = veto_size_multiplier(regime_snap)
         if veto_multiplier < 1.0:
             log_checkpoint("bot_llm_risk_veto_active", status="ok",
                            size_multiplier=veto_multiplier)
     except Exception:  # noqa: BLE001 — reduce-only: never let the veto read break the loop
         veto_multiplier = 1.0
+    # 2026-07-06: regime-aware IVR floor. Hand the latest VIX close to the
+    # provider so the selectors' effective_ivr_min can relax the floor when
+    # the whole market is rich (IVR reads "low" in sustained high-vol —
+    # the rank compares against an elevated 52w high). A missing snapshot
+    # reads as no-modulation; calm-regime behavior is unchanged either way.
+    try:
+        ivr.set_regime_vix(regime_snap.vix_close if regime_snap else None)
+    except Exception:  # noqa: BLE001 — context-only: never let the read break the loop
+        ivr.set_regime_vix(None)
     for strategy in strategies:
         # TICKET-029: existing positions are MANAGED (closes / stops / rolls)
         # on EVERY tick regardless of the gates below — disabling a strategy, or
@@ -609,7 +620,15 @@ async def main(argv: list[str] | None = None) -> int:
         log_checkpoint("bot_anthropic", status="skip", detail="ANTHROPIC_API_KEY unset")
 
     news = make_news_source(config)
-    ivr = IVRProvider(repos.iv_history)
+    # 2026-07-06: regime-aware IVR floor knobs. Absent block → delta 0 → the
+    # floor never modulates (new-knob convention). Per-strategy
+    # ivr_relax_vix / ivr_relax_delta params override these defaults.
+    ivr_relax = (config.get("risk") or {}).get("ivr_regime_relax") or {}
+    ivr = IVRProvider(
+        repos.iv_history,
+        relax_vix_threshold=ivr_relax.get("vix_threshold"),
+        relax_floor_delta=float(ivr_relax.get("floor_delta", 0.0)),
+    )
 
     news_check_callable = await _make_news_check_callable(news, anthropic, config)
     router = OrderRouter(broker, repos, config, universe, news_checker=news_check_callable)

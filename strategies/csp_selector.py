@@ -32,7 +32,7 @@ from core.checkpoint import log_checkpoint
 from core.config import effective_wheel_params
 from core.models import OptionContract
 from data.chain import ChainFilters, annualized_yield, fetch_filtered_chain
-from data.ivr import IVRProvider
+from data.ivr import IVRProvider, effective_ivr_min
 
 # Optional callback that persists the chain we evaluated so the cycle backtester
 # can replay decisions. Caller is responsible for the storage details; selector
@@ -55,7 +55,7 @@ async def select_csp(
     params = effective_wheel_params(symbol, config, universe)
 
     rank = await ivr.iv_rank(symbol)
-    ivr_min = float(params.get("ivr_min", 0))
+    ivr_min = effective_ivr_min(ivr, params)  # regime-aware (relaxes when VIX elevated)
     if rank is not None and rank < ivr_min:
         log_checkpoint(
             "csp_skip_ivr",

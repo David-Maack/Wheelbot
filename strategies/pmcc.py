@@ -44,7 +44,7 @@ from core.models import (
 )
 from core.strategies import StrategyDefinition
 from data.chain import ChainFilters, fetch_filtered_chain
-from data.ivr import IVRProvider
+from data.ivr import IVRProvider, effective_ivr_min
 from db.repo import JSON_FIELDS_BY_TABLE, Repos, _row_to_dict
 from strategies.wheel import Proposal, _tier_flags
 
@@ -107,7 +107,7 @@ async def select_long_call(
 
     if ivr is not None:
         rank = await ivr.iv_rank(symbol)
-        ivr_min = float(params.get("ivr_min", 0))
+        ivr_min = effective_ivr_min(ivr, params)  # regime-aware (relaxes when VIX elevated)
         if rank is not None and rank < ivr_min:
             log_checkpoint("pmcc_skip_ivr", status="ok", symbol=symbol, ivr=rank, ivr_min=ivr_min)
             return None
