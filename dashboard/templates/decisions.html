@@ -15,6 +15,36 @@
   </dl>
 </section>
 
+{% if news_hit %}
+<section class="panel">
+  <h2>News-check hit rate <small>(advisory-mode natural experiment — gate for flipping <code>news_check_advisory</code>)</small></h2>
+  <table class="grid">
+    <thead><tr><th>Decision</th><th>Decisions</th><th>Matched to cycle</th><th>Closed</th><th>Win rate</th><th>Avg P&amp;L</th><th>Total P&amp;L</th></tr></thead>
+    <tbody>
+      {% for name in ("proceed", "caution") %}
+      {% set s = news_hit.buckets[name] %}
+      <tr class="{% if name == 'caution' %}row-warn{% endif %}">
+        <td><code>{{ name }}</code></td>
+        <td>{{ s.n_decisions }}</td>
+        <td>{{ s.n_matched }}</td>
+        <td>{{ s.n_closed }}</td>
+        <td>{% if s.win_rate is not none %}{{ "%.1f"|format(s.win_rate * 100) }}%{% else %}—{% endif %}</td>
+        <td>{% if s.avg_pnl is not none %}<span class="{% if s.avg_pnl >= 0 %}ok{% else %}bad{% endif %}">${{ "%.2f"|format(s.avg_pnl) }}</span>{% else %}—{% endif %}</td>
+        <td>{% if s.n_closed %}${{ "%.2f"|format(s.total_pnl) }}{% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+      <tr class="row-bad">
+        <td><code>block</code></td>
+        <td>{{ news_hit.blocks | length }}</td>
+        <td colspan="5">no trade — no realized outcome (counterfactual out of scope)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p><strong>Verdict:</strong> {{ news_hit.verdict }}</p>
+  {% if news_hit.n_unparsed %}<p class="empty">{{ news_hit.n_unparsed }} unparsed pre-2026-05-29 rows excluded.</p>{% endif %}
+</section>
+{% endif %}
+
 <form method="get" class="filters">
   <label>Type
     <select name="decision_type">

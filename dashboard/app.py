@@ -252,6 +252,10 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         budget_cap = float(
             deps.config.get("intelligence", {}).get("daily_budget_usd", 1.0)
         )
+        # 2026-07-07: news-check hit-rate panel — the evidence gate for
+        # flipping news_check_advisory to false (see intelligence/news_hit_rate).
+        from intelligence.news_hit_rate import compute_hit_rate
+        news_hit = await compute_hit_rate(deps.repos)
         return TEMPLATES.TemplateResponse(
             request,
             "decisions.html",
@@ -261,6 +265,7 @@ def build_app(deps: DashboardDeps) -> FastAPI:
                 "filter_decision": decision or "",
                 "spent_today": spent_today,
                 "budget_cap": budget_cap,
+                "news_hit": news_hit,
             },
         )
 

@@ -84,8 +84,10 @@ async def test_decisions_filter_by_decision(app_client):
     resp = await client.get("/decisions?decision=block", headers=_auth())
     assert resp.status_code == 200
     assert "block" in resp.text
-    # The other two shouldn't appear in their own row.
-    assert resp.text.lower().count(">proceed<") == 1  # the dropdown option only
+    # The other two shouldn't appear in their own decisions-table row. Two
+    # occurrences are structural: the filter dropdown option + the hit-rate
+    # panel's bucket row (2026-07-07 sprint) — both render on every load.
+    assert resp.text.lower().count(">proceed<") == 2
 
 
 @pytest.mark.asyncio
