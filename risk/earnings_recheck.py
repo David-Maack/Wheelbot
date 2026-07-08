@@ -60,6 +60,7 @@ ACTION_CLOSE_SKIPPED_KILL_SWITCH = "close_skipped_kill_switch"
 ACTION_CLOSE_SPREAD_UNSUPPORTED = "close_spread_unsupported_fallback_flag_manual"
 ACTION_PROVIDER_UNAVAILABLE = "provider_unavailable"
 ACTION_OUTSIDE_WINDOW = "outside_window"  # not returned, but used internally
+ACTION_FLAG_STALE = "flag_stale_nudge"  # watchdog: flag condition has cleared
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,4 +401,123 @@ async def check_open_positions_for_new_earnings(
             rationale=f"flagged; days_to_earnings={days_to_earnings}",
         ))
 
+    # Stale-flag watchdog (2026-07-08 sprint) — same rate-limited pass.
+    if bool(cfg.get("stale_flag_watchdog", False)):
+        results.extend(await check_stale_manual_flags(
+            repos=repos, config=config, today=today,
+            days_before=days_before, days_after=days_after,
+            next_earnings_fn=lookup_fn, active=active,
+        ))
+
+    return results
+
+
+STALE_NUDGE_COOLDOWN_HOURS = 24.0
+
+
+async def check_stale_manual_flags(
+    *,
+    repos: Repos,
+    config: dict[str, Any],
+    today: date,
+    days_before: int,
+    days_after: int,
+    next_earnings_fn: NextEarningsFn,
+    active: list[Position] | None = None,
+) -> list[EarningsRecheckResult]:
+    """Nudge the operator when an earnings-recheck flag has gone stale.
+
+    Provider earnings dates are ESTIMATES until confirmed — they wobble. The
+    flag is a deliberate one-way latch, so when the estimate that justified it
+    later moves OUT of the risk window, the position stays flagged and
+    UNMANAGED (no profit close, no DTE force-close) with nobody the wiser
+    (bit us: SOFI calendar 2026-07-08, flagged on an estimate that later moved
+    to 5 days past the front expiry).
+
+    This re-evaluates the window for MANUAL_INTERVENTION positions whose flag
+    was set BY the earnings recheck (state_log reason prefix — operator flags
+    and reconciler flags are never touched). Condition cleared → 24h
+    rate-limited Discord nudge + checkpoint with the restore command. The
+    clear itself stays MANUAL (scripts/restore_position.py or the MCP
+    unflag_position control) — a flag that silently disappears is worse than
+    a nudge.
+    """
+    from risk.manual_flags import EARNINGS_FLAG_REASON_PREFIX, latest_flag_entry
+
+    account_id = (config.get("account") or {}).get("id", "primary")
+    if active is None:
+        active = await repos.positions.list_active(account_id)
+
+    results: list[EarningsRecheckResult] = []
+    for pos in active:
+        if pos.state != PositionState.MANUAL_INTERVENTION or pos.id is None:
+            continue
+        entry = await latest_flag_entry(repos, pos.id)
+        if entry is None or not (entry.reason or "").startswith(EARNINGS_FLAG_REASON_PREFIX):
+            continue  # flagged by something else — not ours to second-guess
+
+        # Recover the short expiration the same way the flag path did.
+        if pos.current_cycle_id is None:
+            continue
+        short = await _latest_short_for_cycle(repos, pos.current_cycle_id)
+        short_expiration = short.expiration if short is not None else None
+        if short_expiration is None:
+            short_expiration = await _latest_spread_short_expiration(
+                repos, pos.current_cycle_id
+            )
+        if short_expiration is None:
+            continue
+
+        lookup = next_earnings_fn(pos.symbol)
+        if lookup.next_date is None:
+            continue  # can't re-evaluate without data; keep the flag quiet
+        earnings_date = lookup.next_date
+        still_at_risk = earnings_date >= today and is_in_earnings_window(
+            earnings_date, short_expiration,
+            days_before=days_before, days_after=days_after,
+        )
+        if still_at_risk:
+            continue
+
+        rationale = (
+            f"flag stale: earnings now {earnings_date}, outside the "
+            f"[{days_before}d before, {days_after}d after] window around "
+            f"short exp {short_expiration} — position is UNMANAGED while flagged"
+        )
+        log_checkpoint(
+            "earnings_recheck_flag_stale",
+            status="ok",
+            symbol=pos.symbol,
+            strategy=pos.strategy_id,
+            position_id=pos.id,
+            earnings_date=str(earnings_date),
+            short_expiration=str(short_expiration),
+            flagged_at=str(entry.created_at),
+        )
+        if await repos.alert_rate_limits.try_fire(
+            f"stale_flag_{pos.id}", cooldown_hours=STALE_NUDGE_COOLDOWN_HOURS,
+        ):
+            await notify(
+                "earnings.flag_stale",
+                f"{pos.symbol} MANUAL_INTERVENTION flag looks stale",
+                symbol=pos.symbol,
+                strategy=pos.strategy_id,
+                position_id=pos.id,
+                earnings_date=str(earnings_date),
+                short_expiration=str(short_expiration),
+                rationale=rationale,
+                restore_hint=(
+                    f"python -m scripts.restore_position --symbol {pos.symbol} "
+                    f"--strategy {pos.strategy_id} (or MCP unflag_position)"
+                ),
+            )
+        results.append(EarningsRecheckResult(
+            position_id=pos.id,
+            symbol=pos.symbol,
+            strategy_id=pos.strategy_id,
+            action_taken=ACTION_FLAG_STALE,
+            earnings_date=earnings_date,
+            short_expiration=short_expiration,
+            rationale=rationale,
+        ))
     return results

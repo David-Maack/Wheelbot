@@ -373,6 +373,27 @@ class WheelbotMcpService:
         self._audit("refresh_macro_calendar", rows=rows, source=source)
         return {"ok": True, "distinct_rows": rows, "source": source}
 
+    async def unflag_position(
+        self, symbol: str, strategy: str, state: str | None = None,
+        reason: str = "operator unflag via MCP",
+    ) -> dict:
+        """Restore a MANUAL_INTERVENTION position to its pre-flag state so the
+        bot resumes managing it (2026-07-08: replaces the raw-SQL-in-container
+        ritual). Defaults to the from_state recorded in state_log when it was
+        flagged; pass `state` to override."""
+        self._require_controls("unflag_position")
+        from risk.manual_flags import restore_position
+        result = await restore_position(
+            self._repos, symbol, strategy,
+            account_id=self._account_id, state=state, reason=f"MCP: {reason}",
+        )
+        self._audit(
+            "unflag_position", symbol=symbol, strategy=strategy,
+            ok=result.get("ok"), restored_to=result.get("restored_to"),
+            reason=reason,
+        )
+        return result
+
     async def flatten_position(self, symbol: str, execute: bool = False) -> dict:
         """Close all option legs for one underlying. DRY-RUN by default — returns the plan;
         only acts when execute=true. Closes at the broker, then marks the DB row IDLE."""

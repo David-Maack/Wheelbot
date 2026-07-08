@@ -109,7 +109,7 @@ an open position.
 | Win-rate floor | < 60% over last 10+ cycles | Strategy paused, **manual** reenable only |
 | Expectancy floor | Mean $/cycle < $0 over last 10+ cycles (currently observe-only — `risk.expectancy_floor.enabled: false`; the `/risk` panel shows what it would do) | Strategy paused, **manual** reenable only — catches a strategy that wins often but loses big, which the win-rate floor can't see |
 | Regime veto (AI) | LLM flags headline risk the numbers can't see | All entry sizes halved for the day — reduce-only |
-| Earnings recheck | Earnings date moves inside an open position's window | Flag MANUAL_INTERVENTION + Discord |
+| Earnings recheck | Earnings date moves inside an open position's window | Flag MANUAL_INTERVENTION + Discord. A watchdog re-checks flagged positions each pass: if the (estimated, wobbly) earnings date later moves back OUT of the window, Discord gets a "flag looks stale" nudge — clearing stays manual via `scripts/restore_position.py` or the MCP `unflag_position` control |
 
 ## 6. Where the AI is involved
 
@@ -152,7 +152,8 @@ The host crontab on CT 105 is authoritative — `crontab -l` to verify.
 - **Ops MCP** (port 8890, bearer-token): read tools (positions, risk,
   performance, decisions, regime, watchlists, diagnose_symbol) + guarded
   controls (pause/reenable strategy, kill switch, flatten position [dry-run
-  first], refresh macro calendar, approve/reject watchlist). Every control is
+  first], unflag a MANUAL_INTERVENTION position back to its pre-flag state,
+  refresh macro calendar, approve/reject watchlist). Every control is
   audit-logged.
 
 ## 9. Data stores in one breath

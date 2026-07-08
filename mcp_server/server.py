@@ -99,6 +99,13 @@ def build_server(service: WheelbotMcpService, *, host: str, port: int) -> FastMC
         """[control] Close all option legs for one underlying. DRY-RUN unless execute=true."""
         return await service.flatten_position(symbol, execute=execute)
 
+    @mcp.tool()
+    async def unflag_position(symbol: str, strategy: str, state: str | None = None,
+                              reason: str = "operator unflag via MCP") -> dict:
+        """[control] Restore a MANUAL_INTERVENTION position to its pre-flag state
+        (from state_log; override with `state`) so the bot resumes managing it."""
+        return await service.unflag_position(symbol, strategy, state=state, reason=reason)
+
     return mcp
 
 

@@ -190,3 +190,33 @@ async def test_approve_watchlist_guards(db_repos, tmp_path):
         await svc_off.approve_watchlist(run_id)
     # get_watchlists is a read tool — works with controls off.
     assert "applied" in await svc_off.get_watchlists()
+
+
+@pytest.mark.asyncio
+async def test_unflag_position_restores_pre_flag_state(db_repos, tmp_path):
+    """2026-07-08: the MCP path out of MANUAL_INTERVENTION (replaces raw SQL)."""
+    from core.models import StateLog, StateLogTrigger
+    svc = _service(db_repos, tmp_path)
+    pos_id = await db_repos.positions.insert(Position(
+        account_id="test", symbol="SOFI", strategy_id="calendar",
+        state=PositionState.MANUAL_INTERVENTION, shares=0,
+        state_changed_at=_utcnow(),
+    ))
+    await db_repos.state_log.insert(StateLog(
+        position_id=pos_id, from_state=PositionState.SPREAD_OPEN,
+        to_state=PositionState.MANUAL_INTERVENTION,
+        reason="earnings_appeared_mid_cycle earnings=2026-07-26 short_exp=2026-07-24",
+        triggered_by=StateLogTrigger.STRATEGY, created_at=_utcnow(),
+    ))
+    res = await svc.unflag_position("SOFI", "calendar", reason="stale earnings flag")
+    assert res["ok"] is True
+    assert res["restored_to"] == "SPREAD_OPEN"
+    pos = await db_repos.positions.get_by_symbol("test", "SOFI", strategy_id="calendar")
+    assert pos.state == PositionState.SPREAD_OPEN
+
+
+@pytest.mark.asyncio
+async def test_unflag_position_requires_controls(db_repos, tmp_path):
+    svc = _service(db_repos, tmp_path, controls_enabled=False)
+    with pytest.raises(ControlsDisabled):
+        await svc.unflag_position("SOFI", "calendar")

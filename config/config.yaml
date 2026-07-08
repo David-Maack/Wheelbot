@@ -268,6 +268,14 @@ risk:
     # so the badge and the actual recheck behaviour cannot diverge.
     days_before: 5
     days_after: 2
+    # 2026-07-08: provider earnings dates are ESTIMATES and wobble. The flag
+    # is a one-way latch, so when the date that justified it later moves OUT
+    # of the window the position stays flagged and UNMANAGED (no profit
+    # close, no DTE force-close — bit us on the SOFI calendar). The watchdog
+    # re-evaluates earnings-recheck flags each pass and nudges Discord
+    # (24h-limited) when one goes stale. Clearing stays MANUAL:
+    # scripts/restore_position.py or the MCP unflag_position control.
+    stale_flag_watchdog: true
 
   # Earnings ENTRY gate (risk/limits.py rule 4). entry_avoid_days switches the
   # gate from expiry-based (block any 30-45 DTE position whose life reaches

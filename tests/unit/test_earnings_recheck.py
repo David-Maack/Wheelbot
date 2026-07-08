@@ -29,6 +29,7 @@ from risk.earnings_recheck import (
     ACTION_CLOSE_SKIPPED_KILL_SWITCH,
     ACTION_CLOSE_SPREAD_UNSUPPORTED,
     ACTION_FLAG_MANUAL,
+    ACTION_FLAG_STALE,
     ACTION_PROVIDER_UNAVAILABLE,
     EarningsRecheckResult,
     check_open_positions_for_new_earnings,
@@ -407,3 +408,107 @@ async def test_flag_manual_is_idempotent(db_repos):
     )
     log_rows_after = await db_repos.state_log.list_for_position(pos.id)
     assert len(log_rows_after) == len(log_rows_before)
+
+
+# -- stale-flag watchdog (2026-07-08 sprint) ----------------------------------
+
+
+async def _no_notify(*args, **kwargs):
+    return None
+
+
+async def _seed_flagged_spread(db_repos, *, symbol: str, short_expiration: date,
+                               flag_reason: str | None = None) -> Position:
+    """A spread that WAS flagged by the earnings recheck: MANUAL_INTERVENTION
+    position + the state_log row the flag path writes."""
+    from core.models import StateLog, StateLogTrigger
+    pos = await _seed_spread(db_repos, symbol=symbol, short_expiration=short_expiration)
+    reason = flag_reason or (
+        f"earnings_appeared_mid_cycle earnings=2026-06-03 short_exp={short_expiration}"
+    )
+    await db_repos.positions.update_state(
+        pos.id, PositionState.MANUAL_INTERVENTION, reason)
+    await db_repos.state_log.insert(
+        StateLog(position_id=pos.id, from_state=PositionState.SPREAD_OPEN,
+                 to_state=PositionState.MANUAL_INTERVENTION, reason=reason,
+                 triggered_by=StateLogTrigger.STRATEGY,
+                 created_at=datetime.now(UTC).replace(tzinfo=None))
+    )
+    return pos
+
+
+@pytest.mark.asyncio
+async def test_watchdog_nudges_when_earnings_moves_out_of_window(db_repos, monkeypatch):
+    """The SOFI case: flagged on an estimate inside the window; the estimate
+    later moves out -> stale nudge + notify, position stays flagged."""
+    notified: list[dict] = []
+
+    async def _capture_notify(event, message, **kw):
+        notified.append({"event": event, **kw})
+
+    monkeypatch.setattr("risk.earnings_recheck.notify", _capture_notify)
+    short_exp = _today() + timedelta(days=16)
+    await _seed_flagged_spread(db_repos, symbol="SOFI", short_expiration=short_exp)
+
+    results = await check_open_positions_for_new_earnings(
+        repos=db_repos, router=None,
+        config=_config(stale_flag_watchdog=True),
+        today=_today(), recheck_state={"ticks_since_check": 0},
+        # Earnings now 5 days AFTER the short expiry -> outside [-2, +5].
+        next_earnings_fn=_stub_lookup({"SOFI": short_exp + timedelta(days=5)}),
+    )
+    stale = [r for r in results if r.action_taken == ACTION_FLAG_STALE]
+    assert len(stale) == 1
+    assert stale[0].symbol == "SOFI"
+    assert any(n["event"] == "earnings.flag_stale" for n in notified)
+    # The clear stays manual — the position must still be flagged.
+    pos = await db_repos.positions.get_by_symbol("test", "SOFI", strategy_id="put_spread")
+    assert pos.state == PositionState.MANUAL_INTERVENTION
+
+
+@pytest.mark.asyncio
+async def test_watchdog_quiet_while_still_in_window(db_repos, monkeypatch):
+    monkeypatch.setattr("risk.earnings_recheck.notify", _no_notify)
+    short_exp = _today() + timedelta(days=16)
+    await _seed_flagged_spread(db_repos, symbol="SOFI", short_expiration=short_exp)
+    results = await check_open_positions_for_new_earnings(
+        repos=db_repos, router=None,
+        config=_config(stale_flag_watchdog=True),
+        today=_today(), recheck_state={"ticks_since_check": 0},
+        # Earnings 2 days before the short expiry -> squarely in the window.
+        next_earnings_fn=_stub_lookup({"SOFI": short_exp - timedelta(days=2)}),
+    )
+    assert not [r for r in results if r.action_taken == ACTION_FLAG_STALE]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ignores_non_earnings_flags(db_repos, monkeypatch):
+    """Operator/reconciler flags are never second-guessed."""
+    monkeypatch.setattr("risk.earnings_recheck.notify", _no_notify)
+    short_exp = _today() + timedelta(days=16)
+    await _seed_flagged_spread(
+        db_repos, symbol="SOFI", short_expiration=short_exp,
+        flag_reason="partial fill then cancel - operator must inspect",
+    )
+    results = await check_open_positions_for_new_earnings(
+        repos=db_repos, router=None,
+        config=_config(stale_flag_watchdog=True),
+        today=_today(), recheck_state={"ticks_since_check": 0},
+        next_earnings_fn=_stub_lookup({"SOFI": short_exp + timedelta(days=30)}),
+    )
+    assert not [r for r in results if r.action_taken == ACTION_FLAG_STALE]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_off_by_default(db_repos, monkeypatch):
+    """No stale_flag_watchdog key -> feature off (new-knob convention)."""
+    monkeypatch.setattr("risk.earnings_recheck.notify", _no_notify)
+    short_exp = _today() + timedelta(days=16)
+    await _seed_flagged_spread(db_repos, symbol="SOFI", short_expiration=short_exp)
+    results = await check_open_positions_for_new_earnings(
+        repos=db_repos, router=None,
+        config=_config(),  # watchdog key absent
+        today=_today(), recheck_state={"ticks_since_check": 0},
+        next_earnings_fn=_stub_lookup({"SOFI": short_exp + timedelta(days=30)}),
+    )
+    assert not [r for r in results if r.action_taken == ACTION_FLAG_STALE]
