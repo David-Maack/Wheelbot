@@ -686,6 +686,17 @@ async def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # defensive — recheck must not block trading
             log_checkpoint("earnings_recheck_fail", status="fail", error=str(exc))
 
+        # 2026-07-08: stale-open sweep. Entry orders that never fill leave
+        # their positions *_PENDING all day (no re-proposal → the router's
+        # stale-replace path never fires for opens). Cancel them at the
+        # broker after stale_pending_minutes; the next reconcile restores
+        # the position and the entry re-prices from fresh quotes. Runs even
+        # under the kill switch — cancelling resting orders reduces risk.
+        try:
+            await router.cancel_stale_pending_opens()
+        except Exception as exc:  # noqa: BLE001 — sweep must never break the tick
+            log_checkpoint("stale_open_sweep_fail", status="fail", error=str(exc))
+
         if kill_switch_tripped:
             log_checkpoint("bot_skip_kill_switch", status="ok", reason=ks.reason)
             return

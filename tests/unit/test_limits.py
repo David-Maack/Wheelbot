@@ -908,3 +908,59 @@ async def test_regime_gate_skips_swing(db_repos):
     await gate._rule_regime(res, p, {})
     assert res.results[-1].status == "skip"
     assert "swing" in res.results[-1].detail
+
+
+# -- per-strategy concurrent cap (2026-07-08 fix) ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cap_uses_strategy_block_max_concurrent(db_repos, monkeypatch):
+    """The strategies-block max_concurrent (2) beats the wheel-section
+    max_concurrent_positions (4) — pre-fix, EVERY strategy got the wheel
+    default and put_spread piled up 3-4 pendings past its cap of 2."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    broker = PaperBroker(cash=20_000)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    for sym in ("BAC", "SOFI"):
+        await db_repos.positions.insert(
+            Position(
+                account_id="test",
+                symbol=sym,
+                strategy_id="monthly_wheel",
+                state=PositionState.CSP_OPEN,
+                shares=0,
+                state_changed_at=now,
+            )
+        )
+    cfg = _config(max_concurrent_positions=4)  # wheel fallback alone would PASS
+    cfg["strategies"] = [{"id": "monthly_wheel", "max_concurrent": 2}]
+    gate = RiskGate(broker, db_repos, cfg, _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["concurrent_positions_cap"] == "fail"  # projected 3 > cap 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cap_falls_back_to_wheel_param(db_repos, monkeypatch):
+    """Strategy without a max_concurrent (or absent from the strategies
+    block) keeps the wheel-section fallback — backwards compatible."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    broker = PaperBroker(cash=20_000)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    for sym in ("BAC", "SOFI"):
+        await db_repos.positions.insert(
+            Position(
+                account_id="test",
+                symbol=sym,
+                strategy_id="monthly_wheel",
+                state=PositionState.CSP_OPEN,
+                shares=0,
+                state_changed_at=now,
+            )
+        )
+    cfg = _config(max_concurrent_positions=4)
+    cfg["strategies"] = [{"id": "some_other_strategy", "max_concurrent": 1}]
+    gate = RiskGate(broker, db_repos, cfg, _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    assert statuses["concurrent_positions_cap"] == "pass"  # projected 3 <= 4

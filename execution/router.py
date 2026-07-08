@@ -304,6 +304,73 @@ class OrderRouter:
         )
         return ("replace", new_id)
 
+    async def cancel_stale_pending_opens(self) -> int:
+        """Tick-loop sweep for the open-side dead end (2026-07-08 fix).
+
+        An entry order that never fills leaves its position `*_PENDING`;
+        the orchestrators only propose entries for IDLE/closed positions, so
+        no new proposal arrives and `_replace_stale_pending` (which runs
+        pre-submission of a NEW proposal) is unreachable for opens. The order
+        then sits at its stale limit until the broker expires it at the
+        close — the day's entry is lost while the phantom pending position
+        consumes a concurrent-cap slot (observed: put_spread opens priced at
+        the 9:30 mid never crossing, EOD-cancelling, repeating daily).
+
+        Cancels PENDING `*_OPEN` orders older than `stale_pending_minutes`
+        at the BROKER ONLY — no local writes. The reconciler observes the
+        cancellation on its next pass and restores the position state
+        (single source of truth), and the following propose pass re-prices
+        the entry from fresh quotes (the day-scoped client id collides only
+        with a CANCELLED row, so it proceeds). Net effect: entries re-price
+        every ~stale_pending_minutes instead of one doomed attempt per day.
+
+        PARTIALs are deliberately left alone — cancelling a partial fill
+        routes to MANUAL_INTERVENTION (PR#1 finding #7) and needs a human.
+        Closes are exempt: their positions stay `*_OPEN`, so they re-propose
+        every tick and the pre-submission replace path already covers them.
+        """
+        account_id = self._config.get("account", {}).get("id", "primary")
+        now = _utcnow()
+        cancelled = 0
+        for order in await self._repos.orders.list_pending(account_id):
+            if order.status != OrderStatus.PENDING:
+                continue  # PARTIAL — human territory, never auto-cancel
+            if order.order_type not in _OPEN_ORDER_TYPES:
+                continue
+            if order.broker_order_id is None or order.placed_at is None:
+                continue
+            age_min = (now - order.placed_at).total_seconds() / 60.0
+            if age_min < self._cfg.stale_pending_minutes:
+                continue
+            try:
+                await self._broker.cancel_order(order.broker_order_id)
+            except Exception as exc:  # noqa: BLE001
+                log_checkpoint(
+                    "router_stale_open_cancel_fail",
+                    status="fail",
+                    symbol=order.symbol,
+                    strategy=order.strategy_id,
+                    broker_order_id=order.broker_order_id,
+                    error=str(exc),
+                )
+                continue
+            cancelled += 1
+            order_type_val = (
+                order.order_type.value
+                if hasattr(order.order_type, "value") else str(order.order_type)
+            )
+            log_checkpoint(
+                "router_stale_open_cancelled",
+                status="ok",
+                symbol=order.symbol,
+                strategy=order.strategy_id,
+                order_type=order_type_val,
+                client_order_id=order.client_order_id,
+                age_min=round(age_min, 1),
+                threshold_min=self._cfg.stale_pending_minutes,
+            )
+        return cancelled
+
     async def place(
         self,
         proposal: Proposal,

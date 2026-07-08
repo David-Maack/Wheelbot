@@ -241,7 +241,21 @@ class RiskGate:
         proposal: Proposal | MultiLegProposal,
         params: dict[str, Any],
     ) -> None:
-        cap = int(params.get("max_concurrent_positions", 4))
+        # 2026-07-08 fix: `params` here is effective_wheel_params — the WHEEL
+        # config section — so the old read of max_concurrent_positions applied
+        # the wheel-global cap (4) to EVERY strategy, and the per-strategy
+        # `max_concurrent` in the strategies: block was never consulted
+        # (observed: 3-4 put_spread pendings piling up past its cap of 2).
+        # The strategy's own cap now wins; the wheel param stays the fallback
+        # for strategies without one.
+        cap_raw: Any = None
+        for s in (self._config.get("strategies") or []):
+            if s.get("id") == proposal.strategy_id:
+                cap_raw = s.get("max_concurrent")
+                break
+        if cap_raw is None:
+            cap_raw = params.get("max_concurrent_positions", 4)
+        cap = int(cap_raw)
         account_id = self._config.get("account", {}).get("id", "primary")
         # Per-strategy concurrent cap: count only positions belonging to the
         # same strategy. Different strategies share the account but have

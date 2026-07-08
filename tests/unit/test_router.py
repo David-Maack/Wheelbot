@@ -375,3 +375,101 @@ async def test_close_not_gated_by_entry_window(db_repos, monkeypatch):
     result = await router.place(close_proposal, sleep=_noop_sleep, today=date(2025, 6, 1))
     assert result.placed is not None
     assert result.skipped_outside_entry_window is False
+
+
+# -- stale-open sweep (2026-07-08 fix) -----------------------------------------
+
+
+class _CancelRecorder:
+    """Broker stub for the sweep — records cancel calls, optionally raises."""
+
+    def __init__(self, fail_ids: set[str] | None = None):
+        self.cancelled: list[str] = []
+        self._fail_ids = fail_ids or set()
+
+    async def cancel_order(self, broker_order_id: str) -> None:
+        if broker_order_id in self._fail_ids:
+            raise BrokerUnavailable("cancel refused")
+        self.cancelled.append(broker_order_id)
+
+
+async def _insert_order(
+    db_repos,
+    *,
+    client_id: str,
+    broker_id: str | None,
+    order_type: OrderType,
+    age_minutes: float,
+    status: OrderStatus = OrderStatus.PENDING,
+    symbol: str = "AAPL",
+):
+    from core.models import Order
+    placed = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=age_minutes)
+    await db_repos.orders.insert(Order(
+        account_id="test", symbol=symbol, strategy_id="put_spread",
+        order_type=order_type, quantity=1, status=status,
+        placed_at=placed, client_order_id=client_id, broker_order_id=broker_id,
+    ))
+
+
+@pytest.mark.asyncio
+async def test_sweep_cancels_stale_pending_open(db_repos):
+    broker = _CancelRecorder()
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    await _insert_order(db_repos, client_id="c1", broker_id="b1",
+                        order_type=OrderType.MULTI_LEG_OPEN, age_minutes=30)
+    n = await router.cancel_stale_pending_opens()
+    assert n == 1
+    assert broker.cancelled == ["b1"]
+    # No local write — the reconciler observes the broker cancel and drives
+    # the status + position transitions (single source of truth).
+    order = await db_repos.orders.get_by_client_id("c1")
+    assert order.status == OrderStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_fresh_and_nonopen_and_partial(db_repos):
+    broker = _CancelRecorder()
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    # Fresh open — inside the stale window.
+    await _insert_order(db_repos, client_id="fresh", broker_id="b-fresh",
+                        order_type=OrderType.MULTI_LEG_OPEN, age_minutes=5)
+    # Stale CLOSE — exempt (closes re-propose every tick; replace path covers them).
+    await _insert_order(db_repos, client_id="close", broker_id="b-close",
+                        order_type=OrderType.MULTI_LEG_CLOSE, age_minutes=60)
+    # Stale PARTIAL open — human territory, never auto-cancel.
+    await _insert_order(db_repos, client_id="part", broker_id="b-part",
+                        order_type=OrderType.MULTI_LEG_OPEN, age_minutes=60,
+                        status=OrderStatus.PARTIAL)
+    # No broker id yet — nothing to cancel.
+    await _insert_order(db_repos, client_id="nobrk", broker_id=None,
+                        order_type=OrderType.MULTI_LEG_OPEN, age_minutes=60)
+    n = await router.cancel_stale_pending_opens()
+    assert n == 0
+    assert broker.cancelled == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_covers_single_leg_opens_too(db_repos):
+    """A wheel CSP entry that never fills dead-ends the same way (CSP_PENDING
+    suppresses re-proposals) — the sweep covers all _OPEN_ORDER_TYPES."""
+    broker = _CancelRecorder()
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    await _insert_order(db_repos, client_id="csp", broker_id="b-csp",
+                        order_type=OrderType.SELL_TO_OPEN, age_minutes=30, symbol="F")
+    n = await router.cancel_stale_pending_opens()
+    assert n == 1
+    assert broker.cancelled == ["b-csp"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_survives_broker_cancel_failure(db_repos):
+    broker = _CancelRecorder(fail_ids={"b-bad"})
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    await _insert_order(db_repos, client_id="bad", broker_id="b-bad",
+                        order_type=OrderType.MULTI_LEG_OPEN, age_minutes=30)
+    await _insert_order(db_repos, client_id="good", broker_id="b-good",
+                        order_type=OrderType.MULTI_LEG_OPEN, age_minutes=30, symbol="MSFT")
+    n = await router.cancel_stale_pending_opens()
+    assert n == 1
+    assert broker.cancelled == ["b-good"]

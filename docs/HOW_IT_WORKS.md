@@ -89,7 +89,12 @@ Every proposed entry passes, in order:
 4. **News check** (AI, §6) — headline sniff on wheel CSP entries.
 5. **Router** — sizes the order (halved under drawdown WARNING or regime
    veto), concedes $0.05 slippage so it fills, refuses entries in the last 15
-   minutes before the close, and cancels/re-places limits stale > 15 min.
+   minutes before the close, and cancels/re-places limits stale > 15 min. A
+   per-tick sweep also cancels any pending **entry** order older than 15
+   minutes outright — the reconciler restores the position and the next tick
+   re-prices the entry from fresh quotes, so an entry limit that doesn't
+   cross re-prices every ~15 minutes instead of sitting at its stale price
+   until the broker expires it at the close.
 
 Exits skip most of this on purpose: a bad regime or blackout must never trap
 an open position.
