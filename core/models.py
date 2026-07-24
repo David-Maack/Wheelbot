@@ -129,6 +129,9 @@ class LlmDecisionType(StrEnum):
     REGIME_VETO = "REGIME_VETO"
     # Weekly universe refresh — per-strategy watchlist ranking (intelligence/universe_refresh.py)
     UNIVERSE_REFRESH = "UNIVERSE_REFRESH"
+    # 2026-07-09: position news sentry — mid-cycle headline check on OPEN
+    # positions, notify-only (intelligence/position_news_sentry.py)
+    POSITION_NEWS = "POSITION_NEWS"
 
 
 class WatchlistRunStatus(StrEnum):

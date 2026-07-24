@@ -42,7 +42,10 @@ runs the same sequence:
    `universe.yaml` when none is applied.
 4. **Earnings recheck** — companies confirm earnings dates late; every open
    short-premium position is periodically re-checked and flagged
-   `MANUAL_INTERVENTION` (+ Discord) if earnings moved inside its window.
+   `MANUAL_INTERVENTION` (+ Discord) if earnings moved inside its window. The
+   **position news sentry** (§6) covers *unscheduled* catalysts on the same
+   cadence: an hourly Haiku read of each open position's headlines,
+   notify-only.
 5. **Per strategy — manage, then maybe enter:**
    - **Closes, stops, and rolls run on EVERY tick for EVERY strategy**, even
      disabled or drawdown-paused ones. Disabling a strategy only stops new
@@ -123,6 +126,7 @@ every AI failure "fails open" to the bot's plain rule-based behavior.
 | **Screener** | Opus | Daily pre-market (cron) | Scores tier-1/2 universe 0–100; tier-2 names need ≥ 50 to trade that day | Tier-2 entries blocked (safe-closed) |
 | **Adversarial screen** | Haiku | Same run | Bull/bear second read of top-3, adjusts scores ±15 | Keeps single-pass scores |
 | **News check** | Haiku | Per wheel-CSP entry | proceed / caution / block. Currently **advisory**: only hard "block" cancels. The flip to enforcement (`news_check_advisory: false`) is gated on evidence: the hit-rate panel on `/decisions` joins every decision to its realized cycle P&L — flip only once caution entries measurably underperform proceed entries | Proceeds (fail-open) |
+| **Position news sentry** | Haiku | ~Hourly per OPEN position | Position-aware headline read: hold / alert / exit_advisory. **Notify-only** — alerts go to Discord + `/decisions`; the operator closes via MCP `flatten_position` if they agree. Auto-close must first EARN its autonomy via a hit-rate report (verdicts are logged with the position's cycle so outcomes are joinable) — the stop-loss backtest showed reactive early exits on defined-risk spreads destroy expectancy, so a ~75%-accurate signal doesn't get the keys | Silent hold (fail-open) |
 | **Regime veto** | Haiku | Daily (regime cron) | Halves ALL entry sizes for the day — reduce-only by construction | No veto |
 | **Universe refresh** | Opus | Weekly, Sat 07:00 MDT (cron) | Proposes watchlist add/keep/drop per strategy, matching candidates to each strategy's profile (rich IV → put spreads, low IV → calendars, cheap LEAPs → PMCC, …). Candidates = the curated universe **plus a market-wide discovery scan**: the top ~100 most-active US stocks (Alpaca screener), quant-gated, chain-tradability-checked, capped at 25 new names per run. **Human must approve** (MCP `approve_watchlist`); code-enforced guardrails: open/pinned symbols undroppable, ≤2 adds + ≤2 drops per strategy, min 3 symbols, banned/tier-3 never re-addable, discovered adds enter at tier 2 (need a daily screener score to trade) | Last-good watchlist stands; a broken screener just shrinks the pool back to hand-curated |
 | **Roll advisor** | Opus+Haiku ensemble | — | **Disabled** (`llm_roll_advisor_enabled: false`) until 3+ months of data | — |

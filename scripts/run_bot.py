@@ -72,6 +72,7 @@ from intelligence.anthropic_client import AnthropicClient
 from intelligence.budget import BudgetTracker
 from intelligence.news import make_news_source
 from intelligence.news_check import news_check as run_news_check
+from intelligence.position_news_sentry import run_position_news_sentry
 from strategies import roll_orchestrator
 from strategies.roll_advisor import RollAction, RollContext
 from strategies.iron_condor import propose_all as propose_all_iron_condor
@@ -657,6 +658,8 @@ async def main(argv: list[str] | None = None) -> int:
     # counter incremented on every _post_tick, only does the per-position
     # work when it crosses risk.earnings_recheck.check_interval_ticks.
     earnings_recheck_state: dict[str, int] = {"ticks_since_check": 0}
+    # 2026-07-09: same pattern for the position news sentry.
+    news_sentry_state: dict[str, int] = {"ticks_since_check": 0}
 
     async def _post_tick(_loop: ReconcilerLoop, ks: KillSwitchResult | None):
         kill_switch_tripped = ks is not None and ks.tripped
@@ -696,6 +699,18 @@ async def main(argv: list[str] | None = None) -> int:
             await router.cancel_stale_pending_opens()
         except Exception as exc:  # noqa: BLE001 — sweep must never break the tick
             log_checkpoint("stale_open_sweep_fail", status="fail", error=str(exc))
+
+        # 2026-07-09: position news sentry — hourly Haiku read of each open
+        # position's headlines. NOTIFY-ONLY (Discord + llm_decisions); never
+        # places or closes. Runs even under the kill switch — the operator
+        # needs the signal most exactly when trading is halted.
+        try:
+            await run_position_news_sentry(
+                repos=repos, news=news, anthropic=anthropic, config=config,
+                sentry_state=news_sentry_state,
+            )
+        except Exception as exc:  # noqa: BLE001 — sentry must never break the tick
+            log_checkpoint("news_sentry_pass_fail", status="fail", error=str(exc))
 
         if kill_switch_tripped:
             log_checkpoint("bot_skip_kill_switch", status="ok", reason=ks.reason)

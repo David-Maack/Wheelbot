@@ -259,6 +259,17 @@ tickers:
     strategies: [bear_call_spread]
     notes: "Retail/pharma weakness, liquid weeklies. Tier 2 = LLM screener required."
 
+  - symbol: CRM
+    name: "Salesforce"
+    tier: 1
+    strategies: [bear_call_spread]
+    notes: >
+      2026-07-09 (David): bearish AI-disruption thesis on seat-based SaaS.
+      Parked here deliberately — bear_call_spread is disabled and regime-gated
+      (bear_calls_allowed), so this activates only if the strategy is enabled
+      AND the tape turns. Quarterly earnings land inside the 30-45 DTE window;
+      expect regular earnings-blackout gating.
+
 # Banned list — explicitly never trade these even if screener suggests
 banned:
   - GME

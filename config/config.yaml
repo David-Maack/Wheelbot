@@ -113,6 +113,24 @@ intelligence:
   # paper proof-of-concept.
   adversarial_screener_enabled: true
   adversarial_model: claude-haiku-4-5
+  # 2026-07-09 sprint: position news sentry — the mid-cycle counterpart to
+  # the entry-time news_check. Every ~hour each OPEN position's headlines get
+  # a position-aware Haiku read: hold / alert / exit_advisory. NOTIFY-ONLY by
+  # design: verdicts go to Discord (rate-limited per position) + llm_decisions
+  # (context carries cycle_id for the future hit-rate join); the operator
+  # closes via MCP flatten_position if they agree. Rationale for not letting
+  # it close autonomously: the Sprint-2 stop-loss backtest showed reactive
+  # early exits on defined-risk structures destroy expectancy (58% of 2x
+  # stop-outs recovered), and headline sentiment is ~70-75% accurate — an
+  # auto-close must EARN its autonomy via the hit-rate evidence first.
+  # Cost: ~6 positions x ~7 market-hour passes x Haiku ≈ a few cents/day.
+  position_news_sentry:
+    enabled: true
+    check_interval_ticks: 12       # ~1h at 5-min cadence (earnings-recheck pattern)
+    lookback_hours: 24
+    notify_cooldown_hours: 4       # per-position Discord cooldown
+    max_positions_per_pass: 10
+    model: claude-haiku-4-5
   llm_provider: anthropic
   screener_model: claude-opus-4-7
   news_check_model: claude-haiku-4-5
