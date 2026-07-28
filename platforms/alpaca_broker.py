@@ -21,7 +21,8 @@ import os
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
-from core.broker import Broker, BrokerUnavailable, OrderRejected
+from core.broker import Broker, BrokerUnavailable, OrderNotCancelable, OrderRejected
+from core.checkpoint import log_checkpoint
 from core.models import (
     Account,
     OptionContract,
@@ -53,8 +54,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 _PENDING = {
     "new", "pending_new", "accepted", "accepted_for_bidding", "pending_review",
     "held", "done_for_day", "calculated",
+    # 2026-07-23 review fix: pending_cancel / pending_replace are STILL LIVE —
+    # the order can still fill while the cancel/replace is in flight. Mapping
+    # them to CANCELLED made the reconciler run _on_cancel (restoring the
+    # position) while the contract could still print; a fill after that
+    # arrived against a terminal local row and was silently dropped. The
+    # stale-open sweep enters this window on a schedule, so it was routine.
+    # Hold PENDING and wait for the definitive `canceled`.
+    "pending_cancel", "pending_replace",
 }
-_CANCELLED = {"canceled", "pending_cancel", "expired", "replaced", "pending_replace"}
+_CANCELLED = {"canceled", "expired", "replaced"}
 _REJECTED = {"rejected", "suspended", "stopped"}
 
 
@@ -95,6 +104,14 @@ def _map_status(alpaca_status: Any) -> OrderStatus:
         return OrderStatus.CANCELLED
     if s in _REJECTED:
         return OrderStatus.REJECTED
+    # 2026-07-23: unknown statuses still pin PENDING (safest — keeps the
+    # reconciler watching), but LOUDLY: a silent fallback previously meant a
+    # new alpaca-py status could pin an order PENDING forever with zero
+    # log evidence (which also pins the orders cursor).
+    log_checkpoint(
+        "alpaca_unknown_order_status", status="fail", raw_status=s,
+        note="mapping to PENDING — update _map_status for this alpaca-py status",
+    )
     return OrderStatus.PENDING
 
 
@@ -467,9 +484,18 @@ class AlpacaBroker(Broker):
 
         try:
             await asyncio.to_thread(self._trading.cancel_order_by_id, broker_order_id)
-        except APIError:
-            # Already filled / cancelled / unknown — broker contract says no-op.
-            return
+        except APIError as exc:
+            # 2026-07-23 review fix: an APIError here usually means "order is
+            # not cancelable" — i.e. it FILLED (or went terminal) before our
+            # cancel landed. The old silent no-op let the router mark the row
+            # CANCELLED locally while a real fill existed at the broker; that
+            # fill then arrived against a terminal local row and was dropped —
+            # a live position invisible to every code path. Raise a distinct
+            # error so callers skip rather than assume the cancel succeeded
+            # (the next reconcile pass observes the true terminal status).
+            raise OrderNotCancelable(
+                f"alpaca refused cancel for {broker_order_id}: {exc}"
+            ) from exc
         except Exception as exc:
             raise BrokerUnavailable(f"alpaca cancel_order failed: {exc}") from exc
 

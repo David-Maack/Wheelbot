@@ -99,7 +99,10 @@ Every proposed entry passes, in order:
    minutes outright — the reconciler restores the position and the next tick
    re-prices the entry from fresh quotes, so an entry limit that doesn't
    cross re-prices every ~15 minutes instead of sitting at its stale price
-   until the broker expires it at the close.
+   until the broker expires it at the close. **Close** orders never move the
+   position out of its OPEN state, so a spread close that doesn't cross is
+   re-proposed every tick and re-priced through the same stale-replace path
+   — a missed stop-out keeps chasing until it fills.
 
 Exits skip most of this on purpose: a bad regime or blackout must never trap
 an open position.
@@ -108,7 +111,7 @@ an open position.
 
 | Circuit | Trigger | Effect |
 |---|---|---|
-| Kill switch | −5% equity in a day, or losses streak, or STOP file | All new orders halt. Automatic trips (drawdown/losses) **latch for the rest of the session** — an equity bounce back above the threshold does not re-enable trading; only the MCP `release_kill_switch` (or the day rolling over) clears the latch. Manual STOP-file trips release when the file is removed |
+| Kill switch | −5% equity in a day, or losses streak, or STOP file | All new orders halt — including roll-generated new shorts (the roll path runs inside reconcile and checks the switch itself; the risk-reducing buyback leg still places). Automatic trips (drawdown/losses) **latch for the rest of the session** — an equity bounce back above the threshold does not re-enable trading; only the MCP `release_kill_switch` (or the day rolling over) clears the latch. Manual STOP-file trips release when the file is removed |
 | Drawdown breaker | Strategy's 7-day realized P&L ≤ −$300 | Strategy disabled 30 days (auto-clears; manual reenable available) |
 | Drawdown WARNING | 7-day P&L ≤ −$150 | New spreads at half size |
 | Win-rate floor | < 60% over last 10+ cycles | Strategy paused, **manual** reenable only |

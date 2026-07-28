@@ -367,6 +367,7 @@ class Reconciler:
                     f"reconcile error on order {local.client_order_id}: "
                     f"{type(exc).__name__}: {exc}",
                     summary,
+                    strategy_id=local.strategy_id,
                 )
 
     async def _dispatch_order_transition(
@@ -395,6 +396,7 @@ class Reconciler:
                     f"order {local.broker_order_id} {broker_view.status.value} "
                     f"after partial fill — manual reconcile",
                     summary,
+                    strategy_id=local.strategy_id,
                 )
             else:
                 await self._on_cancel(local, broker_view, summary)
@@ -551,6 +553,7 @@ class Reconciler:
                 f"_on_fill: no handler for filled order_type "
                 f"{local.order_type} ({local.client_order_id})",
                 summary,
+                strategy_id=local.strategy_id,
             )
 
     # -- PMCC fill dispatch (TICKET-015) --------------------------------------
@@ -653,6 +656,7 @@ class Reconciler:
             f"_on_pmcc_fill: unhandled fill {ot}/{local.option_type} "
             f"({local.client_order_id})",
             summary,
+            strategy_id=local.strategy_id,
         )
 
     async def _open_cycle_for_pmcc_long(
@@ -734,6 +738,7 @@ class Reconciler:
         await self._flag_manual_intervention(
             symbol, f"_on_swing_fill: unhandled fill {ot}/{local.option_type} "
             f"({local.client_order_id})", summary,
+            strategy_id=local.strategy_id,
         )
 
     async def _open_cycle_for_swing(
@@ -999,6 +1004,7 @@ class Reconciler:
                     symbol,
                     f"reconcile error diffing {symbol}: {type(exc).__name__}: {exc}",
                     summary,
+                    strategy_id=local.strategy_id,
                 )
 
         # Symbols at broker we don't track at all.
@@ -1039,6 +1045,24 @@ class Reconciler:
             if has_short_put:
                 return  # short put still alive — nothing to do
             if has_shares:
+                # 2026-07-23 review fix: broker rows are NOT strategy-scoped.
+                # If ANOTHER local position on this symbol already accounts
+                # for shares (e.g. monthly_wheel got assigned while
+                # weekly_wheel's CSP expired worthless the same Friday), the
+                # observed shares are likely theirs — booking an assignment
+                # here fabricated a phantom cost basis and a synthetic
+                # BUY_TO_OPEN into the WRONG strategy's cycle. Ambiguous
+                # shares go to a human (spec §10: do NOT auto-correct).
+                if await self._shares_claimed_by_other(local):
+                    await self._flag_manual_intervention(
+                        local.symbol,
+                        f"CSP_OPEN with shares at broker, but another local "
+                        f"position on {local.symbol} already claims shares — "
+                        "assignment-vs-expiration ambiguous; resolve manually",
+                        summary,
+                        strategy_id=local.strategy_id,
+                    )
+                    return
                 await self._on_assignment(local, summary)
                 return
             await self._on_csp_expiration(local, summary)
@@ -1127,6 +1151,7 @@ class Reconciler:
                         "leg gone — 2-DTE force-close did not fire; review the "
                         "back leg (now an uncovered long)",
                         summary,
+                        strategy_id=local.strategy_id,
                     )
                 return
             # Broker shows nothing for this symbol → both legs OTM at expiry,
@@ -1147,6 +1172,7 @@ class Reconciler:
                     f"spread {local.symbol} shows shares={total_shares} at broker — "
                     "likely assignment on short leg; review max-loss handling",
                     summary,
+                    strategy_id=local.strategy_id,
                 )
             return
 
@@ -1178,6 +1204,7 @@ class Reconciler:
                     "order and no legs at broker — open never filled or close "
                     "not reconciled; review",
                     summary,
+                    strategy_id=local.strategy_id,
                 )
             return
 
@@ -1197,6 +1224,7 @@ class Reconciler:
                     f"PMCC {local.symbol} shows shares={total_shares} in "
                     "PMCC_LONG_OPEN — long exercised/assigned? review",
                     summary,
+                    strategy_id=local.strategy_id,
                 )
             return
 
@@ -1210,6 +1238,7 @@ class Reconciler:
                     f"PMCC {local.symbol} shows shares={total_shares} — short "
                     "call likely assigned; exercise long to cover (manual)",
                     summary,
+                    strategy_id=local.strategy_id,
                 )
                 return
             if has_short_call:
@@ -1243,6 +1272,7 @@ class Reconciler:
             f"_diff_one: uncategorized state {local.state} for {local.symbol} "
             "— reconciliation cannot infer transitions",
             summary,
+            strategy_id=local.strategy_id,
         )
 
     async def _on_spread_expiration(
@@ -1383,6 +1413,7 @@ class Reconciler:
                 local.symbol,
                 "called_away_missing_cc_strike",
                 summary,
+                strategy_id=local.strategy_id,
             )
             return
         summary.called_aways_processed += 1
@@ -1432,13 +1463,25 @@ class Reconciler:
         symbol: str,
         reason: str,
         summary: ReconcileSummary,
+        *,
+        strategy_id: str | None = None,
     ) -> None:
+        # 2026-07-23 review fix: scope the lookup by strategy when the caller
+        # knows it. Symbol-only lookup returned an ARBITRARY row on shared
+        # underlyings (SPY runs five strategies) — the flag landed on the
+        # wrong strategy's healthy position, and once any row on the symbol
+        # was flagged, the dedup below swallowed every subsequent flag from
+        # every other strategy. Symbol-only remains the fallback for truly
+        # unknown orders/positions where no strategy is derivable.
+        #
         # Dedup BEFORE notify — if the position is already in
         # MANUAL_INTERVENTION, the reconciler may still see the same
         # unknown order on every tick until the cursor advances past it.
         # Without this guard, Discord gets re-pinged each tick for the
         # same underlying event.
-        existing = await self._repos.positions.get_by_symbol(self._account_id, symbol)
+        existing = await self._repos.positions.get_by_symbol(
+            self._account_id, symbol, strategy_id=strategy_id,
+        )
         if existing is not None and existing.state == PositionState.MANUAL_INTERVENTION:
             return
         summary.manual_interventions += 1
@@ -1446,6 +1489,7 @@ class Reconciler:
             "position.manual_intervention",
             f"{symbol} flagged for review",
             symbol=symbol,
+            strategy=strategy_id or (existing.strategy_id if existing else None),
             reason=reason,
         )
         now = _utcnow()
@@ -1454,6 +1498,7 @@ class Reconciler:
                 Position(
                     account_id=self._account_id,
                     symbol=symbol,
+                    strategy_id=strategy_id or "monthly_wheel",
                     state=PositionState.MANUAL_INTERVENTION,
                     shares=0,
                     state_changed_at=now,
@@ -1474,6 +1519,24 @@ class Reconciler:
             )
 
     # -- Helpers --------------------------------------------------------------
+
+    async def _shares_claimed_by_other(self, local: Position) -> bool:
+        """2026-07-23: True when ANOTHER local position on the same symbol
+        already holds or expects stock — i.e. the broker's share rows for
+        this underlying are plausibly not ours. Used to keep the CSP
+        assignment inference from booking another strategy's shares."""
+        share_states = {
+            PositionState.SHARES_HELD,
+            PositionState.CC_OPEN,
+            PositionState.CC_PENDING,
+            PositionState.ASSIGNED,
+        }
+        for p in await self._repos.positions.list_active(self._account_id):
+            if p.symbol != local.symbol or p.id == local.id:
+                continue
+            if (p.shares or 0) > 0 or p.state in share_states:
+                return True
+        return False
 
     async def _has_inflight_order(self, position: Position) -> bool:
         """True if any order on this position's symbol is still working

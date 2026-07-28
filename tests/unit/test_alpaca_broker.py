@@ -77,3 +77,19 @@ def test_parse_occ_round_trip():
     assert exp == date(2025, 6, 20)
     assert opt_type == OptionType.PUT
     assert strike == 10.0
+
+
+# -- status mapping (2026-07-23 review fix) ------------------------------------
+
+
+def test_pending_cancel_and_replace_map_to_pending():
+    """pending_cancel / pending_replace orders are STILL LIVE and can fill —
+    mapping them CANCELLED made the reconciler restore the position while the
+    contract could still print, and the late fill was then dropped."""
+    from platforms.alpaca_broker import _map_status
+    from core.models import OrderStatus
+    assert _map_status("pending_cancel") == OrderStatus.PENDING
+    assert _map_status("pending_replace") == OrderStatus.PENDING
+    assert _map_status("canceled") == OrderStatus.CANCELLED
+    assert _map_status("expired") == OrderStatus.CANCELLED
+    assert _map_status("replaced") == OrderStatus.CANCELLED

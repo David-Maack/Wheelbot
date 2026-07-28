@@ -258,10 +258,28 @@ class OrderRouter:
                        prior order already cancelled at broker + marked CANCELLED locally.
         """
         existing = await self._repos.orders.get_by_client_id(client_id)
-        if existing is None or existing.status not in (
-            OrderStatus.PENDING, OrderStatus.PARTIAL,
-        ):
+        if existing is None:
             return ("proceed", None)
+        if existing.status not in (OrderStatus.PENDING, OrderStatus.PARTIAL):
+            # 2026-07-23 review fix: a TERMINAL row (FILLED / CANCELLED /
+            # REJECTED) means this day-scoped id has already been used at the
+            # broker — Alpaca enforces client_order_id uniqueness across ALL
+            # orders, not just live ones. Reusing the base id 422-rejected
+            # every same-day re-entry (spread closed then re-proposed, or a
+            # sweep-cancelled entry re-pricing) for the rest of the day.
+            # Duplicate-trade protection lives in the position-state gates,
+            # not in id collision — so mint a fresh suffixed id.
+            now = _utcnow()
+            new_id = f"{client_id}-r{int(now.timestamp())}"
+            log_checkpoint(
+                "router_fresh_id_after_terminal",
+                status="ok",
+                client_order_id=client_id,
+                new_client_order_id=new_id,
+                prior_status=str(existing.status),
+                proposal=proposal_label,
+            )
+            return ("replace", new_id)
         now = _utcnow()
         age_min = (now - existing.placed_at).total_seconds() / 60.0
         if age_min < self._cfg.stale_pending_minutes:
@@ -767,7 +785,20 @@ class OrderRouter:
             placed.raw_request["width_dollars"] = float(proposal.width_dollars)
 
         await self._persist_order(placed)
-        await self._upsert_position_spread_pending(proposal, placed)
+        # 2026-07-23 review fix: pend the position on OPENS only. A close that
+        # moved the position to SPREAD_PENDING dead-ended it: the close
+        # orchestrators only walk SPREAD_OPEN, so a MULTI_LEG_CLOSE that
+        # didn't cross was never re-proposed (the pre-submission
+        # stale-replace path needs a re-proposal to fire) and the stale-OPEN
+        # sweep deliberately exempts closes — a missed stop-out then sat
+        # unmanaged until the DAY order expired. Closes now leave the
+        # position in SPREAD_OPEN, so the orchestrator re-proposes every
+        # tick and the stale-replace re-prices after 15 min — the same
+        # contract single-leg wheel closes have always had. The reconciler's
+        # MULTI_LEG_CLOSE fill handler sets SPREAD_CLOSED unconditionally,
+        # so it never needed the PENDING hop.
+        if proposal.order_type == OrderType.MULTI_LEG_OPEN:
+            await self._upsert_position_spread_pending(proposal, placed)
         return RouteResult(
             proposal=proposal,
             placed=placed,

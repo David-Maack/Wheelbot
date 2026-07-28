@@ -28,6 +28,19 @@ def _utc():
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def _no_ks_repos(armed: bool = False, reason: str | None = None):
+    """Repos stub for the 2026-07-23 roll kill-switch gate: daily_state.get
+    returns None (no row) or an armed row."""
+    from types import SimpleNamespace
+
+    async def _get(account_id, snapshot_date):
+        if not armed:
+            return None
+        return SimpleNamespace(kill_switch_armed=True,
+                               kill_switch_reason=reason or "test trip")
+    return SimpleNamespace(daily_state=SimpleNamespace(get=_get))
+
+
 def _short_contract():
     return OptionContract(
         underlying="F",
@@ -105,7 +118,7 @@ async def test_roll_executes_btc_then_sto():
         reason="rule_only",
     )
     await _execute_roll_action(
-        router=router, outcome=outcome,
+        router=router, repos=_no_ks_repos(), config={}, outcome=outcome,
         position=_position(), short=_short_order(), short_contract=_short_contract(),
     )
     assert router.calls == [
@@ -125,7 +138,7 @@ async def test_close_executes_btc_only():
         reason="rule_only",
     )
     await _execute_roll_action(
-        router=router, outcome=outcome,
+        router=router, repos=_no_ks_repos(), config={}, outcome=outcome,
         position=_position(), short=_short_order(), short_contract=_short_contract(),
     )
     assert router.calls == [("BUY_TO_CLOSE", "F250706P00009500")]
@@ -142,7 +155,7 @@ async def test_let_assign_is_a_noop():
         reason="rule_only",
     )
     await _execute_roll_action(
-        router=router, outcome=outcome,
+        router=router, repos=_no_ks_repos(), config={}, outcome=outcome,
         position=_position(), short=_short_order(), short_contract=_short_contract(),
     )
     assert router.calls == []
@@ -174,7 +187,7 @@ async def test_btc_router_failure_aborts_sto():
         reason="rule_only",
     )
     await _execute_roll_action(
-        router=router, outcome=outcome,  # type: ignore[arg-type]
+        router=router, repos=_no_ks_repos(), config={}, outcome=outcome,  # type: ignore[arg-type]
         position=_position(), short=_short_order(), short_contract=_short_contract(),
     )
     assert router.calls == ["BUY_TO_CLOSE"]  # STO not reached
@@ -207,7 +220,7 @@ async def test_quantity_propagates_from_short_order():
             return SimpleNamespace(placed=SimpleNamespace())
 
     await _execute_roll_action(
-        router=_Capture(), outcome=outcome,  # type: ignore[arg-type]
+        router=_Capture(), repos=_no_ks_repos(), config={}, outcome=outcome,  # type: ignore[arg-type]
         position=_position(), short=_short_order(qty=3), short_contract=_short_contract(),
     )
     assert captured == [3, 3]
@@ -241,8 +254,32 @@ async def test_strategy_id_propagates_from_position():
             return SimpleNamespace(placed=SimpleNamespace())
 
     await _execute_roll_action(
-        router=_Capture(), outcome=outcome,  # type: ignore[arg-type]
+        router=_Capture(), repos=_no_ks_repos(), config={}, outcome=outcome,  # type: ignore[arg-type]
         position=_position(strategy_id="put_spread"),
         short=_short_order(), short_contract=_short_contract(),
     )
     assert captured == ["put_spread", "put_spread"]
+
+
+@pytest.mark.asyncio
+async def test_roll_sto_skipped_when_kill_switch_armed():
+    """2026-07-23 review fix: the roll path runs inside reconcile, BEFORE the
+    tick's kill-switch gate — it must check for itself. BTC (risk-reducing)
+    still places; the NEW short does not."""
+    router = _StubRouter()
+    outcome = RollOutcome(
+        action=RollAction.ROLL,
+        rule=RollDecision(
+            action=RollAction.ROLL, rationale="credit roll",
+            new_contract=_new_contract(), expected_credit_per_share=0.10,
+        ),
+        llm=None,
+        halted=False,
+        reason="rule_only",
+    )
+    await _execute_roll_action(
+        router=router, repos=_no_ks_repos(armed=True, reason="daily drawdown 6% > 5%"),
+        config={}, outcome=outcome,
+        position=_position(), short=_short_order(), short_contract=_short_contract(),
+    )
+    assert router.calls == [("BUY_TO_CLOSE", "F250706P00009500")]  # no STO

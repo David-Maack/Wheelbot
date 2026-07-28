@@ -204,6 +204,8 @@ async def _make_roll_evaluator(
         if router is not None and outcome.action is not None and not outcome.halted:
             await _execute_roll_action(
                 router=router,
+                repos=repos,
+                config=config,
                 outcome=outcome,
                 position=position,
                 short=short,
@@ -217,12 +219,21 @@ async def _make_roll_evaluator(
 async def _execute_roll_action(
     *,
     router: OrderRouter,
+    repos: Repos,
+    config: dict[str, Any],
     outcome,
     position: Position,
     short: Order,
     short_contract,
 ):
-    """Place the BTC (and optional STO) implied by the roll outcome."""
+    """Place the BTC (and optional STO) implied by the roll outcome.
+
+    2026-07-23 review fix: the roll evaluator runs INSIDE reconcile_once,
+    BEFORE loop.tick() checks the kill switch — so this path used to open a
+    brand-new short (the STO leg) while trading was supposed to be halted.
+    The BTC leg is always allowed (risk-reducing); the STO leg now checks
+    the stop file + the (Sprint-9-latched) daily_state armed flag itself.
+    """
     from strategies.roll_advisor import RollAction
     from strategies.wheel import Proposal
 
@@ -252,6 +263,27 @@ async def _execute_roll_action(
             return
 
     if outcome.action == RollAction.ROLL and outcome.rule and outcome.rule.new_contract:
+        ks_reason: str | None = None
+        risk_cfg = config.get("risk", {}) or {}
+        stop_file = risk_cfg.get("stop_file_path")
+        if stop_file and Path(stop_file).expanduser().exists():
+            ks_reason = f"stop file present: {stop_file}"
+        else:
+            account_id = (config.get("account") or {}).get("id", "primary")
+            row = await repos.daily_state.get(account_id, datetime.now(UTC).date())
+            if row is not None and row.kill_switch_armed:
+                ks_reason = row.kill_switch_reason or "kill switch armed"
+        if ks_reason:
+            log_checkpoint(
+                "roll_sto_skipped_kill_switch",
+                status="skip",
+                symbol=position.symbol,
+                strategy=position.strategy_id,
+                reason=ks_reason,
+                note="BTC leg placed; new short NOT opened while halted",
+            )
+            return
+
         sto = Proposal(
             symbol=position.symbol,
             contract=outcome.rule.new_contract,

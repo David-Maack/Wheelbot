@@ -1211,3 +1211,87 @@ async def test_pmcc_full_pnl_across_long_and_shorts(db_repos):
     pnl = await rec._compute_cycle_pnl(cycle_id)
     # -500 + 100 - 40 + 650 = +210
     assert pnl == pytest.approx(210.0)
+
+
+# -- strategy-scoped share inference (2026-07-23 review fix) -------------------
+
+
+@pytest.mark.asyncio
+async def test_csp_shares_claimed_by_other_strategy_flags_not_assigns(db_repos):
+    """monthly_wheel holds shares; weekly_wheel's CSP on the same symbol sees
+    those shares at the broker. Pre-fix this booked a FALSE assignment into
+    the weekly cycle (phantom cost basis + synthetic BUY_TO_OPEN). Ambiguous
+    shares now go to MANUAL_INTERVENTION on the RIGHT strategy's row."""
+    broker = PaperBroker()
+    now = _utc()
+    # monthly_wheel legitimately holds 100 shares.
+    await db_repos.positions.insert(Position(
+        account_id="test", symbol="F", strategy_id="monthly_wheel",
+        state=PositionState.SHARES_HELD, shares=100, state_changed_at=now,
+    ))
+    # weekly_wheel has a CSP_OPEN on the same symbol.
+    cycle_id = await db_repos.cycles.insert(WheelCycle(
+        account_id="test", symbol="F", strategy_id="weekly_wheel",
+        started_at=now,
+    ))
+    weekly_id = await db_repos.positions.insert(Position(
+        account_id="test", symbol="F", strategy_id="weekly_wheel",
+        state=PositionState.CSP_OPEN, shares=0, current_cycle_id=cycle_id,
+        state_changed_at=now,
+    ))
+    weekly = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="weekly_wheel")
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    # Broker view: shares on the symbol, no short put.
+    broker_row = Position(
+        account_id="test", symbol="F", state=PositionState.SHARES_HELD,
+        shares=100, state_changed_at=now,
+    )
+    await rec._diff_one("F", weekly, [broker_row], summary)
+
+    weekly_after = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="weekly_wheel")
+    assert weekly_after.state == PositionState.MANUAL_INTERVENTION
+    assert weekly_after.id == weekly_id
+    # No false assignment: no shares booked, monthly row untouched.
+    assert weekly_after.shares == 0
+    monthly_after = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="monthly_wheel")
+    assert monthly_after.state == PositionState.SHARES_HELD
+
+
+@pytest.mark.asyncio
+async def test_csp_assignment_still_inferred_when_unambiguous(db_repos):
+    """Single strategy on the symbol -> the normal assignment inference stands."""
+    broker = PaperBroker()
+    now = _utc()
+    cycle_id = await db_repos.cycles.insert(WheelCycle(
+        account_id="test", symbol="F", strategy_id="monthly_wheel",
+        started_at=now, initial_csp_strike=9.5,
+    ))
+    await db_repos.orders.insert(Order(
+        account_id="test", symbol="F", strategy_id="monthly_wheel",
+        cycle_id=cycle_id, order_type=OrderType.SELL_TO_OPEN,
+        contract_symbol="F250706P00009500", strike=9.5,
+        expiration=date(2025, 7, 6), option_type=OptionType.PUT,
+        quantity=1, fill_price=0.50, status=OrderStatus.FILLED,
+        placed_at=now, client_order_id="csp-assign-test",
+    ))
+    await db_repos.positions.insert(Position(
+        account_id="test", symbol="F", strategy_id="monthly_wheel",
+        state=PositionState.CSP_OPEN, shares=0, current_cycle_id=cycle_id,
+        state_changed_at=now,
+    ))
+    local = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="monthly_wheel")
+    rec = Reconciler(broker, db_repos, _config())
+    summary = ReconcileSummary()
+    broker_row = Position(
+        account_id="test", symbol="F", state=PositionState.SHARES_HELD,
+        shares=100, state_changed_at=now,
+    )
+    await rec._diff_one("F", local, [broker_row], summary)
+    after = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="monthly_wheel")
+    assert after.state != PositionState.MANUAL_INTERVENTION  # assignment path ran

@@ -473,3 +473,29 @@ async def test_sweep_survives_broker_cancel_failure(db_repos):
     n = await router.cancel_stale_pending_opens()
     assert n == 1
     assert broker.cancelled == ["b-good"]
+
+
+# -- fresh client id after a terminal row (2026-07-23 review fix) --------------
+
+
+@pytest.mark.asyncio
+async def test_same_day_reentry_gets_fresh_client_id(db_repos):
+    """A terminal (FILLED/CANCELLED) row under the day-scoped id means that id
+    is spent at the broker — reusing it 422-rejected every same-day re-entry.
+    The router now mints a suffixed replacement id."""
+    broker = PaperBroker(cash=40_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    r1 = await router.place(_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert r1.placed is not None
+    first_id = r1.placed.client_order_id
+
+    # Mark the first order terminal + reset the position so a re-entry is legal.
+    first_row = await db_repos.orders.get_by_client_id(first_id)
+    await db_repos.orders.update(first_row.id, status="CANCELLED")
+    pos = await db_repos.positions.get_by_symbol("test", "F")
+    await db_repos.positions.update_state(pos.id, PositionState.IDLE, "test reset")
+
+    r2 = await router.place(_proposal(), sleep=_noop_sleep, today=date(2025, 6, 1))
+    assert r2.placed is not None
+    assert r2.placed.client_order_id != first_id
+    assert r2.placed.client_order_id.startswith(first_id)  # "-r<ts>" suffix

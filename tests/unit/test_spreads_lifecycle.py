@@ -302,11 +302,15 @@ async def test_reconciler_cancelled_open_drops_position_back_to_idle(db_repos):
 
 @pytest.mark.asyncio
 async def test_reconciler_cancelled_close_restores_spread_open(db_repos):
-    """MULTI_LEG_CLOSE cancelled at broker → return to SPREAD_OPEN (still hold legs).
+    """MULTI_LEG_CLOSE lifecycle keeps the position in SPREAD_OPEN throughout.
 
-    Regression for the live-bot NVDA situation: close attempt cancelled,
-    position stuck SPREAD_PENDING blocked the close orchestrator from
-    retrying — bot couldn't manage the spread for 4 days.
+    2026-07-23 review fix strengthened the original NVDA regression: a close
+    placement no longer moves the position to SPREAD_PENDING at all (the
+    close orchestrator only walks SPREAD_OPEN, so the PENDING hop dead-ended
+    a missed stop-out until the DAY order expired). The position stays
+    SPREAD_OPEN while the close works, so the orchestrator keeps
+    re-proposing and the pre-submission stale-replace re-prices; a cancelled
+    close therefore needs no restore.
     """
     broker = PaperBroker(cash=20_000)
     router = OrderRouter(broker, db_repos, _config(), _universe())
@@ -357,11 +361,17 @@ async def test_reconciler_cancelled_close_restores_spread_open(db_repos):
         close_proposal, sleep=_noop_sleep, today=date(2025, 6, 5),
     )
     assert close_result.placed is not None
+    # The close placement itself must NOT pend the position (the fix).
+    pos_mid = await db_repos.positions.get_by_symbol(
+        "test", "F", strategy_id="put_spread"
+    )
+    assert pos_mid.state == PositionState.SPREAD_OPEN
     await broker.cancel_order(close_result.placed.broker_order_id)
 
-    # 3. Reconcile → SPREAD_PENDING should restore to SPREAD_OPEN, cycle intact.
+    # 3. Reconcile → still SPREAD_OPEN, cycle intact; no restore was needed
+    # so the cancellation is a defensive no-op (counter stays 0).
     summary = await reconciler.reconcile_once()
-    assert summary.cancellations_processed == 1
+    assert summary.cancellations_processed == 0
     pos_after = await db_repos.positions.get_by_symbol(
         "test", "F", strategy_id="put_spread"
     )

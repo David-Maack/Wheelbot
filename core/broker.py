@@ -45,6 +45,13 @@ class BrokerUnavailable(BrokerError):
     """Transport/HTTP failure or auth problem. The router decides on retry."""
 
 
+class OrderNotCancelable(BrokerError):
+    """2026-07-23: the broker refused the cancel — the order is (or may be)
+    already filled/terminal. Callers must NOT mark the order cancelled
+    locally: swallowing this and writing CANCELLED let a fill that raced
+    the cancel become a permanently untracked position."""
+
+
 class Broker(ABC):
     """Async broker interface. See class docstring for usage rules."""
 
