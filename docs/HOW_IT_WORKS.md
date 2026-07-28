@@ -46,7 +46,9 @@ runs the same sequence:
    **position news sentry** (§6) covers *unscheduled* catalysts on the same
    cadence: an hourly Haiku read of each open position's headlines,
    notify-only.
-5. **Per strategy — manage, then maybe enter:**
+5. **Per strategy — manage, then maybe enter** (each strategy's pass is
+   exception-isolated: one strategy's data failure logs + notifies and the
+   loop moves on, so it can never skip another strategy's stops or closes):
    - **Closes, stops, and rolls run on EVERY tick for EVERY strategy**, even
      disabled or drawdown-paused ones. Disabling a strategy only stops new
      entries; it never orphans open positions.
@@ -62,7 +64,7 @@ strategy comes from `universe.yaml` plus the weekly watchlist overlay.
 |---|---|---|---|
 | `monthly_wheel` | 30–45 DTE cash-secured puts → assignment → covered calls | Cheap, ownable names; IVR ≥ 20 | 50% profit, DTE-21, 2× stop, Δ0.55 stop→roll |
 | `weekly_wheel` | 7–14 DTE CSPs, tighter deltas | High-IV liquid weeklies | 50% profit, 2× stop, Δ0.55 stop→close |
-| `put_spread` | 30–45 DTE bull put spreads, $5 wide, ≤$500 risk | Mega-caps, IVR ≥ 20 | 50% profit, DTE-21, 3× stop (was 2× — a paired backtest showed 58% of 2× stop-outs recovered by DTE-21) |
+| `put_spread` | 30–45 DTE bull put spreads, $5 wide, ≤$500 risk | Mega-caps, IVR ≥ 20 | 50% profit, DTE-21, 3× stop (was 2× — a paired backtest showed 58% of 2× stop-outs recovered by DTE-21). Spread close limits are **hard-clamped at the wing width** — a marketable close on blown-out quotes can never pay more than the structure's max settlement value |
 | `narrow_put_spread` | Same, $2 wide, ≤$250 risk | Low-price names ($15–40) | Same as put_spread |
 | `bear_call_spread` | 30–45 DTE bear call spreads | Weak tape (regime-gated) | 35% profit, DTE-21, 1.5× stop |
 | `iron_condor` | Both wings, Δ0.16 shorts, $5 wings | Range-bound, credit ≥ 30% of width | 25% profit, DTE-21 |
@@ -106,7 +108,7 @@ an open position.
 
 | Circuit | Trigger | Effect |
 |---|---|---|
-| Kill switch | −5% equity in a day, or losses streak, or STOP file | All new orders halt |
+| Kill switch | −5% equity in a day, or losses streak, or STOP file | All new orders halt. Automatic trips (drawdown/losses) **latch for the rest of the session** — an equity bounce back above the threshold does not re-enable trading; only the MCP `release_kill_switch` (or the day rolling over) clears the latch. Manual STOP-file trips release when the file is removed |
 | Drawdown breaker | Strategy's 7-day realized P&L ≤ −$300 | Strategy disabled 30 days (auto-clears; manual reenable available) |
 | Drawdown WARNING | 7-day P&L ≤ −$150 | New spreads at half size |
 | Win-rate floor | < 60% over last 10+ cycles | Strategy paused, **manual** reenable only |

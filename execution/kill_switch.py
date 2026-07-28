@@ -120,6 +120,19 @@ class KillSwitch:
         if losses >= max_losses:
             reasons.append(f"{losses} consecutive losing cycles >= {max_losses}")
 
+        # 2026-07-23 review fix: SESSION LATCH. Before this, tripped was
+        # recomputed fresh every tick — equity bouncing from -5.1% to -4.9%
+        # DISARMED the daily-loss stop mid-session and trading resumed. An
+        # automatic trip (drawdown / consecutive losses) now stays tripped
+        # for the rest of the snapshot_date. Manual stop-file trips are NOT
+        # latched — removing the file (scripts or MCP release_kill_switch)
+        # must release, and the MCP release also clears this latch so the
+        # operator always has the override.
+        if not reasons and anchor and anchor.kill_switch_armed:
+            prior = anchor.kill_switch_reason or ""
+            if "drawdown" in prior or "consecutive" in prior:
+                reasons.append(f"latched for the session: {prior}")
+
         # Persist arming state.
         if reasons or (anchor and anchor.kill_switch_armed):
             await self._repos.daily_state.upsert(

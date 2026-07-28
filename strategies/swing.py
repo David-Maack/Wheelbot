@@ -416,7 +416,12 @@ async def propose_all_swing_closes(
     if spot is None:
         return []
 
-    should_exit, reason = swing_exit_from_order(entry_order, float(spot), datetime.now(UTC), p)
+    # 2026-07-23 review fix: naive UTC, matching how entry_ts is persisted —
+    # an aware `now` here made the hold-time subtraction raise TypeError on
+    # every close pass, silently disabling stop/target/time exits.
+    should_exit, reason = swing_exit_from_order(
+        entry_order, float(spot), datetime.now(UTC).replace(tzinfo=None), p,
+    )
     if not should_exit:
         return []
 

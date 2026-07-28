@@ -489,6 +489,39 @@ async def propose_close_for_symbol(
             debit_to_close -= mid
             marketable_debit -= bid
 
+    # 2026-07-23 review fix: HARD CLAMP the close debit at the wing width. A
+    # marketable close (buy at ask, sell at bid) on wide quotes can price
+    # ABOVE the spread's width — TSLA 360/365 closed at a $6.09 debit on a
+    # $5 structure, realizing -$470 on a -$365 max-loss trade. Paying more
+    # than width is strictly irrational: width is the worst possible
+    # settlement value (for a condor, only one wing can finish ITM, so the
+    # wing width bounds it too). The router's close_slippage nickel can
+    # still ride on top — bounded overpay, vs the unbounded quote spread.
+    put_strikes = sorted(
+        float(ol.strike) for ol in close_legs
+        if str(ol.option_type) == OptionType.PUT.value
+    )
+    call_strikes = sorted(
+        float(ol.strike) for ol in close_legs
+        if str(ol.option_type) == OptionType.CALL.value
+    )
+    widths = []
+    if len(put_strikes) >= 2:
+        widths.append(put_strikes[-1] - put_strikes[0])
+    if len(call_strikes) >= 2:
+        widths.append(call_strikes[-1] - call_strikes[0])
+    max_close_debit = max(widths) if widths else None
+    if max_close_debit is not None and marketable_debit > max_close_debit:
+        log_checkpoint(
+            "spread_close_debit_clamped",
+            status="ok",
+            symbol=symbol,
+            strategy=strategy.id,
+            marketable_debit=round(marketable_debit, 2),
+            clamped_to=round(max_close_debit, 2),
+        )
+        marketable_debit = max_close_debit
+
     # Original credit collected per package = open_order.fill_price (signed).
     original_credit_per_share = open_order.fill_price or 0.0
     profit_close_pct = float(strategy.params.get("profit_close_pct", 50))

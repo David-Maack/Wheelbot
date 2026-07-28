@@ -548,8 +548,16 @@ class DailyStateRepo(_Repo):
             "ON CONFLICT(account_id, snapshot_date) DO UPDATE SET "
             " session_open_equity = COALESCE(excluded.session_open_equity, daily_state.session_open_equity), "
             " consecutive_losses = excluded.consecutive_losses, "
-            " kill_switch_armed = excluded.kill_switch_armed, "
-            " kill_switch_reason = excluded.kill_switch_reason",
+            # 2026-07-23 review fix: LATCH for the session. KillSwitch.check()
+            # re-upserts every tick with armed=bool(reasons); before this,
+            # equity bouncing from -5.1% to -4.9% DISARMED the daily-loss stop
+            # mid-session and trading resumed. Once armed for a snapshot_date,
+            # it stays armed (and keeps its first reason) until the date rolls
+            # or the operator releases via the stop-file/MCP path.
+            " kill_switch_armed = MAX(daily_state.kill_switch_armed,"
+            "                         excluded.kill_switch_armed), "
+            " kill_switch_reason = COALESCE(daily_state.kill_switch_reason,"
+            "                              excluded.kill_switch_reason)",
             (
                 entry.account_id,
                 entry.snapshot_date.isoformat(),
@@ -558,6 +566,20 @@ class DailyStateRepo(_Repo):
                 int(entry.kill_switch_armed),
                 entry.kill_switch_reason,
             ),
+        )
+        await c.commit()
+
+    async def clear_kill_switch_latch(
+        self, account_id: str, snapshot_date: date,
+    ) -> None:
+        """Operator override for the session latch (2026-07-23): the MAX()
+        latch in upsert means no ordinary write can un-arm — this is the one
+        explicit path (used by MCP release_kill_switch)."""
+        c = await self.db.connect()
+        await c.execute(
+            "UPDATE daily_state SET kill_switch_armed = 0, kill_switch_reason = NULL "
+            "WHERE account_id = ? AND snapshot_date = ?",
+            (account_id, snapshot_date.isoformat()),
         )
         await c.commit()
 

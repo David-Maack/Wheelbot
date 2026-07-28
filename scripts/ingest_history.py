@@ -79,12 +79,29 @@ def _realized_vol_from_yfinance(symbol: str, end: date, window_days: int = 30) -
     except ImportError:
         log_checkpoint("ingest_yfinance_missing", status="fail")
         return None
+    from data.yf_helpers import flatten_yf_columns
+
     # yfinance is patchy — pull a slightly larger buffer to ensure window_days closes.
     start = end - timedelta(days=window_days * 3)
-    df = yf.download(symbol, start=start.isoformat(), end=end.isoformat(), progress=False)
-    if df is None or df.empty or "Close" not in df.columns:
+    # 2026-07-23 review fix: this was the ONE yfinance caller bypassing the
+    # yf_helpers defenses. Current yfinance returns MultiIndex columns for
+    # single-ticker downloads, making df["Close"] a DataFrame — .apply(math.log)
+    # then raised and the iv_history feed silently stopped accumulating
+    # (IVR gates skip on thin data, so the failure was invisible).
+    try:
+        df = yf.download(symbol, start=start.isoformat(), end=end.isoformat(),
+                         progress=False, auto_adjust=False)
+    except Exception as exc:  # noqa: BLE001 — one bad symbol must not kill the run
+        log_checkpoint("ingest_yf_fail", status="fail", symbol=symbol, error=str(exc))
         return None
-    closes = df["Close"].dropna().tail(window_days + 1)
+    df = flatten_yf_columns(df)
+    if df is None or df.empty or "Close" not in df.columns:
+        log_checkpoint("ingest_yf_empty", status="skip", symbol=symbol)
+        return None
+    closes = df["Close"]
+    if hasattr(closes, "columns"):  # duplicate flat columns → take the first
+        closes = closes.iloc[:, 0]
+    closes = closes.dropna().tail(window_days + 1)
     if len(closes) < window_days // 2:
         return None
     log_returns = (closes / closes.shift(1)).dropna().apply(math.log)
@@ -115,7 +132,9 @@ async def _ingest_realized_source(
     repos_db: Database, symbols: list[str], backfill_days: int
 ) -> int:
     repo = IvHistoryRepo(repos_db)
-    today = date.today()
+    # 2026-07-23 review fix: UTC date, matching _ingest_broker_source — the
+    # local (MDT) date raced the UNIQUE(symbol, snapshot_date) key after 18:00.
+    today = datetime.now(UTC).date()
     written = 0
     for symbol in symbols:
         with checkpoint("ingest_iv_realized", symbol=symbol) as ctx:

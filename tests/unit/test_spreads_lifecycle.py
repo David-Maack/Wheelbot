@@ -905,3 +905,33 @@ async def test_router_stamps_width_dollars_onto_raw_request(db_repos):
     assert persisted is not None
     assert persisted.raw_request is not None
     assert persisted.raw_request.get("width_dollars") == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_close_debit_clamped_at_wing_width(db_repos):
+    """2026-07-23 review fix: a marketable close on blown-out quotes must
+    never pay more than the wing width — TSLA 360/365 closed at a $6.09
+    debit on a $5 structure (-$470 realized vs -$365 theoretical max)."""
+    broker = PaperBroker(cash=20_000)
+    router = OrderRouter(broker, db_repos, _config(), _universe())
+    open_result = await router.place_multi_leg(
+        _spread_proposal(qty=1), sleep=_noop_sleep, today=date(2025, 6, 1),
+    )
+    await broker.fill_multi_leg(open_result.placed.broker_order_id, fill_price=0.30)
+    reconciler = Reconciler(broker, db_repos, _config())
+    await reconciler.reconcile_once()
+
+    # $1-wide 10/9 put spread. Quotes blown out: marketable debit would be
+    # ask(short) - bid(long) = 1.40 - 0.10 = 1.30 > width 1.00.
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=1.30, ask=1.40))
+    broker.seed_quote(Quote(symbol="F250706P00009000", bid=0.10, ask=0.12))
+
+    proposal = await propose_close_for_symbol(
+        broker, db_repos, "F", _config(),
+        today=date(2025, 6, 10),
+        strategy=_strategy(stop_loss_mult=2.0),
+    )
+    assert proposal is not None
+    assert "stop_loss" in proposal.rationale
+    # Clamped to the width, not the 1.30 marketable debit.
+    assert proposal.net_credit_per_spread == pytest.approx(-1.0)

@@ -60,7 +60,15 @@ async def test_run_regime_veto_stamps_snapshot(db_repos, monkeypatch):
 
     class _StubClient:
         async def call(self, **kwargs):
-            return {"veto": True, "reason": "bank failure in headlines"}
+            # 2026-07-23 review fix: the stub MUST return the real client's
+            # envelope shape ({"parsed": {...}, ...}). The old unwrapped-dict
+            # stub is exactly what let the envelope-vs-parsed bug ship — the
+            # veto was structurally dead in production while this test passed.
+            return {
+                "parsed": {"veto": True, "reason": "bank failure in headlines"},
+                "decision_id": 1, "raw_text": "{}", "tokens_in": 100,
+                "tokens_out": 20, "cost_usd": 0.001,
+            }
 
     verdict = await run_regime_veto(db_repos, {"intelligence": {}}, _StubClient(), today=today)
     assert verdict is True

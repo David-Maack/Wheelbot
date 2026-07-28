@@ -126,7 +126,12 @@ async def run_regime_veto(repos, config: dict[str, Any], client, *, today: date 
             user_payload=build_dossier(snap, events, headlines),
             max_output_tokens=200,
         )
-        veto, reason = parse_veto(result)
+        # 2026-07-23 review fix: parse_veto takes the PARSED payload, not the
+        # client's envelope ({"decision_id", "parsed", "raw_text", ...}). The
+        # envelope was being passed since arming (2026-07-01), so
+        # parsed.get("veto") was always None and the veto NEVER fired —
+        # masked by a test stub that returned the unwrapped dict.
+        veto, reason = parse_veto(result["parsed"])
         c = await repos.db.connect()
         await c.execute(
             "UPDATE regime_snapshots SET llm_risk_veto = ?, llm_veto_reason = ? "

@@ -357,14 +357,21 @@ class WheelbotMcpService:
         return {"ok": True, "kill_switch": "ENGAGED", "stop_file": str(sf), "reason": reason}
 
     async def release_kill_switch(self) -> dict:
-        """Release the global kill switch (remove the stop file)."""
+        """Release the global kill switch (remove the stop file AND clear the
+        session latch — 2026-07-23: automatic drawdown/consecutive-loss trips
+        latch for the day; this is the operator's explicit un-latch path)."""
         self._require_controls("release_kill_switch")
         sf = self._stop_file()
         existed = sf.exists()
         if existed:
             sf.unlink()
-        self._audit("release_kill_switch", stop_file=str(sf), existed=existed)
-        return {"ok": True, "kill_switch": "RELEASED", "stop_file": str(sf), "was_engaged": existed}
+        await self._repos.daily_state.clear_kill_switch_latch(
+            self._account_id, datetime.now(UTC).date(),
+        )
+        self._audit("release_kill_switch", stop_file=str(sf), existed=existed,
+                    latch_cleared=True)
+        return {"ok": True, "kill_switch": "RELEASED", "stop_file": str(sf),
+                "was_engaged": existed, "latch_cleared": True}
 
     async def refresh_macro_calendar(self) -> dict:
         """Refresh the macro-event calendar now (idempotent; clears the stale alert)."""

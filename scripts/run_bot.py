@@ -58,7 +58,7 @@ from core.checkpoint import log_checkpoint
 from core.config import load_config, load_universe
 from core.logs import setup_logging
 from core.models import OptionType, Order, OrderType, Position
-from core.notify import make_notifier, set_dispatcher
+from core.notify import make_notifier, notify, set_dispatcher
 from core.strategies import StrategyDefinition, load_strategies, universe_for_strategy
 from core.watchlists import effective_universe
 from data.ivr import IVRProvider
@@ -375,99 +375,124 @@ async def _propose_and_route(
                 strategy=strategy.id,
             )
             opens_allowed = False
-        if strategy.type == "wheel":
-            # Profit-closes first — free up capital before considering new entries.
-            # Closes are unaffected by drawdown WARNING; only new entries scale.
-            close_proposals = await propose_all_wheel_closes(
-                broker, repos, config, strategy=strategy,
-                delta_unavailable_counters=delta_unavailable_counters,
-            )
-            open_proposals = []
-            if opens_allowed:
-                open_proposals = await propose_all(
-                    broker, repos, config, strategy_universe, ivr, strategy=strategy,
-                    size_multiplier=size_multiplier,
+        # 2026-07-23 review fix: EXCEPTION-ISOLATE the per-strategy dispatch.
+        # A single unwrapped raiser (e.g. broker.get_option_chain inside one
+        # strategy's open pass) used to abort the whole tick — skipping every
+        # DOWNSTREAM strategy's stops, force-closes, and rolls (swing is last
+        # in config order, so it lost the most). One strategy's failure now
+        # logs + notifies and the loop moves on.
+        try:
+            if strategy.type == "wheel":
+                # Profit-closes first — free up capital before considering new
+                # entries. Closes are unaffected by drawdown WARNING; only new
+                # entries scale.
+                close_proposals = await propose_all_wheel_closes(
+                    broker, repos, config, strategy=strategy,
+                    delta_unavailable_counters=delta_unavailable_counters,
                 )
-            proposals = close_proposals + open_proposals
-        elif strategy.type == "vertical_spread":
-            # Closes first — free up capital before considering new entries.
-            close_proposals = await propose_all_spread_closes(
-                broker, repos, config, strategy=strategy,
-            )
-            open_proposals = []
-            if opens_allowed:
-                open_proposals = await propose_all_spreads(
-                    broker, repos, config, strategy_universe,
-                    strategy=strategy, ivr=ivr,
-                    size_multiplier=size_multiplier,
+                open_proposals = []
+                if opens_allowed:
+                    open_proposals = await propose_all(
+                        broker, repos, config, strategy_universe, ivr, strategy=strategy,
+                        size_multiplier=size_multiplier,
+                    )
+                proposals = close_proposals + open_proposals
+            elif strategy.type == "vertical_spread":
+                # Closes first — free up capital before considering new entries.
+                close_proposals = await propose_all_spread_closes(
+                    broker, repos, config, strategy=strategy,
                 )
-            proposals = close_proposals + open_proposals
-        elif strategy.type == "iron_condor":
-            # TICKET-014: closes reuse propose_all_spread_closes — the close
-            # orchestrator detects iron_condor by strategy.id and tags
-            # rationale + direction correctly (precursor fix #3). Opens go
-            # through the dedicated iron_condor selector.
-            close_proposals = await propose_all_spread_closes(
-                broker, repos, config, strategy=strategy,
-            )
-            open_proposals = []
-            if opens_allowed:
-                open_proposals = await propose_all_iron_condor(
-                    broker, repos, config, strategy_universe,
-                    strategy=strategy, ivr=ivr,
-                    size_multiplier=size_multiplier,
+                open_proposals = []
+                if opens_allowed:
+                    open_proposals = await propose_all_spreads(
+                        broker, repos, config, strategy_universe,
+                        strategy=strategy, ivr=ivr,
+                        size_multiplier=size_multiplier,
+                    )
+                proposals = close_proposals + open_proposals
+            elif strategy.type == "iron_condor":
+                # TICKET-014: closes reuse propose_all_spread_closes — the close
+                # orchestrator detects iron_condor by strategy.id and tags
+                # rationale + direction correctly (precursor fix #3). Opens go
+                # through the dedicated iron_condor selector.
+                close_proposals = await propose_all_spread_closes(
+                    broker, repos, config, strategy=strategy,
                 )
-            proposals = close_proposals + open_proposals
-        elif strategy.type == "pmcc":
-            # TICKET-015: PMCC. Closes first (short profit/time, long roll),
-            # then opens (long when IDLE, short when LONG_OPEN). All single-leg
-            # Proposals routed via place(). size_multiplier does not apply —
-            # PMCC is sized at 1 long + 1 short per position.
-            close_proposals = await propose_all_pmcc_closes(
-                broker, repos, config, strategy=strategy,
-            )
-            open_proposals = []
-            if opens_allowed:
-                open_proposals = await propose_all_pmcc(
-                    broker, repos, config, strategy_universe,
-                    strategy=strategy, ivr=ivr,
+                open_proposals = []
+                if opens_allowed:
+                    open_proposals = await propose_all_iron_condor(
+                        broker, repos, config, strategy_universe,
+                        strategy=strategy, ivr=ivr,
+                        size_multiplier=size_multiplier,
+                    )
+                proposals = close_proposals + open_proposals
+            elif strategy.type == "pmcc":
+                # TICKET-015: PMCC. Closes first (short profit/time, long roll),
+                # then opens (long when IDLE, short when LONG_OPEN). All single-leg
+                # Proposals routed via place(). size_multiplier does not apply —
+                # PMCC is sized at 1 long + 1 short per position.
+                close_proposals = await propose_all_pmcc_closes(
+                    broker, repos, config, strategy=strategy,
                 )
-            proposals = close_proposals + open_proposals
-        elif strategy.type == "calendar":
-            # TICKET-016: Calendar. 2-leg MLEG (same strike, two expirations),
-            # net DEBIT. Closes first (25% profit / 2-DTE force-close), then
-            # opens (ATM, INVERTED IVR gate — enter only on LOW IV). Both are
-            # MultiLegProposals → place_multi_leg. size_multiplier N/A.
-            close_proposals = await propose_all_calendar_closes(
-                broker, repos, config, strategy=strategy,
-            )
-            open_proposals = []
-            if opens_allowed:
-                open_proposals = await propose_all_calendar(
-                    broker, repos, config, strategy_universe,
-                    strategy=strategy, ivr=ivr,
+                open_proposals = []
+                if opens_allowed:
+                    open_proposals = await propose_all_pmcc(
+                        broker, repos, config, strategy_universe,
+                        strategy=strategy, ivr=ivr,
+                    )
+                proposals = close_proposals + open_proposals
+            elif strategy.type == "calendar":
+                # TICKET-016: Calendar. 2-leg MLEG (same strike, two expirations),
+                # net DEBIT. Closes first (25% profit / 2-DTE force-close), then
+                # opens (ATM, INVERTED IVR gate — enter only on LOW IV). Both are
+                # MultiLegProposals → place_multi_leg. size_multiplier N/A.
+                close_proposals = await propose_all_calendar_closes(
+                    broker, repos, config, strategy=strategy,
                 )
-            proposals = close_proposals + open_proposals
-        elif strategy.type == "swing":
-            # Directional SPY swing (sub-sprint 2.1: DRY-RUN — evaluates and logs
-            # the live signal, places nothing. 2.2 adds deep-ITM long-option entry).
-            close_proposals = await propose_all_swing_closes(
-                broker, repos, config, strategy=strategy,
-            )
-            open_proposals = []
-            if opens_allowed:
-                open_proposals = await propose_all_swings(
-                    broker, repos, config, strategy_universe,
-                    strategy=strategy, size_multiplier=size_multiplier,
+                open_proposals = []
+                if opens_allowed:
+                    open_proposals = await propose_all_calendar(
+                        broker, repos, config, strategy_universe,
+                        strategy=strategy, ivr=ivr,
+                    )
+                proposals = close_proposals + open_proposals
+            elif strategy.type == "swing":
+                # Directional SPY swing (sub-sprint 2.1: DRY-RUN — evaluates and logs
+                # the live signal, places nothing. 2.2 adds deep-ITM long-option entry).
+                close_proposals = await propose_all_swing_closes(
+                    broker, repos, config, strategy=strategy,
                 )
-            proposals = close_proposals + open_proposals
-        else:
+                open_proposals = []
+                if opens_allowed:
+                    open_proposals = await propose_all_swings(
+                        broker, repos, config, strategy_universe,
+                        strategy=strategy, size_multiplier=size_multiplier,
+                    )
+                proposals = close_proposals + open_proposals
+            else:
+                log_checkpoint(
+                    "bot_strategy_unknown_type",
+                    status="fail",
+                    strategy=strategy.id,
+                    type=strategy.type,
+                )
+                continue
+        except Exception as exc:  # noqa: BLE001 — isolate; see comment above
             log_checkpoint(
-                "bot_strategy_unknown_type",
+                "bot_strategy_exception",
                 status="fail",
                 strategy=strategy.id,
-                type=strategy.type,
+                error=f"{type(exc).__name__}: {exc}",
             )
+            try:
+                await notify(
+                    "bot.strategy_exception",
+                    f"{strategy.id} propose pass raised — other strategies unaffected",
+                    strategy=strategy.id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:  # noqa: BLE001 — never let notify break isolation
+                pass
             continue
 
         placed = 0

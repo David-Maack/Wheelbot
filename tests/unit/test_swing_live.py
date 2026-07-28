@@ -240,3 +240,61 @@ def test_swing_exit_from_order_reads_anchors():
     # 8 days held → time stop.
     later = datetime(2026, 7, 2, tzinfo=UTC).replace(tzinfo=None)
     assert swing_exit_from_order(o, 600.0, later, {}) == (True, "swing_time_stop")
+
+
+# -- close orchestrator end-to-end (2026-07-23 review fix) ---------------------
+
+
+@pytest.mark.asyncio
+async def test_swing_close_stop_fires_end_to_end(db_repos):
+    """Regression for the aware/naive datetime bug: with entry_ts persisted
+    (naive UTC), the close pass used to raise TypeError on the hold-time
+    subtraction and NO exit ever evaluated. This walks the real orchestrator:
+    SWING_OPEN + stop breached -> SELL_TO_CLOSE proposal."""
+    from datetime import UTC, date, datetime, timedelta
+    from core.models import (Order, OrderStatus, OrderType, OptionType,
+                             Position, PositionState, Quote, WheelCycle)
+    from core.strategies import StrategyDefinition
+    from platforms.paper_broker import PaperBroker
+    from strategies.swing import propose_all_swing_closes
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cycle_id = await db_repos.cycles.insert(
+        WheelCycle(account_id="test", symbol="SPY", strategy_id="spy_swing_opt",
+                   started_at=now - timedelta(days=2))
+    )
+    exp = date.today() + timedelta(days=55)
+    await db_repos.orders.insert(Order(
+        account_id="test", symbol="SPY", strategy_id="spy_swing_opt",
+        cycle_id=cycle_id, order_type=OrderType.BUY_TO_OPEN,
+        contract_symbol="SPY261016C00450000", strike=450.0, expiration=exp,
+        option_type=OptionType.CALL, quantity=1, fill_price=15.0,
+        status=OrderStatus.FILLED, placed_at=now - timedelta(days=2),
+        client_order_id="swing-entry-1",
+        raw_request={"swing": {
+            "direction": 1, "stop_px": 480.0, "target_px": 520.0,
+            "entry_date": (now - timedelta(days=2)).date().isoformat(),
+            # entry_ts persisted NAIVE, as build_swing_entry writes it.
+            "entry_ts": (now - timedelta(days=2)).isoformat(),
+        }},
+    ))
+    await db_repos.positions.insert(Position(
+        account_id="test", symbol="SPY", strategy_id="spy_swing_opt",
+        state=PositionState.SWING_OPEN, shares=0, current_cycle_id=cycle_id,
+        state_changed_at=now,
+    ))
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="SPY", bid=469.9, ask=470.1))  # below 480 stop
+    broker.seed_quote(Quote(symbol="SPY261016C00450000", bid=21.0, ask=21.6))
+
+    strategy = StrategyDefinition(
+        id="spy_swing_opt", display_name="Swing", type="swing", enabled=True,
+        max_concurrent=1, params={"symbol": "SPY", "dry_run": False,
+                                  "min_hold_days": 1, "max_hold_days": 7},
+    )
+    proposals = await propose_all_swing_closes(
+        broker, db_repos, {"account": {"id": "test"}}, strategy=strategy,
+    )
+    assert len(proposals) == 1
+    assert proposals[0].order_type == OrderType.SELL_TO_CLOSE
+    assert "stop" in (proposals[0].trigger_reason or proposals[0].rationale)

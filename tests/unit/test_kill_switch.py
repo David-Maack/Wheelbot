@@ -132,3 +132,52 @@ async def test_stop_file_trips_kill_switch(db_repos, tmp_path):
     result = await ks.check(today=date(2025, 6, 1))
     assert result.tripped is True
     assert any("manual stop" in r for r in result.reasons)
+
+
+# -- session latch (2026-07-23 review fix) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_daily_loss_latch_survives_equity_recovery(db_repos):
+    """Pre-fix: equity bouncing from -6% to -1% DISARMED the switch next tick
+    and trading resumed mid-session. Automatic trips now latch for the day."""
+    broker = PaperBroker(cash=10_000)
+    ks = KillSwitch(broker, db_repos, _config())
+    d = date(2025, 6, 1)
+    await ks.prime_session(today=d)
+    broker._cash = 9_400  # -6% > 5% threshold
+    assert (await ks.check(today=d)).tripped is True
+    broker._cash = 9_900  # recovered to -1%
+    result = await ks.check(today=d)
+    assert result.tripped is True
+    assert any("latched" in r for r in result.reasons)
+
+
+@pytest.mark.asyncio
+async def test_latch_cleared_by_operator_release(db_repos):
+    broker = PaperBroker(cash=10_000)
+    ks = KillSwitch(broker, db_repos, _config())
+    d = date(2025, 6, 1)
+    await ks.prime_session(today=d)
+    broker._cash = 9_400
+    assert (await ks.check(today=d)).tripped is True
+    broker._cash = 9_900
+    await db_repos.daily_state.clear_kill_switch_latch("test", d)
+    result = await ks.check(today=d)
+    assert result.tripped is False
+
+
+@pytest.mark.asyncio
+async def test_stop_file_trip_does_not_latch(db_repos, tmp_path):
+    """Manual stop-file trips must NOT latch — removing the file releases
+    (the MCP release path depends on this)."""
+    broker = PaperBroker(cash=10_000)
+    stop = tmp_path / "STOP"
+    stop.write_text("halt")
+    ks = KillSwitch(broker, db_repos, _config(stop_path=str(stop)))
+    d = date(2025, 6, 1)
+    await ks.prime_session(today=d)
+    assert (await ks.check(today=d)).tripped is True
+    stop.unlink()
+    result = await ks.check(today=d)
+    assert result.tripped is False
