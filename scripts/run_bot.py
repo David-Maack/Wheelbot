@@ -87,6 +87,10 @@ from strategies.spreads import (
 )
 from risk import auto_disable, expectancy_floor, win_rate_floor
 from strategies.swing import propose_all_swing_closes, propose_all_swings
+from strategies.zero_dte import (
+    propose_all as propose_all_zero_dte,
+    propose_all_closes as propose_all_zero_dte_closes,
+)
 from strategies.wheel import propose_all
 from strategies.wheel_close import propose_all_closes as propose_all_wheel_closes
 
@@ -486,6 +490,24 @@ async def _propose_and_route(
                     open_proposals = await propose_all_calendar(
                         broker, repos, config, strategy_universe,
                         strategy=strategy, ivr=ivr,
+                    )
+                proposals = close_proposals + open_proposals
+            elif strategy.type == "zero_dte":
+                # 0DTE paper test (docs/research/0dte_research_2026-07.md).
+                # Closes FIRST and unconditionally — the 15:00 ET hard flatten
+                # must fire even when opens are gated (Alpaca rejects expiry-
+                # day option orders after ~15:15/15:30 ET and force-liquidates
+                # at 15:30/15:45). Opens are additionally gated inside the
+                # module by the 10:00-10:15 ET entry window, max-positions-
+                # per-day, and the strategy's own penalized daily loss cap.
+                close_proposals = await propose_all_zero_dte_closes(
+                    broker, repos, config, strategy=strategy,
+                )
+                open_proposals = []
+                if opens_allowed:
+                    open_proposals = await propose_all_zero_dte(
+                        broker, repos, config, strategy_universe,
+                        strategy=strategy, size_multiplier=size_multiplier,
                     )
                 proposals = close_proposals + open_proposals
             elif strategy.type == "swing":

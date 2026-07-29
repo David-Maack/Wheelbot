@@ -403,6 +403,20 @@ class WheelCyclesRepo(_Repo):
         )
         return [WheelCycle(**r) for r in rows]
 
+    async def count_started_on(
+        self, account_id: str, strategy_id: str, day: date,
+    ) -> int:
+        """Number of cycles a strategy STARTED on `day` (open or closed).
+        0DTE sprint: enforces zero_dte's max_positions_per_day — a cycle is
+        created on fill, so proposed-but-unfilled entries don't count (the
+        position-state gate covers those)."""
+        row = await self._fetch_one(
+            "SELECT COUNT(*) AS n FROM wheel_cycles "
+            "WHERE account_id = ? AND strategy_id = ? AND date(started_at) = ?",
+            (account_id, strategy_id, day.isoformat()),
+        )
+        return int(row["n"]) if row else 0
+
     async def insert(self, cycle: WheelCycle) -> int:
         return await self._insert(self._serialize(cycle))
 
@@ -1118,6 +1132,45 @@ class WatchlistsRepo(_Repo):
         await self._update(run_id, {"status": status})
 
 
+class ZeroDteLedgerRepo(_Repo):
+    """0DTE dual-ledger (migration 015) — raw vs slippage-penalized P&L per
+    zero_dte package. Written from strategies/zero_dte.py's propose paths at
+    proposal time (phase 2 reconciles against actual broker fills)."""
+
+    table = "zero_dte_ledger"
+
+    async def insert_entry(self, data: dict[str, Any]) -> int:
+        return await self._insert(data)
+
+    async def latest_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        """Most recent ledger row for a symbol (open or closed). The close
+        path updates this row with exit figures — a re-proposed close simply
+        refreshes the exit columns with the latest quotes."""
+        return await self._fetch_one(
+            "SELECT * FROM zero_dte_ledger WHERE symbol = ? ORDER BY id DESC LIMIT 1",
+            (symbol,),
+        )
+
+    async def record_exit(self, row_id: int, **fields: Any) -> None:
+        await self._update(row_id, fields)
+
+    async def realized_pnl_on(self, day: date) -> float:
+        """Sum of PENALIZED P&L realized (exit recorded) on `day`. Feeds the
+        zero_dte daily loss cap — penalized, not raw, so the cap trips on the
+        honest number."""
+        row = await self._fetch_one(
+            "SELECT COALESCE(SUM(pnl_penalized), 0.0) AS total FROM zero_dte_ledger "
+            "WHERE exit_ts IS NOT NULL AND date(exit_ts) = ?",
+            (day.isoformat(),),
+        )
+        return float(row["total"]) if row else 0.0
+
+    async def list_recent(self, limit: int = 100) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            "SELECT * FROM zero_dte_ledger ORDER BY id DESC LIMIT ?", (limit,)
+        )
+
+
 class Repos:
     """Convenience bundle so callers can pass a single object."""
 
@@ -1138,3 +1191,4 @@ class Repos:
         self.alert_rate_limits = AlertRateLimitsRepo(db)
         self.broker_parity_log = BrokerParityLogRepo(db)
         self.watchlists = WatchlistsRepo(db)
+        self.zero_dte_ledger = ZeroDteLedgerRepo(db)

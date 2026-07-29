@@ -301,3 +301,33 @@ CREATE TABLE IF NOT EXISTS watchlist_entries (
     UNIQUE(run_id, strategy_id, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_watchlist_entries_run ON watchlist_entries(run_id);
+
+-- 0DTE dual-ledger (migration 015). Alpaca paper fills are systematically
+-- optimistic for a 0DTE premium seller (no slippage, NBBO touch fills — see
+-- docs/research/0dte_research_2026-07.md §4.1), so every zero_dte trade
+-- records BOTH raw and penalized figures: penalized concedes half the summed
+-- leg bid-ask spreads on each side, plus stop_slippage_adder on forced
+-- flatten exits. Go/no-go reads pnl_penalized only. Rows are written at
+-- proposal time; reconciling against actual fills is phase 2.
+CREATE TABLE IF NOT EXISTS zero_dte_ledger (
+    id                          INTEGER PRIMARY KEY,
+    cycle_id                    INTEGER REFERENCES wheel_cycles(id),  -- NULL until phase-2 fill reconciliation links it
+    symbol                      TEXT    NOT NULL,
+    structure                   TEXT    NOT NULL,   -- narrow_vertical | iron_condor
+    quantity                    INTEGER NOT NULL DEFAULT 1,           -- packages; pnl_* are dollars across all of them
+    entry_ts                    DATETIME NOT NULL,
+    entry_credit_raw            REAL,               -- $/share net credit at proposal-time quotes
+    entry_spread_width_quotes   REAL,               -- sum of leg (ask - bid) at entry, $/share
+    entry_credit_penalized      REAL,               -- raw - entry_spread_width_quotes / 2
+    exit_ts                     DATETIME,
+    exit_debit_raw              REAL,               -- $/share debit-to-close at proposal-time mids
+    exit_debit_penalized        REAL,               -- raw + exit half-spread sum (+ stop_slippage_adder on flatten)
+    pnl_raw                     REAL,               -- (entry_credit_raw - exit_debit_raw) * 100 * quantity
+    pnl_penalized               REAL,               -- penalized equivalent; feeds the zero_dte daily loss cap
+    exit_reason                 TEXT                -- flatten | profit_target
+);
+
+CREATE INDEX IF NOT EXISTS idx_zero_dte_ledger_symbol_entry
+    ON zero_dte_ledger(symbol, entry_ts);
+CREATE INDEX IF NOT EXISTS idx_zero_dte_ledger_exit_ts
+    ON zero_dte_ledger(exit_ts);
