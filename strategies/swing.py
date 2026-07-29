@@ -48,25 +48,66 @@ def evaluate_swing_signal(
     weekly=None,
     params: SwingParams = _DEFAULT_PARAMS,
     cfg: EngineConfig | None = None,
+    since=None,
+    max_age_minutes: float = 15.0,
+    diag: dict | None = None,
 ) -> Signal | None:
-    """Return the signal on the LATEST bar (a fresh aligned cross + 200-SMA gate),
-    or None. Pure — reuses backtest.engine.generate_signals so live == backtest."""
+    """Return the freshest un-acted signal, or None. Pure — reuses
+    backtest.engine.generate_signals so live == backtest.
+
+    2026-07-24 parity fix: the old version fired only when the cross landed
+    on THE single newest completed bar at evaluation time. Live ticks drift
+    past bar boundaries (a tick's work takes 30-90s), so crosses on skipped
+    bars were never examined — the July 1-24 parity run found 11-14 engine
+    entries while the live loop fired ZERO. Now every nonzero signal bar
+    NEWER than `since` (the previous tick's frame end) is considered, and
+    the freshest one within `max_age_minutes` of the frame end fires. The
+    caller advances `since` each tick, which also dedupes: a fired (or
+    passed-over) cross can never fire twice. `spot` is the CURRENT last
+    close (entry economics), while `ts` is the cross bar (identity).
+
+    `diag`, when provided, is filled with parity observability fields
+    regardless of outcome (last cross ts/age, count since last eval).
+    """
     cfg = cfg or EngineConfig(use_regime=True)
     if bars5m is None or len(bars5m) == 0 or daily is None or len(daily) == 0:
         return None
     sig_df = generate_signals(bars5m, daily, params, weekly=weekly, cfg=cfg)
     if sig_df.empty:
         return None
-    last = sig_df.iloc[-1]
-    direction = int(last["signal"])
-    if direction == 0:
+    frame_end = sig_df.index[-1]
+    all_nz = sig_df[sig_df["signal"] != 0]
+    nz = all_nz if since is None else all_nz[all_nz.index > since]
+    if diag is not None:
+        diag["last_bar"] = str(frame_end)
+        diag["last_cross_ts"] = str(all_nz.index[-1]) if len(all_nz) else None
+        diag["last_cross_age_min"] = (
+            round((frame_end - all_nz.index[-1]).total_seconds() / 60.0, 1)
+            if len(all_nz) else None
+        )
+        diag["n_new_since_last_eval"] = int(len(nz))
+    if len(nz) == 0:
         return None
-    return Signal(ts=sig_df.index[-1], direction=direction, spot=float(last["close"]))
+    chosen_ts = nz.index[-1]
+    age_min = (frame_end - chosen_ts).total_seconds() / 60.0
+    if age_min > max_age_minutes:
+        return None
+    return Signal(
+        ts=chosen_ts,
+        direction=int(nz.iloc[-1]["signal"]),
+        spot=float(sig_df.iloc[-1]["close"]),
+    )
 
 
 # Daily/weekly/VIX only change once a day, but the loop ticks every 5 min — so
 # cache them per (symbol, date) and only re-pull intraday 5-min bars each tick.
 _DAILY_CACHE: dict[tuple[str, date], tuple] = {}
+
+# 2026-07-24 parity fix: last evaluated frame-end per symbol. The next tick
+# scans signal bars NEWER than this (nothing falls through tick drift) and a
+# fired cross can never fire twice. Process-local — a restart re-arms within
+# the bounded freshness window, same class as the other tick-state dicts.
+_LAST_EVAL_BAR: dict[str, Any] = {}
 
 
 def _cached_daily(symbol: str, today: date) -> tuple:
@@ -349,8 +390,19 @@ async def propose_all_swings(
         log_checkpoint("swing_fetch_fail", status="fail", strategy=strategy.id, error=str(exc))
         return []
 
+    diag: dict[str, Any] = {}
     try:
-        sig = evaluate_swing_signal(bars5m, daily, weekly=weekly)
+        # 2026-07-24 parity fix: scan every completed bar since the previous
+        # tick's frame end (nothing falls through tick drift), bounded by the
+        # freshness window. _LAST_EVAL_BAR advances even on no-signal ticks.
+        sig = evaluate_swing_signal(
+            bars5m, daily, weekly=weekly,
+            since=_LAST_EVAL_BAR.get(symbol),
+            max_age_minutes=float(p.get("signal_freshness_minutes", 15)),
+            diag=diag,
+        )
+        if len(bars5m):
+            _LAST_EVAL_BAR[symbol] = bars5m.index[-1]
     except Exception as exc:  # audit MED-9b: a data-shape edge (e.g. NaN from a
         # lagged daily frame) must degrade to "no signal", not abort the pass.
         log_checkpoint("swing_eval_fail", status="fail", strategy=strategy.id, error=str(exc))
@@ -368,7 +420,7 @@ async def propose_all_swings(
             ctx_extra = {"fomc_tilt": True, "min_hold_days": 0.0, "max_hold_days": 1.0}
     if sig is None:
         log_checkpoint("swing_eval", status="ok", strategy=strategy.id, symbol=symbol,
-                       signal=0, bars5m=len(bars5m), daily=len(daily))
+                       signal=0, bars5m=len(bars5m), daily=len(daily), **diag)
         return []
 
     contract = await select_swing_option(broker, symbol, sig.direction, p, today=today)
@@ -384,7 +436,8 @@ async def propose_all_swings(
         "swing_signal_fired", status="ok", strategy=strategy.id, symbol=symbol,
         direction=sig.direction, spot=round(sig.spot, 2), strike=contract.strike,
         dte=(contract.expiration - today).days, stop=round(level, 2),
-        rationale=proposal.rationale, dry_run=dry_run,
+        signal_ts=str(sig.ts), rationale=proposal.rationale, dry_run=dry_run,
+        **diag,
     )
     return [] if dry_run else [proposal]
 

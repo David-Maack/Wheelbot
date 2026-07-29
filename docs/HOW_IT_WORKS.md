@@ -70,7 +70,7 @@ strategy comes from `universe.yaml` plus the weekly watchlist overlay.
 | `iron_condor` | Both wings, Δ0.16 shorts, $5 wings | Range-bound, credit ≥ 30% of width | 25% profit, DTE-21 |
 | `pmcc` | Deep-ITM LEAP + short OTM calls | Cheap names with liquid LEAPs (≤$1,500) | Short: 50%/1-DTE; long rolls at 60 DTE or Δ < 0.70 (below that it stops acting like stock) |
 | `calendar` | Same-strike front/back calls, net debit | **LOW** IV (IVR ≤ 35 — inverted gate) | 25% of debit, force-close front ≤ 2 DTE |
-| `spy_swing_opt` | Directional deep-ITM SPY calls/puts (Δ0.90, ~60 DTE) | MTF VWAP/EMA9 signal + 200-SMA gate | Prior-day-level stop, 1.5R target, 7-day time stop |
+| `spy_swing_opt` | Directional deep-ITM SPY calls/puts (Δ0.90, ~60 DTE) | MTF VWAP/EMA9 signal + 200-SMA gate. A cross fires if it printed within 15 min of the newest completed bar (all bars since the last tick are scanned and deduped — a July parity run showed the old newest-bar-only check silently dropped every signal) | Prior-day-level stop, 1.5R target, 7-day time stop |
 
 ## 4. The entry gauntlet
 

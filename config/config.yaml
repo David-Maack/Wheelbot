@@ -707,6 +707,13 @@ strategies:
     params:
       symbol: SPY
       dry_run: false                # 2.4b GO-LIVE (paper): places real paper orders on signal.
+      # 2026-07-24 parity fix: a cross fires if it printed within this many
+      # minutes of the newest completed bar — the old latest-bar-only check
+      # lost every cross that landed on a bar the drifting 5-min tick skipped
+      # (parity run 7/1-7/24: engine 11-14 entries, live ZERO). Bars since
+      # the previous tick are scanned and deduped, so a cross fires at most
+      # once. 15 min ≈ 3 bars of grace without chasing stale setups.
+      signal_freshness_minutes: 15
       # Validated config (see backtest sub-sprint 1): deep-ITM long, ~60 DTE,
       # prior-day-level stop, 1.5R target, 1-day min-hold, 7-day time stop, NO
       # 5-min opposite-cross exit, 200-SMA regime gate. Consumed in 2.2.

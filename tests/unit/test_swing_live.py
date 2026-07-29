@@ -298,3 +298,66 @@ async def test_swing_close_stop_fires_end_to_end(db_repos):
     assert len(proposals) == 1
     assert proposals[0].order_type == OrderType.SELL_TO_CLOSE
     assert "stop" in (proposals[0].trigger_reason or proposals[0].rationale)
+
+
+# -- signal delivery window (2026-07-24 parity fix) ----------------------------
+
+
+def _sig_frame(cross_offset_bars: int, n_bars: int = 10, direction: int = 1):
+    """Signal frame with one nonzero bar `cross_offset_bars` from the end."""
+    import pandas as pd
+    idx = pd.date_range("2026-07-20 09:30", periods=n_bars, freq="5min")
+    sig = [0] * n_bars
+    sig[n_bars - 1 - cross_offset_bars] = direction
+    close = [100.0 + i * 0.1 for i in range(n_bars)]
+    return pd.DataFrame({"signal": sig, "close": close}, index=idx)
+
+
+def _dummy_bars():
+    import pandas as pd
+    idx = pd.date_range("2026-07-20 09:30", periods=3, freq="5min")
+    return pd.DataFrame({"close": [1.0, 1.0, 1.0]}, index=idx)
+
+
+def test_cross_on_skipped_bar_now_fires(monkeypatch):
+    """The July failure mode: the cross printed 2 bars (10 min) ago — the old
+    latest-bar-only check returned None; the windowed scan fires it."""
+    from strategies.swing import evaluate_swing_signal
+    frame = _sig_frame(cross_offset_bars=2)
+    monkeypatch.setattr("strategies.swing.generate_signals", lambda *a, **k: frame)
+    diag = {}
+    sig = evaluate_swing_signal(_dummy_bars(), _dummy_bars(), diag=diag)
+    assert sig is not None
+    assert sig.direction == 1
+    assert sig.ts == frame.index[-3]                  # identity = the cross bar
+    assert sig.spot == frame["close"].iloc[-1]        # economics = current close
+    assert diag["n_new_since_last_eval"] == 1
+    assert diag["last_cross_age_min"] == 10.0
+
+
+def test_since_dedupes_a_fired_cross(monkeypatch):
+    """Once `since` has advanced past the cross bar, it can never re-fire."""
+    from strategies.swing import evaluate_swing_signal
+    frame = _sig_frame(cross_offset_bars=2)
+    monkeypatch.setattr("strategies.swing.generate_signals", lambda *a, **k: frame)
+    sig = evaluate_swing_signal(_dummy_bars(), _dummy_bars(), since=frame.index[-1])
+    assert sig is None
+
+
+def test_stale_cross_outside_freshness_window(monkeypatch):
+    """A cross older than max_age_minutes must not chase."""
+    from strategies.swing import evaluate_swing_signal
+    frame = _sig_frame(cross_offset_bars=6, n_bars=12)  # 30 min old
+    monkeypatch.setattr("strategies.swing.generate_signals", lambda *a, **k: frame)
+    assert evaluate_swing_signal(_dummy_bars(), _dummy_bars(),
+                                 max_age_minutes=15.0) is None
+
+
+def test_cross_on_latest_bar_still_fires(monkeypatch):
+    """Regression: the original semantics remain a subset of the new ones."""
+    from strategies.swing import evaluate_swing_signal
+    frame = _sig_frame(cross_offset_bars=0, direction=-1)
+    monkeypatch.setattr("strategies.swing.generate_signals", lambda *a, **k: frame)
+    sig = evaluate_swing_signal(_dummy_bars(), _dummy_bars())
+    assert sig is not None and sig.direction == -1
+    assert sig.ts == frame.index[-1]
