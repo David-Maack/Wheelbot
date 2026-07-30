@@ -359,16 +359,6 @@ def _flip_action(action: OrderType) -> OrderType:
     return action
 
 
-async def _quote_mid(broker: Broker, symbol: str) -> float | None:
-    try:
-        q = await broker.get_quote(symbol)
-    except Exception:
-        return None
-    if q.mid is not None:
-        return q.mid
-    return q.last or q.bid or q.ask
-
-
 async def _leg_quote(broker: Broker, symbol: str) -> Quote | None:
     """Full quote for a close leg. The MID drives the close DECISION (fair
     value); the BID/ASK drive the ORDER PRICE so the close is marketable and
@@ -377,6 +367,37 @@ async def _leg_quote(broker: Broker, symbol: str) -> Quote | None:
         return await broker.get_quote(symbol)
     except Exception:
         return None
+
+
+async def _close_pricing(
+    broker: Broker, legs: list[OrderLeg]
+) -> tuple[float, float] | None:
+    """Dual pricing for a multi-leg CLOSE: (mid_debit, marketable_debit) per
+    share, or None when any leg lacks a two-sided quote (caller skips).
+
+    Sign convention: positive = we PAY a debit to close (a net-credit close
+    comes back negative). The MID figure is fair value and drives the close
+    DECISION; the MARKETABLE figure crosses the spread — buy legs at the ask,
+    sell legs at the bid — and drives the ORDER LIMIT so the close actually
+    fills instead of cancel-looping behind wide quotes. Shared by the vertical
+    /condor close path and calendar_close (which allows 20% quote spreads,
+    where a mid-priced limit never crosses)."""
+    mid_debit = 0.0
+    marketable_debit = 0.0
+    for leg in legs:
+        q = await _leg_quote(broker, leg.contract_symbol)
+        if q is None or q.mid is None:
+            return None
+        mid = q.mid
+        ask = q.ask if q.ask is not None else mid
+        bid = q.bid if q.bid is not None else mid
+        if leg.action == OrderType.BUY_TO_CLOSE:
+            mid_debit += mid
+            marketable_debit += ask
+        elif leg.action == OrderType.SELL_TO_CLOSE:
+            mid_debit -= mid
+            marketable_debit -= bid
+    return mid_debit, marketable_debit
 
 
 async def propose_close_for_symbol(
@@ -454,15 +475,14 @@ async def propose_close_for_symbol(
         ):
             direction = DIRECTION_BEAR_CALL
 
-    # Re-quote each leg. The MID drives the close DECISION (fair value), while
-    # the BID/ASK drive the ORDER PRICE: a close limit at the mid sits behind a
-    # fast-moving spread, cancel-loops, and the position rides to max loss
-    # (META/GOOGL did exactly that). Pricing the package marketably — buy legs
-    # at the ask, sell legs at the bid — makes a stop-loss actually fill.
-    leg_quotes: list[tuple[OrderLeg, Quote | None]] = []
-    for leg in close_legs:
-        leg_quotes.append((leg, await _leg_quote(broker, leg.contract_symbol)))
-    if any(q is None or q.mid is None for _, q in leg_quotes):
+    # Re-quote each leg via the shared dual-pricing helper. The MID drives the
+    # close DECISION (fair value), while the BID/ASK drive the ORDER PRICE: a
+    # close limit at the mid sits behind a fast-moving spread, cancel-loops,
+    # and the position rides to max loss (META/GOOGL did exactly that).
+    # Pricing the package marketably — buy legs at the ask, sell legs at the
+    # bid — makes a stop-loss actually fill.
+    pricing = await _close_pricing(broker, close_legs)
+    if pricing is None:
         log_checkpoint(
             "spread_close_skip_no_quote",
             status="skip",
@@ -470,24 +490,11 @@ async def propose_close_for_symbol(
             strategy=strategy.id,
         )
         return None
-
     # Two debit-to-close figures, per share. Convention: positive = we pay a
     # debit. `debit_to_close` (mid) is fair value and drives the trigger;
     # `marketable_debit` (ask for buys, bid for sells) crosses the spread and
     # drives the order limit so the close fills.
-    debit_to_close = 0.0
-    marketable_debit = 0.0
-    for leg, q in leg_quotes:
-        assert q is not None and q.mid is not None
-        mid = q.mid
-        ask = q.ask if q.ask is not None else mid
-        bid = q.bid if q.bid is not None else mid
-        if leg.action == OrderType.BUY_TO_CLOSE:
-            debit_to_close += mid
-            marketable_debit += ask
-        elif leg.action == OrderType.SELL_TO_CLOSE:
-            debit_to_close -= mid
-            marketable_debit -= bid
+    debit_to_close, marketable_debit = pricing
 
     # 2026-07-23 review fix: HARD CLAMP the close debit at the wing width. A
     # marketable close (buy at ask, sell at bid) on wide quotes can price

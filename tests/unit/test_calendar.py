@@ -240,7 +240,9 @@ async def _seed_open_calendar(db_repos, today, debit, *, front_dte=14):
 @pytest.mark.asyncio
 async def test_profit_close_at_25_pct(db_repos):
     """Close when close-value ≥ 1.25 × debit. Debit 1.50 → target 1.875.
-    Seed front mid 0.50, back mid 2.50 → close value 2.00 ≥ 1.875 → triggers."""
+    Seed front mid 0.50, back mid 2.50 → close value 2.00 ≥ 1.875 → triggers.
+    ORDER price is MARKETABLE: sell back at bid 2.48, buy front at ask 0.52
+    → net credit 1.96 (the 2.00 mid value still drives the trigger)."""
     broker = PaperBroker()
     today = date(2025, 6, 1)
     exp_f, exp_b = await _seed_open_calendar(db_repos, today, debit=1.50)
@@ -252,8 +254,91 @@ async def test_profit_close_at_25_pct(db_repos):
     assert proposal is not None
     assert proposal.order_type == OrderType.MULTI_LEG_CLOSE
     assert "calendar_profit" in proposal.rationale
-    # close value = back 2.50 − front 0.50 = 2.00
-    assert proposal.net_credit_per_spread == pytest.approx(2.00)
+    # marketable credit = back bid 2.48 − front ask 0.52 = 1.96
+    assert proposal.net_credit_per_spread == pytest.approx(1.96)
+    # mid-based close value (trigger figure) is surfaced in the rationale.
+    assert "value=2.00" in proposal.rationale
+
+
+@pytest.mark.asyncio
+async def test_close_order_price_marketable_on_wide_quotes(db_repos):
+    """Cancel-loop fix (CCL 2026-07-20/28): calendars quote WIDE, so the
+    order limit must cross the spread — sell back at BID, buy front at ASK —
+    not sit at the mid. Trigger still evaluates on mids.
+
+    Front bid 0.40 / ask 0.60 (mid 0.50), back bid 2.20 / ask 2.80 (mid 2.50):
+    mid close value 2.00 ≥ 1.875 target → triggers; marketable net credit
+    = 2.20 − 0.60 = 1.60, which materially differs from the 2.00 mid."""
+    broker = PaperBroker()
+    today = date(2025, 6, 1)
+    exp_f, exp_b = await _seed_open_calendar(db_repos, today, debit=1.50)
+    broker.seed_quote(Quote(symbol=_occ("SPY", exp_f, 150.0), bid=0.40, ask=0.60))
+    broker.seed_quote(Quote(symbol=_occ("SPY", exp_b, 150.0), bid=2.20, ask=2.80))
+    proposal = await propose_close_for_symbol(
+        broker, db_repos, "SPY", _config(), today=date(2025, 6, 10), strategy=_strategy(),
+    )
+    assert proposal is not None
+    assert "calendar_profit" in proposal.rationale
+    # ORDER net = marketable credit, NOT the mid value.
+    assert proposal.net_credit_per_spread == pytest.approx(1.60)
+    assert proposal.net_credit_per_spread != pytest.approx(2.00)
+
+
+@pytest.mark.asyncio
+async def test_close_decision_still_on_mids_not_marketable(db_repos):
+    """The DECISION must stay on mids: wide quotes whose MARKETABLE value
+    would clear the profit target but whose MID value does not → no close.
+    Debit 1.50 → target 1.875. Front mid 0.70, back mid 2.50 → mid value
+    1.80 < 1.875 → no trigger, even though quotes exist on both legs."""
+    broker = PaperBroker()
+    today = date(2025, 6, 1)
+    exp_f, exp_b = await _seed_open_calendar(db_repos, today, debit=1.50)
+    broker.seed_quote(Quote(symbol=_occ("SPY", exp_f, 150.0), bid=0.60, ask=0.80))  # mid 0.70
+    broker.seed_quote(Quote(symbol=_occ("SPY", exp_b, 150.0), bid=2.40, ask=2.60))  # mid 2.50
+    proposal = await propose_close_for_symbol(
+        broker, db_repos, "SPY", _config(), today=date(2025, 6, 10), strategy=_strategy(),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_shared_close_pricing_matches_spreads_convention(db_repos):
+    """Regression: `_close_pricing` (now shared with the vertical/condor close
+    path) must keep spreads' exact dual-pricing semantics — mid debit from
+    MIDs, marketable debit = ask on BUY_TO_CLOSE legs − bid on SELL_TO_CLOSE
+    legs. Sign convention: positive = we pay."""
+    from core.models import OrderLeg
+    from strategies.spreads import _close_pricing
+
+    broker = PaperBroker()
+    today = date(2025, 6, 1)
+    exp_f = today + timedelta(days=14)
+    exp_b = today + timedelta(days=60)
+    buy_front = OrderLeg(
+        contract_symbol=_occ("SPY", exp_f, 150.0), underlying="SPY",
+        option_type=OptionType.CALL, strike=150.0, expiration=exp_f,
+        action=OrderType.BUY_TO_CLOSE, ratio_qty=1,
+    )
+    sell_back = OrderLeg(
+        contract_symbol=_occ("SPY", exp_b, 150.0), underlying="SPY",
+        option_type=OptionType.CALL, strike=150.0, expiration=exp_b,
+        action=OrderType.SELL_TO_CLOSE, ratio_qty=1,
+    )
+    broker.seed_quote(Quote(symbol=buy_front.contract_symbol, bid=0.40, ask=0.60))
+    broker.seed_quote(Quote(symbol=sell_back.contract_symbol, bid=2.20, ask=2.80))
+
+    pricing = await _close_pricing(broker, [buy_front, sell_back])
+    assert pricing is not None
+    mid_debit, marketable_debit = pricing
+    # mids: buy 0.50 − sell 2.50 = −2.00 (net credit at fair value)
+    assert mid_debit == pytest.approx(-2.00)
+    # marketable: buy at ask 0.60 − sell at bid 2.20 = −1.60
+    assert marketable_debit == pytest.approx(-1.60)
+
+    # Missing quote on any leg → None (caller skips, no proposal).
+    broker2 = PaperBroker()
+    broker2.seed_quote(Quote(symbol=buy_front.contract_symbol, bid=0.40, ask=0.60))
+    assert await _close_pricing(broker2, [buy_front, sell_back]) is None
 
 
 @pytest.mark.asyncio

@@ -29,9 +29,9 @@ from db.repo import Repos
 from strategies.spreads import (
     DIRECTION_CALENDAR,
     MultiLegProposal,
+    _close_pricing,
     _flip_action,
     _open_order_for_position,
-    _quote_mid,
 )
 
 
@@ -74,23 +74,22 @@ async def propose_close_for_symbol(
         if str(leg["action"]) == OrderType.SELL_TO_OPEN.value:
             front_leg = ol
 
-    leg_mids: list[tuple[OrderLeg, float | None]] = []
-    for leg in close_legs:
-        mid = await _quote_mid(broker, leg.contract_symbol)
-        leg_mids.append((leg, mid))
-    if any(mid is None for _, mid in leg_mids):
+    # Dual pricing via the shared spreads helper. Calendars quote WIDE (config
+    # allows 20% bid/ask spreads), so a mid-priced close limit never crosses
+    # and the router cancel-loops (CCL 2026-07-20/28). The MID value keeps
+    # driving the close DECISION exactly as before; the MARKETABLE value —
+    # sell the back at the bid, buy the front at the ask — drives the ORDER
+    # limit so the close actually fills. Helper returns debits (positive = we
+    # pay); a calendar close nets a credit, so negate.
+    pricing = await _close_pricing(broker, close_legs)
+    if pricing is None:
         log_checkpoint("calendar_close_skip_no_quote", status="skip",
                        symbol=symbol, strategy=strategy.id)
         return None
-
+    mid_debit, marketable_debit = pricing
     # Close value (credit received on closing) per share = sell_back − buy_front.
-    close_value = 0.0
-    for leg, mid in leg_mids:
-        assert mid is not None
-        if leg.action == OrderType.SELL_TO_CLOSE:   # the back long
-            close_value += mid
-        elif leg.action == OrderType.BUY_TO_CLOSE:  # the front short
-            close_value -= mid
+    close_value = -mid_debit
+    marketable_credit = -marketable_debit
 
     debit = abs(open_order.fill_price or 0.0)
     profit_close_pct = float(strategy.params.get("profit_close_pct", 25))
@@ -105,7 +104,8 @@ async def propose_close_for_symbol(
     reason = "calendar_profit" if profit_trigger else "calendar_time"
     rationale = (
         f"calendar_close[{symbol}] {reason} debit={debit:.2f} "
-        f"value={close_value:.2f} front_dte={front_dte}"
+        f"value={close_value:.2f} marketable={marketable_credit:.2f} "
+        f"front_dte={front_dte}"
     )
     log_checkpoint(
         "calendar_close_triggered", status="ok", symbol=symbol,
@@ -114,7 +114,10 @@ async def propose_close_for_symbol(
     return MultiLegProposal(
         symbol=symbol,
         legs=close_legs,
-        net_credit_per_spread=close_value,  # closing a debit nets a credit
+        # Closing a debit nets a credit. The ORDER price is the MARKETABLE
+        # credit (sell at bid / buy at ask) so the router's limit crosses the
+        # wide calendar quotes; the mid-based close_value drove the trigger.
+        net_credit_per_spread=marketable_credit,
         max_loss_per_spread=debit * 100,
         width_dollars=0.0,
         quantity=open_order.quantity or 1,
