@@ -38,7 +38,10 @@ services:
       uvicorn dashboard.app:create_app --factory
       --host 0.0.0.0 --port 8889
     ports:
-      - "127.0.0.1:8889:8889"
+      # 0.0.0.0 so the tailnet (100.73.1.46) can reach it; HTTP Basic auth
+      # guards the dashboard. Was hand-edited on the LXC for a month — now
+      # committed so deploys stop choking on a dirty tree.
+      - "8889:8889"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8889/healthz"]
       interval: 60s
@@ -46,9 +49,9 @@ services:
       retries: 3
 
   # Ops MCP: read tools + guarded controls over authenticated streamable HTTP.
-  # Bound to 127.0.0.1 like the dashboard; exposed to the tailnet via the same
-  # mechanism (tailscale serve / tunnel — see docs/MCP.md). Requires
-  # WHEELBOT_MCP_TOKEN in secrets.env (server refuses to start without it).
+  # Bound 0.0.0.0 like the dashboard so the tailnet (100.73.1.46:8890) can
+  # reach it. Requires WHEELBOT_MCP_TOKEN in secrets.env (server refuses to
+  # start without it; unauthenticated calls get 401).
   mcp:
     build: .
     image: wheelbot:latest
@@ -64,7 +67,7 @@ services:
       - ./config/universe.yaml:/opt/wheelbot/config/universe.yaml:ro
     command: ["python", "-m", "scripts.run_mcp"]
     ports:
-      - "127.0.0.1:8890:8890"
+      - "8890:8890"
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8890), timeout=5).close()"]
       interval: 60s
@@ -73,4 +76,12 @@ services:
 
 volumes:
   wheelbot-storage:
+    # Bind to the LXC mountpoint backed by the Proxmox AI SSD
+    # (mp0: /mnt/ai-ssd/wheelbot → /mnt/wheelbot-storage) so the DB and
+    # backups live off the 16G container rootfs. The mountpoint must exist
+    # on the LXC before `docker compose up`.
     driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/wheelbot-storage
