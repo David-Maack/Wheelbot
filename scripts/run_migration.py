@@ -61,18 +61,30 @@ def _applied_versions(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in rows}
 
 
+def _strip_line_comment(line: str) -> str:
+    """Drop a `--` comment from a line, ignoring `--` inside 'strings'."""
+    in_string = False
+    for i, ch in enumerate(line):
+        if ch == "'":
+            in_string = not in_string
+        elif not in_string and ch == "-" and line[i + 1 : i + 2] == "-":
+            return line[:i]
+    return line
+
+
 def _split_statements(sql: str) -> list[str]:
     """Tokenize a migration SQL file into individual statements.
 
-    Strips full-line comments and splits on ';'. Migration files don't
-    contain semicolons inside strings so this naive split is safe.
+    Strips `--` comments (full-line AND trailing) outside string literals,
+    then splits on ';'. A semicolon inside a trailing comment must never
+    split the statement — migration 015's inline `-- packages; ...` comment
+    truncated its CREATE TABLE mid-column and crash-looped the bot.
     """
     lines = []
     for raw in sql.split("\n"):
-        stripped = raw.strip()
-        if stripped.startswith("--") or not stripped:
-            continue
-        lines.append(raw)
+        line = _strip_line_comment(raw)
+        if line.strip():
+            lines.append(line)
     text = "\n".join(lines)
     return [s.strip() for s in text.split(";") if s.strip()]
 
