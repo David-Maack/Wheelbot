@@ -40,7 +40,7 @@ data = [
     "scipy>=1.12",
 ]
 mcp = [
-    "mcp>=1.2",
+    "mcp>=1.2,<2",  # 2.0 removed the mcp.server.fastmcp import path
     "uvicorn[standard]>=0.27",
     "starlette>=0.37",
 ]
