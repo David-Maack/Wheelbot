@@ -810,6 +810,10 @@ _DIFF_ONE_HANDLED_STATES = frozenset({
     # TICKET-015 PMCC active states with explicit _diff_one branches.
     PositionState.PMCC_LONG_OPEN,
     PositionState.PMCC_BOTH_OPEN,
+    # 2026-08-03: PMCC pendings moved from no-transition to a stranded-PENDING
+    # self-heal branch (CCL/F sat stuck for weeks holding cap slots).
+    PositionState.PMCC_LONG_PENDING,
+    PositionState.PMCC_SHORT_PENDING,
 })
 
 

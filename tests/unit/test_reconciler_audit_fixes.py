@@ -116,3 +116,138 @@ async def test_diff_covers_every_strategy_position_on_a_symbol(db_repos):
     assert b.state == PositionState.IDLE, "second strategy's expiration missed"
     assert summary.expirations_processed == 2
     assert summary.cycles_closed == 2
+
+
+# -- 2026-08-03 fix: PMCC *_PENDING stranded-state self-heal ------------------
+
+
+async def _seed_pmcc_short_pending(
+    db_repos, *, sto_status: OrderStatus
+) -> tuple[int, int]:
+    """PMCC holding its LEAP, short-call STO in the given terminal status, and
+    the position stranded in PMCC_SHORT_PENDING — the lost-event shape that
+    held CCL/F frozen for weeks live."""
+    cycle_id = await db_repos.cycles.insert(WheelCycle(
+        account_id="test", symbol="CCL", strategy_id="pmcc", started_at=_utc(),
+    ))
+    sto = Order(
+        account_id="test", symbol="CCL", strategy_id="pmcc",
+        order_type=OrderType.SELL_TO_OPEN, contract_symbol="CCL260807C00026000",
+        strike=26.0, expiration=date(2026, 8, 7), option_type=OptionType.CALL,
+        quantity=1, limit_price=0.55, status=sto_status,
+        placed_at=_utc(), client_order_id="wb-pmcc-sto-1", cycle_id=cycle_id,
+    )
+    await db_repos.orders.insert(sto)
+    pos_id = await db_repos.positions.insert(Position(
+        account_id="test", symbol="CCL", strategy_id="pmcc",
+        state=PositionState.PMCC_SHORT_PENDING, shares=0,
+        current_cycle_id=cycle_id, state_changed_at=_utc(),
+        state_change_reason="router_pending:wb-pmcc-sto-1",
+    ))
+    return pos_id, cycle_id
+
+
+@pytest.mark.asyncio
+async def test_pmcc_short_pending_selfheals_to_long_open_when_sto_died(db_repos):
+    """2026-08-03 live incident: the short-call STO died (EOD cancel) but the
+    cancel event was lost across a restart, so the position sat in
+    PMCC_SHORT_PENDING for weeks — holding a global cap slot AND freezing
+    short-call income on the LEAP. With no order in flight the reconciler
+    restores PMCC_LONG_OPEN with the cycle intact."""
+    pos_id, cycle_id = await _seed_pmcc_short_pending(
+        db_repos, sto_status=OrderStatus.CANCELLED
+    )
+    rec = Reconciler(PaperBroker(cash=20_000), db_repos, _config())
+    await rec.reconcile_once()
+    p = await db_repos.positions.get(pos_id)
+    assert p.state == PositionState.PMCC_LONG_OPEN
+    assert p.current_cycle_id == cycle_id
+
+
+@pytest.mark.asyncio
+async def test_pmcc_short_pending_selfheals_to_both_open_when_sto_filled(db_repos):
+    """Mirror case: the STO actually FILLED but the fill event was lost. The
+    short is live at the broker, so the heal must land on PMCC_BOTH_OPEN."""
+    pos_id, cycle_id = await _seed_pmcc_short_pending(
+        db_repos, sto_status=OrderStatus.FILLED
+    )
+    rec = Reconciler(PaperBroker(cash=20_000), db_repos, _config())
+    await rec.reconcile_once()
+    p = await db_repos.positions.get(pos_id)
+    assert p.state == PositionState.PMCC_BOTH_OPEN
+    assert p.current_cycle_id == cycle_id
+
+
+@pytest.mark.asyncio
+async def test_pmcc_short_pending_heal_ignores_other_strategy_orders(db_repos):
+    """A calendar's FILLED front short call on the SAME underlying must not
+    contaminate the pmcc heal (live shape: CCL calendar + CCL pmcc). The heal
+    reads only the pmcc strategy's own order stream."""
+    pos_id, _cycle_id = await _seed_pmcc_short_pending(
+        db_repos, sto_status=OrderStatus.CANCELLED
+    )
+    calendar_sto = Order(
+        account_id="test", symbol="CCL", strategy_id="calendar",
+        order_type=OrderType.SELL_TO_OPEN, contract_symbol="CCL260807C00027000",
+        strike=27.0, expiration=date(2026, 8, 7), option_type=OptionType.CALL,
+        quantity=1, limit_price=0.40, status=OrderStatus.FILLED,
+        placed_at=_utc() + timedelta(minutes=1), client_order_id="wb-cal-sto-1",
+    )
+    await db_repos.orders.insert(calendar_sto)
+    rec = Reconciler(PaperBroker(cash=20_000), db_repos, _config())
+    await rec.reconcile_once()
+    p = await db_repos.positions.get(pos_id)
+    # The pmcc STO was CANCELLED -> LONG_OPEN, despite the calendar's FILLED
+    # short call being the newest CALL order on the symbol.
+    assert p.state == PositionState.PMCC_LONG_OPEN
+
+
+@pytest.mark.asyncio
+async def test_pmcc_long_pending_selfheals_to_idle_when_bto_died(db_repos):
+    """LONG_PENDING with a dead BUY_TO_OPEN and nothing in flight: no LEAP was
+    ever acquired, so the position returns to IDLE (no cycle to keep)."""
+    bto = Order(
+        account_id="test", symbol="F", strategy_id="pmcc",
+        order_type=OrderType.BUY_TO_OPEN, contract_symbol="F261218C00011000",
+        strike=11.0, expiration=date(2026, 12, 18), option_type=OptionType.CALL,
+        quantity=1, limit_price=4.20, status=OrderStatus.CANCELLED,
+        placed_at=_utc(), client_order_id="wb-pmcc-bto-1",
+    )
+    await db_repos.orders.insert(bto)
+    pos_id = await db_repos.positions.insert(Position(
+        account_id="test", symbol="F", strategy_id="pmcc",
+        state=PositionState.PMCC_LONG_PENDING, shares=0, state_changed_at=_utc(),
+        state_change_reason="router_pending:wb-pmcc-bto-1",
+    ))
+    rec = Reconciler(PaperBroker(cash=20_000), db_repos, _config())
+    await rec.reconcile_once()
+    p = await db_repos.positions.get(pos_id)
+    assert p.state == PositionState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_pmcc_long_pending_selfheals_to_long_open_on_lost_fill(db_repos):
+    """LONG_PENDING whose BUY_TO_OPEN FILLED but the fill event was lost: the
+    heal must both restore PMCC_LONG_OPEN and recreate the cycle the lost fill
+    would have opened (debit-based capital at risk)."""
+    bto = Order(
+        account_id="test", symbol="F", strategy_id="pmcc",
+        order_type=OrderType.BUY_TO_OPEN, contract_symbol="F261218C00011000",
+        strike=11.0, expiration=date(2026, 12, 18), option_type=OptionType.CALL,
+        quantity=1, limit_price=4.20, fill_price=4.15,
+        status=OrderStatus.FILLED, placed_at=_utc(),
+        client_order_id="wb-pmcc-bto-2",
+    )
+    await db_repos.orders.insert(bto)
+    pos_id = await db_repos.positions.insert(Position(
+        account_id="test", symbol="F", strategy_id="pmcc",
+        state=PositionState.PMCC_LONG_PENDING, shares=0, state_changed_at=_utc(),
+        state_change_reason="router_pending:wb-pmcc-bto-2",
+    ))
+    rec = Reconciler(PaperBroker(cash=20_000), db_repos, _config())
+    await rec.reconcile_once()
+    p = await db_repos.positions.get(pos_id)
+    assert p.state == PositionState.PMCC_LONG_OPEN
+    assert p.current_cycle_id is not None
+    cycle = await db_repos.cycles.get(p.current_cycle_id)
+    assert cycle.initial_capital_at_risk == pytest.approx(415.0)

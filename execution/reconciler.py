@@ -135,12 +135,12 @@ _DIFF_ONE_NO_TRANSITION_STATES: frozenset[PositionState] = frozenset({
     PositionState.CALLED_AWAY,
     PositionState.SPREAD_CLOSED,
     PositionState.SPREAD_ASSIGNED,
-    # TICKET-015 PMCC: the two *_PENDING states are driven by _on_fill
-    # (PENDING → OPEN on observed fill); CLOSING is the transient full-unwind
-    # state driven by _on_fill of the long SELL_TO_CLOSE. The two ACTIVE PMCC
-    # states (PMCC_LONG_OPEN, PMCC_BOTH_OPEN) get explicit _diff_one branches.
-    PositionState.PMCC_LONG_PENDING,
-    PositionState.PMCC_SHORT_PENDING,
+    # TICKET-015 PMCC: CLOSING is the transient full-unwind state driven by
+    # _on_fill of the long SELL_TO_CLOSE. The two *_PENDING states got their
+    # own stranded-PENDING self-heal branch in _diff_one (2026-08-03: CCL and
+    # F sat in PMCC_SHORT_PENDING for weeks after restarts dropped the order
+    # events, holding cap slots and freezing short-call income). The two
+    # ACTIVE states (PMCC_LONG_OPEN, PMCC_BOTH_OPEN) also have branches.
     PositionState.PMCC_CLOSING,
     # Sub-sprint 2.2b swing: SWING_PENDING is driven by _on_swing_fill
     # (PENDING → OPEN on the observed fill). SWING_OPEN has no shape-only
@@ -1248,6 +1248,21 @@ class Reconciler:
             await self._on_pmcc_short_expiration(local, summary)
             return
 
+        if local.state in (
+            PositionState.PMCC_LONG_PENDING,
+            PositionState.PMCC_SHORT_PENDING,
+        ):
+            # Same stranded-PENDING class as CSP/CC/SPREAD above (a cursor
+            # reset mid-rebuild drops the one-shot fill/cancel event). The
+            # broker shape flags can't drive this heal: on a shared underlying
+            # has_short_call may belong to ANOTHER strategy (CCL calendar's
+            # front short vs CCL pmcc), and long option rows carry no flag at
+            # all. The strategy's own order stream is authoritative instead.
+            if await self._has_inflight_order(local):
+                return
+            await self._selfheal_pmcc_pending(local, symbol, summary)
+            return
+
         # TICKET-014.5: explicit exhaustive guard. States that intentionally
         # imply no position-shape transition are enumerated in
         # _DIFF_ONE_NO_TRANSITION_STATES. Anything that is neither handled
@@ -1555,6 +1570,91 @@ class Reconciler:
             ),
         ) as cur:
             return await cur.fetchone() is not None
+
+    async def _latest_call_order(
+        self, position: Position, order_type: OrderType
+    ) -> Order | None:
+        """Most recent CALL order of the given type for this position's
+        (symbol, strategy) — the record of what the strategy last attempted.
+        Scoped to strategy_id so a shared underlying (CCL calendar + CCL pmcc)
+        can't cross-contaminate the heal."""
+        c = await self._repos.db.connect()
+        async with c.execute(
+            "SELECT id FROM orders WHERE symbol = ? AND strategy_id = ? "
+            "AND order_type = ? AND option_type = 'CALL' "
+            "ORDER BY placed_at DESC LIMIT 1",
+            (position.symbol, position.strategy_id, order_type.value),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return await self._repos.orders.get(row[0])
+
+    async def _selfheal_pmcc_pending(
+        self,
+        local: Position,
+        symbol: str,
+        summary: ReconcileSummary,
+    ) -> None:
+        """Heal a PMCC position stranded in *_PENDING with no working order
+        (observed live 2026-08-03: CCL stuck PMCC_SHORT_PENDING for 27 days —
+        held a global cap slot AND froze short-call income on the LEAP). The
+        latest matching call order for THIS strategy decides what happened."""
+        want = (
+            OrderType.BUY_TO_OPEN
+            if local.state == PositionState.PMCC_LONG_PENDING
+            else OrderType.SELL_TO_OPEN
+        )
+        order = await self._latest_call_order(local, want)
+        filled = order is not None and order.status == OrderStatus.FILLED
+
+        if local.state == PositionState.PMCC_LONG_PENDING:
+            if filled and order is not None:
+                # The lost fill also lost the cycle-open — recreate both.
+                cycle_id = await self._open_cycle_for_pmcc_long(
+                    order, order.fill_price or order.limit_price or 0.0, summary
+                )
+                if cycle_id is not None and order.id is not None:
+                    await self._repos.orders.update(order.id, cycle_id=cycle_id)
+                await self._set_position_state(
+                    local, symbol, PositionState.PMCC_LONG_OPEN,
+                    "selfheal:stuck_pmcc_long_pending",
+                    cycle_id=cycle_id,
+                    strategy_id=local.strategy_id,
+                )
+                to_state = PositionState.PMCC_LONG_OPEN
+            else:
+                # Order died unfilled (or never landed) → no LEAP, no cycle.
+                await self._set_position_state(
+                    local, symbol, PositionState.IDLE,
+                    "selfheal:pmcc_long_pending_unfilled",
+                    strategy_id=local.strategy_id,
+                )
+                to_state = PositionState.IDLE
+            log_checkpoint(
+                "reconcile_selfheal_pending", status="ok", symbol=symbol,
+                from_state="PMCC_LONG_PENDING", to_state=to_state.value,
+            )
+            return
+
+        # PMCC_SHORT_PENDING — the LEAP is held and its cycle is open; only
+        # the short call's fate is unknown. (No broker-shape guard here: long
+        # option rows are invisible on PaperBroker and flag-less on Alpaca, so
+        # order truth is the only reliable signal. A genuinely-missing LEAP
+        # surfaces via the PMCC_LONG_OPEN diff branch on later ticks.)
+        target = (
+            PositionState.PMCC_BOTH_OPEN if filled else PositionState.PMCC_LONG_OPEN
+        )
+        await self._set_position_state(
+            local, symbol, target,
+            "selfheal:stuck_pmcc_short_pending",
+            cycle_id=local.current_cycle_id,
+            strategy_id=local.strategy_id,
+        )
+        log_checkpoint(
+            "reconcile_selfheal_pending", status="ok", symbol=symbol,
+            from_state="PMCC_SHORT_PENDING", to_state=target.value,
+        )
 
     async def _set_position_state(
         self,
