@@ -36,7 +36,7 @@ from typing import Any
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.config import effective_wheel_params
-from core.models import OptionType, OrderStatus, OrderType
+from core.models import OptionType, OrderStatus, OrderType, PositionState
 from data.earnings import in_blackout
 from db.repo import Repos
 from strategies.spreads import MultiLegProposal
@@ -264,6 +264,12 @@ class RiskGate:
         active = await self._repos.positions.list_active(
             account_id, strategy_id=strategy_id
         )
+        # SPREAD_CLOSED is terminal bookkeeping, not live exposure — the spread
+        # orchestrators all treat it as re-proposable (state ∈ {IDLE,
+        # SPREAD_CLOSED}). Counting it as active permanently ate cap slots:
+        # observed 2026-08-03 with the global book locked at 6/6 by three
+        # closed spreads (MSFT/TSLA/SOFI), blocking every entry for days.
+        active = [p for p in active if p.state != PositionState.SPREAD_CLOSED]
         symbol = proposal.symbol.upper()
         new_slot = not any(p.symbol.upper() == symbol for p in active)
         if not new_slot:
@@ -312,6 +318,9 @@ class RiskGate:
         cap = int(cap_raw)
         account_id = account_section.get("id", "primary")
         active = await self._repos.positions.list_active(account_id)  # no strategy filter
+        # Terminal SPREAD_CLOSED rows are not live exposure — see the same
+        # filter in _rule_concurrent_cap.
+        active = [p for p in active if p.state != PositionState.SPREAD_CLOSED]
         symbol = proposal.symbol.upper()
         # A position is uniquely identified by (account, symbol, strategy_id).
         # The cap-skip "managing existing" path applies ONLY when the proposal

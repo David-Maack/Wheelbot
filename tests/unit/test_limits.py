@@ -964,3 +964,42 @@ async def test_concurrent_cap_falls_back_to_wheel_param(db_repos, monkeypatch):
     res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
     statuses = {r.rule: r.status for r in res.results}
     assert statuses["concurrent_positions_cap"] == "pass"  # projected 3 <= 4
+
+
+# -- 2026-08-03 fix: SPREAD_CLOSED ghosts must not consume cap slots ----------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_total_ignores_closed_spread_ghosts(db_repos, monkeypatch):
+    """Regression for the 2026-08-03 lockout: SPREAD_CLOSED is finished
+    bookkeeping (the spread orchestrators re-propose on it exactly like IDLE),
+    but the global cap counted it as active — three closed spreads held the
+    6/6 book shut for days and blocked every entry across all strategies."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    for sym, strat in (("AAA", "put_spread"), ("BBB", "put_spread"), ("CCC", "calendar")):
+        await _seed_active_position(db_repos, symbol=sym, strategy_id=strat, state="SPREAD_CLOSED")
+    await _seed_active_position(db_repos, symbol="DDD", strategy_id="pmcc", state="PMCC_LONG_OPEN")
+
+    cfg = _config()
+    cfg["account"]["max_concurrent_total"] = 4
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    # 1 real position + 3 ghosts -> projected 2 <= cap 4.
+    assert statuses["concurrent_total_cap"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_strategy_cap_ignores_closed_spread_ghosts(db_repos, monkeypatch):
+    """Per-strategy twin of the ghost fix: closed spreads must not consume the
+    strategy's own max_concurrent slots either."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    for sym in ("AAA", "BBB", "CCC", "DDD"):
+        await _seed_active_position(
+            db_repos, symbol=sym, strategy_id="monthly_wheel", state="SPREAD_CLOSED"
+        )
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, _config(), _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    statuses = {r.rule: r.status for r in res.results}
+    # Without the filter: projected 5 > 4 -> fail. Ghosts excluded -> pass.
+    assert statuses["concurrent_positions_cap"] == "pass"
