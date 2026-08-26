@@ -1160,8 +1160,16 @@ class Reconciler:
                     summary,
                     strategy_id=lp.strategy_id,
                 )
+        # Broker adapters put option contract qty in `shares` for option rows
+        # (a swing long call shows shares=1) — only SHARES_HELD rows are
+        # stock, the same convention _diff_one leans on.
         broker_shares = {
-            sym: sum(float(r.shares or 0) for r in rows)
+            sym: sum(
+                float(r.shares or 0)
+                for r in rows
+                if (r.state.value if hasattr(r.state, "value") else str(r.state))
+                == PositionState.SHARES_HELD.value
+            )
             for sym, rows in rows_by_symbol.items()
         }
         for sym in set(local_shares) | set(broker_shares):

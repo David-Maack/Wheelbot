@@ -247,6 +247,9 @@ async def test_csp_pending_returns_to_idle_on_sell_to_open_cancel(db_repos):
 async def test_cc_pending_returns_to_shares_held_on_sell_to_open_cancel(db_repos):
     """Wheel CC entry cancellation: CC_PENDING → SHARES_HELD (still own underlying)."""
     broker = PaperBroker(cash=20_000)
+    # 2026-08-26 parity audit: the broker must actually hold the underlying or
+    # the new share-parity phase (rightly) flags the divergence.
+    broker._stock["F"] = (100, 10.0)
     rogue = Order(
         account_id="test",
         symbol="F",

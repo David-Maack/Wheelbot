@@ -907,6 +907,9 @@ async def test_reconcile_positions_isolates_failing_symbol(db_repos, monkeypatch
     """Part A: an exception in _diff_one for one symbol doesn't abort the
     per-symbol loop for the others."""
     broker = PaperBroker(cash=20_000)
+    # 2026-08-26 parity audit: the broker must actually hold BAC's shares or
+    # the new share-parity phase (rightly) flags the divergence.
+    broker._stock["BAC"] = (100, 30.0)
     await db_repos.positions.insert(
         Position(account_id="test", symbol="F", state=PositionState.CSP_OPEN,
                  shares=0, state_changed_at=_utc())
