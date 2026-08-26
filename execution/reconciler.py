@@ -1103,12 +1103,18 @@ class Reconciler:
                     if rows_by_symbol.get(cyc.symbol.upper())
                     else "broker holds nothing on the symbol"
                 )
+                # repo rows may carry state as plain str — same normalization
+                # as _scan_roll_triggers.
+                state_str = (
+                    "MISSING" if state is None
+                    else state.value if hasattr(state, "value") else str(state)
+                )
                 summary.parity_flags += 1
                 await self._flag_manual_intervention(
                     cyc.symbol,
                     f"parity audit: cycle {cyc.id} ({cyc.strategy_id}) open "
                     f"since {cyc.started_at:%Y-%m-%d} but position state is "
-                    f"{state.value if state is not None else 'MISSING'}; "
+                    f"{state_str}; "
                     f"{exposure} — orphaned cycle",
                     summary,
                     strategy_id=cyc.strategy_id,
@@ -1143,11 +1149,14 @@ class Reconciler:
                 local_shares.get(lp.symbol.upper(), 0.0) + shares
             )
             if lp.state not in _SHARE_HOLDING_STATES and lp.state not in _OPERATOR_STATES:
+                lp_state_str = (
+                    lp.state.value if hasattr(lp.state, "value") else str(lp.state)
+                )
                 summary.parity_flags += 1
                 await self._flag_manual_intervention(
                     lp.symbol,
                     f"parity audit: position row holds {shares:g} shares in "
-                    f"non-share-holding state {lp.state.value} — untracked stock",
+                    f"non-share-holding state {lp_state_str} — untracked stock",
                     summary,
                     strategy_id=lp.strategy_id,
                 )
