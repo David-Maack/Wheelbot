@@ -155,6 +155,34 @@ _DIFF_ONE_NO_TRANSITION_STATES: frozenset[PositionState] = frozenset({
     PositionState.KILLED,
 })
 
+# 2026-08-26 audit: states that mean "this position is NOT carrying the
+# exposure of an open cycle". A wheel_cycle left open while its position sits
+# in one of these is the exact signature of the June-23 incident: nine cycles
+# (COIN, PLTR, META, ...) went IDLE on a close / earnings flag_manual while
+# their broker exposure lived on, got liquidated with no DB record, and
+# ~$3.8k of realized P&L stayed invisible until a manual backfill.
+# Operator-owned states (MANUAL_INTERVENTION, BROKER_DOWN, KILLED) are
+# deliberately absent — those are already in front of a human.
+_CYCLE_ABANDONED_STATES: frozenset[PositionState] = frozenset({
+    PositionState.IDLE,
+    PositionState.SCANNING,
+    PositionState.CSP_CLOSED,
+    PositionState.CC_CLOSED,
+    PositionState.CALLED_AWAY,
+    PositionState.SPREAD_CLOSED,
+    PositionState.SPREAD_ASSIGNED,
+})
+
+# States in which a position row legitimately carries stock. A row with
+# shares != 0 in any OTHER non-operator state is untracked stock (COIN sat
+# IDLE with 100 shares for three months while nobody sold calls against it).
+_SHARE_HOLDING_STATES: frozenset[PositionState] = frozenset({
+    PositionState.ASSIGNED,
+    PositionState.SHARES_HELD,
+    PositionState.CC_PENDING,
+    PositionState.CC_OPEN,
+})
+
 # TICKET-014.5: order types whose P&L multiplier _compute_cycle_pnl knows.
 # Options trade at 100×; the synthetic stock legs written by assignment /
 # called-away (BUY_TO_OPEN / SELL_TO_CLOSE with option_type=None) trade at 1×.
@@ -181,6 +209,7 @@ class ReconcileSummary:
     cycles_closed: int = 0
     cycles_opened: int = 0
     rolls_evaluated: int = 0
+    parity_flags: int = 0
     transitions: list[tuple[str, PositionState, PositionState, str]] = field(default_factory=list)
 
 
@@ -234,6 +263,7 @@ class Reconciler:
 
             await self._process_orders(broker_orders, summary)
             await self._reconcile_positions(broker_positions, summary)
+            await self._audit_cycle_parity(broker_positions, summary)
             if self._roll_evaluator is not None:
                 await self._scan_roll_triggers(summary)
 
@@ -243,6 +273,7 @@ class Reconciler:
             ctx["expirations"] = summary.expirations_processed
             ctx["manual_interventions"] = summary.manual_interventions
             ctx["rolls_evaluated"] = summary.rolls_evaluated
+            ctx["parity_flags"] = summary.parity_flags
         return summary
 
     async def _scan_roll_triggers(self, summary: ReconcileSummary) -> None:
@@ -1019,6 +1050,124 @@ class Reconciler:
                 f"broker shows {rep.state} for {rep.symbol} but no local row",
                 summary,
             )
+
+    async def _audit_cycle_parity(
+        self,
+        broker_positions: list[Position],
+        summary: ReconcileSummary,
+    ) -> None:
+        """2026-08-26 audit: cycle/position parity — the divergence class the
+        order- and shape-driven paths above cannot see.
+
+        _diff_one keys on ACTIVE states, so an IDLE row still holding shares,
+        or an open wheel_cycle whose position was reset, is invisible to it by
+        design. This phase asserts two invariants and flags violations as
+        MANUAL_INTERVENTION (spec §10 — never auto-correct):
+
+          (a) an open wheel_cycle older than `cycle_parity_min_age_days`
+              implies a position in an exposure-bearing state;
+          (b) rows carrying shares are in share-holding states, and per-symbol
+              share totals agree with the broker.
+
+        Config (reconciler section): cycle_parity_enabled (default true),
+        cycle_parity_min_age_days (default 7 — young cycles churn states
+        legitimately between legs).
+        """
+        section = self._config.get("reconciler", {})
+        if not section.get("cycle_parity_enabled", True):
+            return
+        min_age = timedelta(days=float(section.get("cycle_parity_min_age_days", 7)))
+        now = _utcnow()
+        rows_by_symbol: dict[str, list[Position]] = {}
+        for p in broker_positions:
+            rows_by_symbol.setdefault(p.symbol.upper(), []).append(p)
+
+        # (a) open cycles whose position no longer carries their exposure.
+        try:
+            open_cycles = await self._repos.cycles.list_open(self._account_id)
+        except Exception as exc:  # noqa: BLE001 — audit must not kill the tick
+            log_checkpoint("parity_cycles_fail", status="fail", error=str(exc))
+            open_cycles = []
+        for cyc in open_cycles:
+            try:
+                if cyc.started_at is None or now - cyc.started_at < min_age:
+                    continue
+                pos = await self._repos.positions.get_by_symbol(
+                    self._account_id, cyc.symbol, strategy_id=cyc.strategy_id
+                )
+                state = pos.state if pos is not None else None
+                if state is not None and state not in _CYCLE_ABANDONED_STATES:
+                    continue  # active exposure, or already operator-owned
+                exposure = (
+                    "broker still shows exposure on the symbol"
+                    if rows_by_symbol.get(cyc.symbol.upper())
+                    else "broker holds nothing on the symbol"
+                )
+                summary.parity_flags += 1
+                await self._flag_manual_intervention(
+                    cyc.symbol,
+                    f"parity audit: cycle {cyc.id} ({cyc.strategy_id}) open "
+                    f"since {cyc.started_at:%Y-%m-%d} but position state is "
+                    f"{state.value if state is not None else 'MISSING'}; "
+                    f"{exposure} — orphaned cycle",
+                    summary,
+                    strategy_id=cyc.strategy_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — per-item isolation
+                log_checkpoint(
+                    "parity_cycle_item_fail",
+                    status="fail",
+                    symbol=cyc.symbol,
+                    cycle_id=cyc.id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        # (b) share-ledger parity.
+        _OPERATOR_STATES = (
+            PositionState.MANUAL_INTERVENTION,
+            PositionState.BROKER_DOWN,
+            PositionState.KILLED,
+        )
+        try:
+            local_positions = await self._repos.positions.list_all(self._account_id)
+        except Exception as exc:  # noqa: BLE001
+            log_checkpoint("parity_shares_fail", status="fail", error=str(exc))
+            return
+        local_shares: dict[str, float] = {}
+        local_symbols = {p.symbol.upper() for p in local_positions}
+        for lp in local_positions:
+            shares = float(lp.shares or 0)
+            if shares == 0:
+                continue
+            local_shares[lp.symbol.upper()] = (
+                local_shares.get(lp.symbol.upper(), 0.0) + shares
+            )
+            if lp.state not in _SHARE_HOLDING_STATES and lp.state not in _OPERATOR_STATES:
+                summary.parity_flags += 1
+                await self._flag_manual_intervention(
+                    lp.symbol,
+                    f"parity audit: position row holds {shares:g} shares in "
+                    f"non-share-holding state {lp.state.value} — untracked stock",
+                    summary,
+                    strategy_id=lp.strategy_id,
+                )
+        broker_shares = {
+            sym: sum(float(r.shares or 0) for r in rows)
+            for sym, rows in rows_by_symbol.items()
+        }
+        for sym in set(local_shares) | set(broker_shares):
+            if sym not in local_symbols:
+                continue  # wholly unknown symbols are _reconcile_positions' case
+            db_qty = local_shares.get(sym, 0.0)
+            br_qty = broker_shares.get(sym, 0.0)
+            if abs(db_qty - br_qty) > 1e-9:
+                summary.parity_flags += 1
+                await self._flag_manual_intervention(
+                    sym,
+                    f"parity audit: share count mismatch — db {db_qty:g} vs "
+                    f"broker {br_qty:g}",
+                    summary,
+                )
 
     async def _diff_one(
         self,
