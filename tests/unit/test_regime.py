@@ -11,7 +11,7 @@ from risk.regime import RegimeInputs, _upsert, classify_regime
 
 
 def test_classify_high_vol_when_vix_above_max():
-    inputs = RegimeInputs(spy_close=500, spy_sma_200=400, vix_close=40, vix_change_pct=5, choppiness=50)
+    inputs = RegimeInputs(spy_close=500, spy_sma_200=400, spy_sma_20=490, vix_close=40, vix_change_pct=5, choppiness=50)
     regime, csps_allowed, bear_calls_allowed = classify_regime(inputs, vix_max=35, vix_spike_pct=30)
     assert regime == Regime.HIGH_VOL
     assert csps_allowed is False
@@ -20,7 +20,7 @@ def test_classify_high_vol_when_vix_above_max():
 
 
 def test_classify_high_vol_when_vix_spike():
-    inputs = RegimeInputs(spy_close=500, spy_sma_200=400, vix_close=20, vix_change_pct=35, choppiness=50)
+    inputs = RegimeInputs(spy_close=500, spy_sma_200=400, spy_sma_20=490, vix_close=20, vix_change_pct=35, choppiness=50)
     regime, csps_allowed, bear_calls_allowed = classify_regime(inputs, vix_max=35, vix_spike_pct=30)
     assert regime == Regime.HIGH_VOL
     assert csps_allowed is False
@@ -28,7 +28,7 @@ def test_classify_high_vol_when_vix_spike():
 
 
 def test_classify_bear_when_spy_below_sma():
-    inputs = RegimeInputs(spy_close=380, spy_sma_200=400, vix_close=18, vix_change_pct=5, choppiness=50)
+    inputs = RegimeInputs(spy_close=380, spy_sma_200=400, spy_sma_20=395, vix_close=18, vix_change_pct=5, choppiness=50)
     regime, csps_allowed, bear_calls_allowed = classify_regime(inputs, vix_max=35, vix_spike_pct=30)
     assert regime == Regime.BEAR_TREND
     assert csps_allowed is False
@@ -37,7 +37,7 @@ def test_classify_bear_when_spy_below_sma():
 
 
 def test_classify_bull_when_calm_uptrend():
-    inputs = RegimeInputs(spy_close=500, spy_sma_200=400, vix_close=15, vix_change_pct=2, choppiness=40)
+    inputs = RegimeInputs(spy_close=500, spy_sma_200=400, spy_sma_20=490, vix_close=15, vix_change_pct=2, choppiness=40)
     regime, csps_allowed, bear_calls_allowed = classify_regime(inputs, vix_max=35, vix_spike_pct=30)
     assert regime == Regime.BULL_TREND
     assert csps_allowed is True
@@ -46,7 +46,7 @@ def test_classify_bull_when_calm_uptrend():
 
 
 def test_classify_neutral_when_choppy_uptrend():
-    inputs = RegimeInputs(spy_close=500, spy_sma_200=400, vix_close=18, vix_change_pct=2, choppiness=70)
+    inputs = RegimeInputs(spy_close=500, spy_sma_200=400, spy_sma_20=490, vix_close=18, vix_change_pct=2, choppiness=70)
     regime, csps_allowed, bear_calls_allowed = classify_regime(inputs, vix_max=35, vix_spike_pct=30)
     assert regime == Regime.NEUTRAL
     assert csps_allowed is True
@@ -108,3 +108,58 @@ async def test_upsert_persists_bear_calls_allowed_true(db_repos):
         row = await cur.fetchone()
     assert row["csps_allowed"] == 0
     assert row["bear_calls_allowed"] == 1
+
+
+# -- 2026-08-26 PULLBACK regime (defensive-only) ------------------------------
+
+def test_classify_pullback_below_20d_above_200d():
+    """The Aug-2026 signature: off the highs, under the 20d, miles above the
+    200d. Old ladder said BULL_TREND for 64 straight days of this."""
+    inputs = RegimeInputs(spy_close=766, spy_sma_200=709, spy_sma_20=772,
+                          vix_close=15, vix_change_pct=2, choppiness=50)
+    regime, csps_allowed, bear_calls_allowed = classify_regime(inputs, vix_max=35, vix_spike_pct=30)
+    assert regime == Regime.PULLBACK
+    # Defensive-only: no bullish premium into weak tape...
+    assert csps_allowed is False
+    # ...and bear calls stay OFF until they earn their way in with evidence.
+    assert bear_calls_allowed is False
+
+
+def test_pullback_margin_keeps_shallow_dips_bull():
+    """Hysteresis: within 0.3% of the 20d SMA is still BULL_TREND — damps the
+    ~26/yr raw-crossing whipsaw."""
+    inputs = RegimeInputs(spy_close=499, spy_sma_200=400, spy_sma_20=500,
+                          vix_close=15, vix_change_pct=2, choppiness=40)
+    regime, csps_allowed, _ = classify_regime(inputs, vix_max=35, vix_spike_pct=30)
+    assert regime == Regime.BULL_TREND
+    assert csps_allowed is True
+
+
+def test_bear_takes_precedence_over_pullback():
+    """Below BOTH SMAs is BEAR_TREND (bear calls allowed), not PULLBACK."""
+    inputs = RegimeInputs(spy_close=380, spy_sma_200=400, spy_sma_20=395,
+                          vix_close=18, vix_change_pct=5, choppiness=50)
+    regime, _, bear_calls_allowed = classify_regime(inputs, vix_max=35, vix_spike_pct=30)
+    assert regime == Regime.BEAR_TREND
+    assert bear_calls_allowed is True
+
+
+def test_pullback_takes_precedence_over_choppy_neutral():
+    """Choppy tape BELOW the 20d is PULLBACK, not NEUTRAL — defense wins ties
+    (NEUTRAL would have re-enabled CSPs)."""
+    inputs = RegimeInputs(spy_close=490, spy_sma_200=400, spy_sma_20=500,
+                          vix_close=18, vix_change_pct=2, choppiness=70)
+    regime, csps_allowed, bear_calls_allowed = classify_regime(inputs, vix_max=35, vix_spike_pct=30)
+    assert regime == Regime.PULLBACK
+    assert csps_allowed is False
+    assert bear_calls_allowed is False
+
+
+def test_pullback_margin_is_configurable():
+    """A wider margin keeps the same tape BULL_TREND."""
+    inputs = RegimeInputs(spy_close=495, spy_sma_200=400, spy_sma_20=500,
+                          vix_close=15, vix_change_pct=2, choppiness=40)
+    tight = classify_regime(inputs, vix_max=35, vix_spike_pct=30, pullback_margin_pct=0.3)
+    wide = classify_regime(inputs, vix_max=35, vix_spike_pct=30, pullback_margin_pct=2.0)
+    assert tight[0] == Regime.PULLBACK
+    assert wide[0] == Regime.BULL_TREND

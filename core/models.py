@@ -147,6 +147,11 @@ class Regime(StrEnum):
     NEUTRAL = "NEUTRAL"
     BEAR_TREND = "BEAR_TREND"
     HIGH_VOL = "HIGH_VOL"
+    # 2026-08-26 regime-sensitivity fix: SPY below its 20d SMA but above the
+    # 200d — the intermediate gear between "all clear" and "full bear" that
+    # fired on ~19% of days over 5y. The 200d-only ladder called BULL_TREND
+    # for 64 straight days through the entire Aug-2026 decline from the ATH.
+    PULLBACK = "PULLBACK"
 
 
 class _Base(BaseModel):
@@ -243,6 +248,7 @@ class RegimeSnapshot(_Base):
     snapshot_date: date
     spy_close: float | None = None
     spy_sma_200: float | None = None
+    spy_sma_20: float | None = None   # migration 016: PULLBACK regime input
     spy_above_sma: bool | None = None
     vix_close: float | None = None
     vix_change_pct: float | None = None

@@ -123,11 +123,12 @@ CREATE TABLE IF NOT EXISTS regime_snapshots (
     snapshot_date   DATE    UNIQUE NOT NULL,
     spy_close       REAL,
     spy_sma_200     REAL,
+    spy_sma_20      REAL,                              -- migration 016: PULLBACK regime input
     spy_above_sma   BOOLEAN,
     vix_close       REAL,
     vix_change_pct  REAL,
     choppiness      REAL,
-    regime          TEXT,                              -- BULL_TREND, NEUTRAL, BEAR_TREND, HIGH_VOL
+    regime          TEXT,                              -- BULL_TREND, NEUTRAL, BEAR_TREND, HIGH_VOL, PULLBACK
     csps_allowed    BOOLEAN,
     bear_calls_allowed BOOLEAN,                         -- mirrored gate for bear_call_spread (Sprint 10)
     notes           TEXT,
