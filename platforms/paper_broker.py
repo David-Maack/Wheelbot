@@ -402,9 +402,21 @@ class PaperBroker(Broker):
         elif order.order_type == OrderType.BUY_TO_CLOSE and order.contract_symbol:
             self._cash -= price * shares
             self._open_options.pop(order.contract_symbol, None)
+        elif order.order_type == OrderType.BUY_TO_OPEN and order.contract_symbol:
+            # 2026-08-26 parity audit: a single-leg long option (swing, PMCC
+            # long) is an OPTION position, not stock. Booking it via
+            # _add_shares made get_positions report phantom equity shares —
+            # the real Alpaca adapter reports option rows with shares=0.
+            # Mirror the multi-leg path: track in _open_options. Cash math
+            # left exactly as before (PaperBroker's simplified accounting).
+            self._cash -= price * contracts
+            self._open_options[order.contract_symbol] = order
         elif order.order_type == OrderType.BUY_TO_OPEN:
             self._cash -= price * contracts
             self._add_shares(order.symbol, contracts, price)
+        elif order.order_type == OrderType.SELL_TO_CLOSE and order.contract_symbol:
+            self._cash += price * contracts
+            self._open_options.pop(order.contract_symbol, None)
         elif order.order_type == OrderType.SELL_TO_CLOSE:
             self._cash += price * contracts
             self._remove_shares(order.symbol, contracts)

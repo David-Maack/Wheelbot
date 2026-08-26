@@ -733,6 +733,9 @@ async def test_cc_fill_links_order_to_existing_cycle(db_repos):
     existing wheel cycle. Previously only puts got cycle-linked, so CC orders
     had cycle_id=NULL and the dashboard read the expired CSP for DTE/P&L."""
     broker = PaperBroker(cash=20_000)
+    # 2026-08-26 parity audit: the broker must actually hold the underlying or
+    # the new share-parity phase (rightly) flags the divergence.
+    broker._stock["F"] = (100, 9.60)
     now = _utc()
     # Open wheel cycle (from the original CSP that was assigned).
     cycle_id = await db_repos.cycles.insert(
