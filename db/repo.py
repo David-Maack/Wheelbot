@@ -435,7 +435,10 @@ class StateLogRepo(_Repo):
         self, position_id: int, limit: int = 100
     ) -> list[StateLog]:
         rows = await self._fetch_all(
-            "SELECT * FROM state_log WHERE position_id = ? ORDER BY created_at DESC LIMIT ?",
+            # id tiebreak: rows written in the same clock tick (flag + restore
+            # in one call; Windows timer resolution) otherwise sort randomly.
+            "SELECT * FROM state_log WHERE position_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
             (position_id, limit),
         )
         return [StateLog(**r) for r in rows]
