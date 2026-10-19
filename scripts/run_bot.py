@@ -311,6 +311,36 @@ async def _execute_roll_action(
             )
 
 
+MONITOR_FAILURE_COOLDOWN_HOURS = 24.0
+
+
+async def _report_monitor_failure(
+    repos: Repos, step: str, strategy_id: str, exc: Exception,
+) -> None:
+    """A crashing risk monitor (drawdown / win-rate / expectancy) must never
+    break trading, but it must not be silent either: the win-rate floor threw
+    on every tick from 2026-08-26 to 2026-10-19 (unknown cycle_outcome) and
+    only the JSON log knew. Checkpoint every time; Discord at most once per
+    24h per (monitor, strategy)."""
+    log_checkpoint(step, status="fail", strategy=strategy_id, error=str(exc))
+    try:
+        if await repos.alert_rate_limits.try_fire(
+            f"{step}:{strategy_id}", cooldown_hours=MONITOR_FAILURE_COOLDOWN_HOURS,
+        ):
+            await notify(
+                "risk.monitor_check_failed",
+                f"{strategy_id}: {step} — safety check is NOT running",
+                strategy=strategy_id,
+                step=step,
+                error=str(exc)[:500],
+            )
+    except Exception as notify_exc:  # alerting must not break trading either
+        log_checkpoint(
+            "monitor_failure_alert_failed", status="fail",
+            strategy=strategy_id, monitor=step, error=str(notify_exc),
+        )
+
+
 async def _propose_and_route(
     *,
     broker: Broker,
@@ -588,12 +618,7 @@ async def _propose_and_route(
         try:
             await auto_disable.check_and_apply(repos, strategy, config)
         except Exception as exc:  # defensive — never let monitoring break trading
-            log_checkpoint(
-                "auto_disable_check_failed",
-                status="fail",
-                strategy=strategy.id,
-                error=str(exc),
-            )
+            await _report_monitor_failure(repos, "auto_disable_check_failed", strategy.id, exc)
         # TICKET-009: evaluate the win-rate floor right after drawdown so
         # both signals are re-derived from the freshest cycle data. Independent
         # of drawdown — a single tick can trip drawdown WARNING and win-rate
@@ -602,24 +627,14 @@ async def _propose_and_route(
         try:
             await win_rate_floor.check_and_apply(repos, strategy, config)
         except Exception as exc:
-            log_checkpoint(
-                "win_rate_floor_check_failed",
-                status="fail",
-                strategy=strategy.id,
-                error=str(exc),
-            )
+            await _report_monitor_failure(repos, "win_rate_floor_check_failed", strategy.id, exc)
         # 2026-07-06: expectancy floor — same cadence, same defensive catch.
         # Runs after the win-rate floor; whichever trips first owns the pause
         # (neither overwrites the other).
         try:
             await expectancy_floor.check_and_apply(repos, strategy, config)
         except Exception as exc:
-            log_checkpoint(
-                "expectancy_floor_check_failed",
-                status="fail",
-                strategy=strategy.id,
-                error=str(exc),
-            )
+            await _report_monitor_failure(repos, "expectancy_floor_check_failed", strategy.id, exc)
     log_checkpoint(
         "bot_propose_route_summary",
         status="ok",

@@ -395,3 +395,32 @@ async def test_get_win_rate_overview_insufficient_data(db_repos):
     assert info["action"] == "insufficient_data"
     assert info["sample_size"] == 3
     assert info["win_rate"] is None
+
+
+# -- 2026-10-19 regression: backfill outcome literal ------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfilled_outcome_does_not_crash_evaluate(db_repos):
+    """The 2026-08-26 ledger repair wrote cycle_outcome
+    'RECONCILED_BACKFILL_20260826' via raw SQL. Before it was in CycleOutcome,
+    loading those rows raised a pydantic error and the win-rate floor failed
+    on every tick for 8 weeks. The rows must load and count by final_pnl."""
+    cfg = _cfg()
+    ids = await _insert_cycles(
+        db_repos, strategy_id="put_spread",
+        pnls=[100, 100, 100, 100, -50, -50, -50, -50, -50, -50],
+    )
+    conn = await db_repos.db.connect()
+    await conn.execute(
+        "UPDATE wheel_cycles SET cycle_outcome = 'RECONCILED_BACKFILL_20260826' "
+        "WHERE id IN (?, ?)",
+        (ids[0], ids[5]),
+    )
+    await conn.commit()
+    result = await evaluate(db_repos, "put_spread", cfg, account_id="test")
+    assert result.sample_size == 10
+    assert result.win_rate == pytest.approx(40.0)
+    assert result.action == "pause"
+    closed = await db_repos.cycles.list_closed("test", limit=200)
+    assert {c.cycle_outcome for c in closed} >= {CycleOutcome.RECONCILED_BACKFILL_20260826}

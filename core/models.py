@@ -110,6 +110,11 @@ class CycleOutcome(StrEnum):
     # — stop / target / time — is on the close order's trigger_reason.
     SWING_CLOSED = "SWING_CLOSED"
     MANUAL_CLOSE = "MANUAL_CLOSE"
+    # 2026-08-26 ledger repair: 9 phantom cycles backfilled from the Alpaca
+    # activities API carry this literal. It was missing here, so every load of
+    # those rows (win-rate floor, /cycles) raised a validation error until
+    # 2026-10-19. Any future backfill outcome must be added here FIRST.
+    RECONCILED_BACKFILL_20260826 = "RECONCILED_BACKFILL_20260826"
 
 
 class StateLogTrigger(StrEnum):
