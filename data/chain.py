@@ -14,7 +14,7 @@ Returns OptionContracts. Selection (highest yield, etc) lives in the selectors.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from core.broker import Broker
@@ -76,8 +76,10 @@ def _populate_greeks(
     underlying_price: float,
     today: date,
     r: float,
+    now: datetime | None = None,
 ) -> list[OptionContract]:
-    """Fill in missing delta/theta/vega/iv from BS using the contract's mid price."""
+    """Fill in missing delta/theta/vega/iv from BS using the contract's mid price.
+    `now` prices expiration-day contracts on intraday time left (0DTE)."""
     out: list[OptionContract] = []
     for c in contracts:
         if c.delta is not None:
@@ -96,6 +98,7 @@ def _populate_greeks(
             market_price=market_price,
             today=today,
             r=r,
+            now=now,
         )
         if result is None:
             out.append(c)
@@ -122,12 +125,16 @@ async def fetch_filtered_chain(
     *,
     today: date | None = None,
     underlying_price: float | None = None,
+    now: datetime | None = None,
 ) -> list[OptionContract]:
     """Return contracts on `underlying` matching `filters`.
 
     `underlying_price` is the spot used for Greeks fallback; if None, we ask the
     broker for a quote. Failing that, contracts without broker-supplied Greeks
     are dropped (we can't filter on delta we don't have).
+
+    `now` must be passed for same-day (DTE 0) chains: without it the Greeks
+    fallback sees T=0 on expiration day and every contract is dropped.
     """
     today = today or date.today()
     opt_type = OptionType.PUT if side == "put" else OptionType.CALL
@@ -155,7 +162,9 @@ async def fetch_filtered_chain(
             underlying_price = None
 
     if underlying_price is not None:
-        with_greeks = _populate_greeks(in_window, underlying_price, today, filters.risk_free_rate)
+        with_greeks = _populate_greeks(
+            in_window, underlying_price, today, filters.risk_free_rate, now=now,
+        )
     else:
         with_greeks = in_window
 

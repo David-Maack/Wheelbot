@@ -535,3 +535,61 @@ async def test_skips_when_max_loss_exceeds_capital_cap(db_repos):
     proposal = await _propose(db_repos, _entry_broker(), now=_et(10, 5),
                               strategy=strat)
     assert proposal is None
+
+
+# -- 2026-10-19: broker chain WITHOUT Greeks (the live Alpaca paper shape) ---
+
+
+def _seed_delta_less_chain(broker: PaperBroker, symbol: str, spot: float, now: datetime) -> None:
+    """Same-day chain priced off Black-Scholes at 14% vol, with delta=None
+    on every contract — the shape the live feed returns. Every pre-fix test
+    seeded broker deltas, so the fallback (where T was 0 on expiry day) was
+    never exercised and the module shipped unable to trade. Use a realistic
+    SPY level: at 14% vol 1 sd over ~6h is only ~$2.80, so $1 strikes around
+    a $500 spot skip straight over the 0.15-0.25 delta band."""
+    from core.models import Quote
+    from data.greeks import bs_price, years_to_expiry
+
+    T = years_to_expiry(TODAY, TODAY, now=now)
+    contracts: list[OptionContract] = []
+    for offset in range(-15, 16):
+        strike = spot + offset
+        for kind in (OptionType.PUT, OptionType.CALL):
+            p = bs_price(spot, strike, T, 0.14, kind)
+            contracts.append(OptionContract(
+                underlying=symbol, occ_symbol=_occ(symbol, TODAY, kind.value, strike),
+                strike=strike, expiration=TODAY, option_type=kind,
+                bid=max(0.01, round(p - 0.01, 2)), ask=round(p + 0.01, 2),
+                delta=None, open_interest=1000, volume=500,
+            ))
+    broker.seed_chain(symbol, contracts)
+    broker.seed_quote(Quote(symbol=symbol, bid=spot - 0.01, ask=spot + 0.01))
+
+
+@pytest.mark.asyncio
+async def test_fetch_same_day_chain_without_broker_greeks():
+    from data.chain import ChainFilters, fetch_filtered_chain
+
+    broker = PaperBroker(cash=50_000)
+    now = _et(10, 5)
+    _seed_delta_less_chain(broker, "SPY", 766.0, now)
+    filters = ChainFilters(dte_min=0, dte_max=0, delta_min=0.15, delta_max=0.25)
+    # Without the clock: T=0 on expiry day -> no deltas -> nothing (the bug).
+    assert await fetch_filtered_chain(broker, "SPY", "put", filters, today=TODAY) == []
+    got = await fetch_filtered_chain(broker, "SPY", "put", filters, today=TODAY, now=now)
+    assert got, "expected 0.15-0.25 delta puts once T is intraday"
+    assert all(0.15 <= abs(c.delta) <= 0.25 for c in got)
+
+
+@pytest.mark.asyncio
+async def test_entry_proposes_from_delta_less_chain(db_repos):
+    broker = PaperBroker(cash=50_000)
+    now = _et(10, 5)
+    _seed_delta_less_chain(broker, "SPY", 766.0, now)
+    proposal = await _propose(db_repos, broker, now=now, session_ref=765.0)
+    assert proposal is not None
+    assert proposal.direction == DIRECTION_BULL_PUT
+    short = next(x for x in proposal.legs if x.action == OrderType.SELL_TO_OPEN)
+    long_ = next(x for x in proposal.legs if x.action == OrderType.BUY_TO_OPEN)
+    assert short.strike < 766.0
+    assert short.strike - long_.strike == pytest.approx(2.0)

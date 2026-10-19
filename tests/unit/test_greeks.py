@@ -121,3 +121,48 @@ def test_fill_greeks_solves_iv_when_only_market_price_given():
     assert res is not None
     assert res.iv is not None
     assert 0.10 < res.iv < 1.0
+
+
+# -- 2026-10-19: expiration-day (0DTE) time to expiry -----------------------
+
+
+def test_years_to_expiry_same_day_uses_time_to_close():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from data.greeks import years_to_expiry
+
+    et = ZoneInfo("America/New_York")
+    d = date(2026, 10, 19)
+    # Old behaviour preserved when no clock is passed.
+    assert years_to_expiry(d, d) == 0.0
+    # 10:00 ET -> 6h to the 16:00 close.
+    t = years_to_expiry(d, d, now=datetime(2026, 10, 19, 10, 0, tzinfo=et))
+    assert t == pytest.approx(6 / (365 * 24))
+    # Naive datetimes are read as UTC: 14:00Z == 10:00 EDT.
+    assert years_to_expiry(d, d, now=datetime(2026, 10, 19, 14, 0)) == pytest.approx(t)
+    # At/after the close -> expired.
+    assert years_to_expiry(d, d, now=datetime(2026, 10, 19, 16, 0, tzinfo=et)) == 0.0
+    assert years_to_expiry(d, d, now=datetime(2026, 10, 19, 17, 30, tzinfo=et)) == 0.0
+    # DTE >= 1 unchanged by `now` (whole days).
+    assert years_to_expiry(date(2026, 10, 23), d,
+                           now=datetime(2026, 10, 19, 10, 0, tzinfo=et)) == pytest.approx(4 / 365)
+
+
+def test_fill_greeks_prices_0dte_contract_when_now_given():
+    """The bug: on expiry day fill_greeks returned None for every contract,
+    so strategies/zero_dte.py never saw a delta. With `now` it round-trips."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    d = date(2026, 10, 19)
+    now = datetime(2026, 10, 19, 10, 5, tzinfo=et)
+    T = (16 * 60 - (10 * 60 + 5)) / (365 * 24 * 60)
+    # 1 sd over ~5.9h at 14% vol is ~$2.80 on SPY 766, so the 764P is ~0.24 delta.
+    price = bs_price(766.0, 764.0, T, 0.14, OptionType.PUT)
+    assert fill_greeks(766.0, 764.0, d, OptionType.PUT, price, d) is None  # old path
+    res = fill_greeks(766.0, 764.0, d, OptionType.PUT, price, d, now=now)
+    assert res is not None
+    assert res.iv == pytest.approx(0.14, abs=1e-3)
+    assert -0.30 < res.delta < -0.18

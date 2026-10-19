@@ -17,12 +17,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, time
+from zoneinfo import ZoneInfo
 
 from core.models import OptionType
 
 DEFAULT_RISK_FREE_RATE = 0.045
 _SQRT_2PI = math.sqrt(2 * math.pi)
+_ET = ZoneInfo("America/New_York")
+_EXPIRY_CLOSE_ET = time(16, 0)  # equity/ETF options stop trading and settle at the 4pm close
+_SECONDS_PER_YEAR = 365.0 * 86400.0
 
 
 def _norm_cdf(x: float) -> float:
@@ -37,9 +41,23 @@ def _d1(S: float, K: float, T: float, r: float, sigma: float) -> float:
     return (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
 
 
-def years_to_expiry(expiration: date, today: date) -> float:
-    """Calendar-year fraction. <=0 means already expired."""
+def years_to_expiry(expiration: date, today: date, now: datetime | None = None) -> float:
+    """Calendar-year fraction. <=0 means already expired.
+
+    Whole days for DTE >= 1 (unchanged — selection at 30-45 DTE doesn't care
+    about hours). On expiration day the whole-day count is 0, which made every
+    same-day contract look expired: fill_greeks returned None, no 0DTE contract
+    ever got a delta, and strategies/zero_dte.py logged
+    zero_dte_no_short_candidates on every tick from July to 2026-10-19. When
+    the caller passes `now`, expiration day instead returns the real time left
+    until the 16:00 ET close. Without `now` it stays 0 (old behaviour), so
+    only callers that opt in see intraday values.
+    """
     days = (expiration - today).days
+    if days == 0 and now is not None:
+        moment = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        close = datetime.combine(expiration, _EXPIRY_CLOSE_ET, tzinfo=_ET)
+        return max((close - moment).total_seconds(), 0.0) / _SECONDS_PER_YEAR
     return max(days, 0) / 365.0
 
 
@@ -168,12 +186,15 @@ def fill_greeks(
     *,
     iv: float | None = None,
     r: float = DEFAULT_RISK_FREE_RATE,
+    now: datetime | None = None,
 ) -> GreeksResult | None:
     """Compute Greeks for a single contract. If `iv` is None, solve from market_price.
 
     Returns None when we can't get an IV (no market_price + no iv supplied).
+    Pass `now` to price expiration-day contracts on time left to the close
+    (see years_to_expiry).
     """
-    T = years_to_expiry(expiration, today)
+    T = years_to_expiry(expiration, today, now)
     if T <= 0:
         return None
     if iv is None:

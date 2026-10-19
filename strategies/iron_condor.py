@@ -38,7 +38,7 @@ post-paper-validation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from core.broker import Broker
@@ -139,6 +139,7 @@ async def select_iron_condor(
     today: date | None = None,
     record_chain: Any | None = None,
     ivr: IVRProvider | None = None,
+    now: datetime | None = None,
 ) -> IronCondorCandidate | None:
     """Return a symmetric iron condor candidate, or None if nothing qualifies.
 
@@ -153,6 +154,8 @@ async def select_iron_condor(
       6. net_credit = (sp − lp) + (sc − lc). Reject if
          net_credit / wing_width < min_credit_pct / 100.
       7. max_loss = (wing_width − net_credit) × 100.
+
+    `now` is only needed for same-day (0DTE) chains — see data.chain.
     """
     today = today or date.today()
 
@@ -193,8 +196,12 @@ async def select_iron_condor(
         bid_ask_spread_max_pct=float(params.get("bid_ask_spread_max_pct", 100.0)),
     )
 
-    put_candidates = await fetch_filtered_chain(broker, symbol, "put", put_filters, today=today)
-    call_candidates = await fetch_filtered_chain(broker, symbol, "call", call_filters, today=today)
+    put_candidates = await fetch_filtered_chain(
+        broker, symbol, "put", put_filters, today=today, now=now,
+    )
+    call_candidates = await fetch_filtered_chain(
+        broker, symbol, "call", call_filters, today=today, now=now,
+    )
     if record_chain is not None:
         await record_chain(symbol, "put", put_candidates)
         await record_chain(symbol, "call", call_candidates)
@@ -231,8 +238,12 @@ async def select_iron_condor(
         open_interest_min=0, volume_min=0,
         bid_ask_spread_max_pct=100.0,
     )
-    wide_puts = await fetch_filtered_chain(broker, symbol, "put", wide_filters, today=today)
-    wide_calls = await fetch_filtered_chain(broker, symbol, "call", wide_filters, today=today)
+    wide_puts = await fetch_filtered_chain(
+        broker, symbol, "put", wide_filters, today=today, now=now,
+    )
+    wide_calls = await fetch_filtered_chain(
+        broker, symbol, "call", wide_filters, today=today, now=now,
+    )
     long_put = _find_protective_long(
         wide_puts, short_put, wing_width=wing_width, side=OptionType.PUT,
     )

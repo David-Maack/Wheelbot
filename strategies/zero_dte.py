@@ -175,8 +175,13 @@ async def select_zero_dte_vertical(
     *,
     today: date | None = None,
     record_chain: Any | None = None,
+    now: datetime | None = None,
 ) -> SpreadCandidate | None:
     """Same-day-expiry narrow vertical at ~0.20 short delta.
+
+    `now` is threaded into the chain fetch so the Greeks fallback prices on
+    time left to the close; without it (pre-2026-10-19) T was 0 on expiry day,
+    no contract got a delta and this returned None on every tick.
 
     The existing vertical selectors (spread_selector / call_spread_selector)
     rank shorts by annualized_yield, which is undefined at DTE 0 (divides by
@@ -201,7 +206,10 @@ async def select_zero_dte_vertical(
         volume_min=int(params.get("volume_min", 0)),
         bid_ask_spread_max_pct=float(params.get("bid_ask_spread_max_pct", 100.0)),
     )
-    candidates = await fetch_filtered_chain(broker, symbol, side, filters, today=today)
+    now = now if now is not None else datetime.now(UTC)
+    candidates = await fetch_filtered_chain(
+        broker, symbol, side, filters, today=today, now=now,
+    )
     if record_chain is not None:
         await record_chain(symbol, side, candidates)
     if not candidates:
@@ -218,7 +226,9 @@ async def select_zero_dte_vertical(
         dte_min=0, dte_max=0, delta_min=0.0, delta_max=1.0,
         open_interest_min=0, volume_min=0, bid_ask_spread_max_pct=100.0,
     )
-    full_chain = await fetch_filtered_chain(broker, symbol, side, wide, today=today)
+    full_chain = await fetch_filtered_chain(
+        broker, symbol, side, wide, today=today, now=now,
+    )
     long = _find_protective_long(full_chain, short, wing_width=width, side=opt_type)
     if long is None:
         log_checkpoint("zero_dte_no_long_wing", status="ok", symbol=symbol,
@@ -490,7 +500,7 @@ async def propose_for_symbol(
             "min_credit_pct": float(params.get("condor_min_credit_pct", 10.0)),
         }
         cand = await select_iron_condor(
-            broker, symbol, condor_params, today=today, record_chain=record,
+            broker, symbol, condor_params, today=today, record_chain=record, now=et,
         )
         if cand is None:
             return None
@@ -534,6 +544,7 @@ async def propose_for_symbol(
         direction = pick_direction(float(spot), float(ref))
         cand_v = await select_zero_dte_vertical(
             broker, symbol, params, direction, today=today, record_chain=record,
+            now=et,
         )
         if cand_v is None:
             return None
