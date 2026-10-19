@@ -179,6 +179,7 @@ def in_blackout(
     today: date | None = None,
     block_if_spans: bool = True,
     entry_avoid_days: int | None = None,
+    time_close_dte: int | None = None,
 ) -> bool | None:
     """True if opening a position expiring on `expiration` conflicts with the
     symbol's next earnings date. Two independent triggers (either one → True):
@@ -210,12 +211,58 @@ def in_blackout(
     # `today <= earnings`, NOT `<`: a same-day report (e.g. AMC tonight) must
     # block — the strict comparison let the bot sell premium hours before the gap.
     if entry_avoid_days is not None:
-        return today <= earnings <= today + timedelta(days=entry_avoid_days)
+        imminent = today <= earnings <= today + timedelta(days=entry_avoid_days)
+        if time_close_dte is None:
+            return imminent
+        # 2026-10-19: proximity alone let in trades whose PLANNED hold still
+        # reached earnings (earnings 10d out, 35-DTE spread, 21-DTE close on
+        # day 14), and the mid-cycle recheck then flagged them minutes after
+        # the fill. Also block on the predicate the recheck uses.
+        return imminent or earnings_overlaps_hold(
+            earnings,
+            today=today,
+            expiration=expiration,
+            time_close_dte=time_close_dte,
+            days_before=days_before,
+            days_after=days_after,
+        )
     near_expiry = (earnings - expiration).days <= days_before and (
         expiration - earnings
     ).days <= days_after
     spans = block_if_spans and today <= earnings <= expiration
     return near_expiry or spans
+
+
+def earnings_overlaps_hold(
+    earnings: date,
+    *,
+    today: date,
+    expiration: date,
+    time_close_dte: int,
+    days_before: int,
+    days_after: int,
+) -> bool:
+    """True when a short-premium position would still be OPEN inside the
+    earnings risk window [earnings - days_before, earnings + days_after].
+
+    The position is assumed held from `today` until its planned exit: the
+    strategy's time-close (`expiration - time_close_dte`), or `today` if that
+    date has already passed (a position still open past its time-close is
+    still exposed). `time_close_dte=0` means held to expiration.
+
+    This is the ONE predicate for "is this position exposed to earnings",
+    shared by the entry gate (in_blackout, proximity mode), the mid-cycle
+    recheck, its stale-flag watchdog and the dashboard badge. Before
+    2026-10-19 the entry gate checked only proximity to today while the
+    recheck checked a window around the EXPIRATION, ignoring the time-close,
+    so 30-45 DTE trades whose expiry sat near earnings were flagged
+    MANUAL_INTERVENTION (and left unmanaged) within minutes of filling.
+    """
+    planned_exit = expiration - timedelta(days=max(0, int(time_close_dte)))
+    hold_end = min(expiration, max(today, planned_exit))
+    window_start = earnings - timedelta(days=days_before)
+    window_end = earnings + timedelta(days=days_after)
+    return today <= window_end and window_start <= hold_end
 
 
 def _clear_cache() -> None:

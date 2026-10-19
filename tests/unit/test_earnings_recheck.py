@@ -33,7 +33,7 @@ from risk.earnings_recheck import (
     ACTION_PROVIDER_UNAVAILABLE,
     EarningsRecheckResult,
     check_open_positions_for_new_earnings,
-    is_in_earnings_window,
+    is_exposed_to_earnings,
 )
 
 
@@ -135,24 +135,41 @@ async def _seed_spread(db_repos, *, symbol: str, short_expiration: date) -> Posi
 # -- predicate ---------------------------------------------------------------
 
 
-def test_is_in_earnings_window_basic():
-    """The pure predicate — same math the dashboard and the recheck use.
-    Window around EXPIRATION: [expiration − days_before, expiration + days_after]."""
-    short_exp = date(2026, 7, 5)
-    # Same day → inside.
-    assert is_in_earnings_window(date(2026, 7, 5), short_exp, days_before=5, days_after=2) is True
-    # 3 days BEFORE expiry → inside (within days_before=5).
-    assert is_in_earnings_window(date(2026, 7, 2), short_exp, days_before=5, days_after=2) is True
-    # Exactly 5 days BEFORE expiry → boundary, inside.
-    assert is_in_earnings_window(date(2026, 6, 30), short_exp, days_before=5, days_after=2) is True
-    # 6 days BEFORE expiry → outside (one past days_before).
-    assert is_in_earnings_window(date(2026, 6, 29), short_exp, days_before=5, days_after=2) is False
-    # 2 days AFTER expiry → inside (boundary of days_after).
-    assert is_in_earnings_window(date(2026, 7, 7), short_exp, days_before=5, days_after=2) is True
-    # 3 days AFTER expiry → outside.
-    assert is_in_earnings_window(date(2026, 7, 8), short_exp, days_before=5, days_after=2) is False
-    # 10 days BEFORE expiry → outside.
-    assert is_in_earnings_window(date(2026, 6, 25), short_exp, days_before=5, days_after=2) is False
+def _exposed(earnings: date, short_exp: date, *, today: date, time_close_dte: int) -> bool:
+    return is_exposed_to_earnings(
+        earnings, short_exp, today=today, time_close_dte=time_close_dte,
+        days_before=5, days_after=2,
+    )
+
+
+def test_is_exposed_to_earnings_hold_to_expiry():
+    """time_close_dte=0: held to expiry, so any earnings whose
+    [E-5, E+2] window touches [today, expiry] counts."""
+    today, short_exp = date(2026, 6, 1), date(2026, 7, 5)
+    assert _exposed(date(2026, 7, 5), short_exp, today=today, time_close_dte=0) is True
+    # Mid-hold earnings — the old expiry-window predicate MISSED this one.
+    assert _exposed(date(2026, 6, 20), short_exp, today=today, time_close_dte=0) is True
+    # 5 days after expiry: its pre-earnings window starts on expiry day → boundary, exposed.
+    assert _exposed(date(2026, 7, 10), short_exp, today=today, time_close_dte=0) is True
+    assert _exposed(date(2026, 7, 11), short_exp, today=today, time_close_dte=0) is False
+    # Earnings in the past: exposed only while still inside days_after.
+    assert _exposed(date(2026, 5, 30), short_exp, today=today, time_close_dte=0) is True
+    assert _exposed(date(2026, 5, 29), short_exp, today=today, time_close_dte=0) is False
+
+
+def test_is_exposed_to_earnings_respects_time_close():
+    """The live TSLA case (2026-09-18): 35-DTE put spread, 21-DTE close →
+    planned exit 10/02; earnings 10/20 → NOT exposed. The old predicate
+    flagged it 21 minutes after the fill and left it unmanaged."""
+    today, short_exp = date(2026, 9, 18), date(2026, 10, 23)
+    assert _exposed(date(2026, 10, 20), short_exp, today=today, time_close_dte=21) is False
+    # Earnings inside the planned hold (10/05 < exit 10/02 + 5d window) → exposed.
+    assert _exposed(date(2026, 10, 5), short_exp, today=today, time_close_dte=21) is True
+    assert _exposed(date(2026, 10, 8), short_exp, today=today, time_close_dte=21) is False
+    # Past its time-close date but still open → held "until today" → exposed
+    # to earnings tomorrow.
+    assert _exposed(date(2026, 10, 20), short_exp, today=date(2026, 10, 19),
+                    time_close_dte=21) is True
 
 
 # -- per-ticket required cases ----------------------------------------------
@@ -454,8 +471,10 @@ async def test_watchdog_nudges_when_earnings_moves_out_of_window(db_repos, monke
         repos=db_repos, router=None,
         config=_config(stale_flag_watchdog=True),
         today=_today(), recheck_state={"ticks_since_check": 0},
-        # Earnings now 5 days AFTER the short expiry -> outside [-2, +5].
-        next_earnings_fn=_stub_lookup({"SOFI": short_exp + timedelta(days=5)}),
+        # Earnings now 6 days AFTER the short expiry: its [E-5, E+2] window
+        # starts the day after expiry, so the hold no longer touches it. (At
+        # +5 the window would start ON expiry day — still exposed.)
+        next_earnings_fn=_stub_lookup({"SOFI": short_exp + timedelta(days=6)}),
     )
     stale = [r for r in results if r.action_taken == ACTION_FLAG_STALE]
     assert len(stale) == 1
@@ -512,3 +531,74 @@ async def test_watchdog_off_by_default(db_repos, monkeypatch):
         next_earnings_fn=_stub_lookup({"SOFI": short_exp + timedelta(days=30)}),
     )
     assert not [r for r in results if r.action_taken == ACTION_FLAG_STALE]
+
+
+# -- 2026-10-19: entry gate and recheck agree --------------------------------
+
+
+def _config_with_strategies(**overrides: Any) -> dict[str, Any]:
+    cfg = _config(**overrides)
+    cfg["strategies"] = [
+        {"id": "put_spread", "type": "vertical_spread", "params": {"time_close_dte": 21}},
+        {"id": "monthly_wheel", "type": "wheel", "params": {"time_close_dte": 21}},
+    ]
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_spread_that_time_closes_before_earnings_is_not_flagged(db_repos):
+    """Live 2026-09-18 TSLA shape: 35-DTE put spread, 21-DTE close, earnings
+    3 days before expiry. Planned exit is 14 days out, earnings 32 days out →
+    no flag (it was flagged 21 minutes after filling before this fix)."""
+    pos = await _seed_spread(db_repos, symbol="TSLA", short_expiration=_today() + timedelta(days=35))
+    results = await check_open_positions_for_new_earnings(
+        repos=db_repos, router=None, config=_config_with_strategies(),
+        today=_today(), recheck_state={"ticks_since_check": 99},
+        next_earnings_fn=_stub_lookup({"TSLA": _today() + timedelta(days=32)}),
+    )
+    assert results == []
+    assert (await db_repos.positions.get(pos.id)).state == PositionState.SPREAD_OPEN
+
+
+@pytest.mark.asyncio
+async def test_earnings_inside_planned_hold_is_flagged(db_repos):
+    """Earnings 10 days out on the same 35-DTE/21-DTE-close spread falls
+    inside the planned 14-day hold → flagged. The old expiry-window predicate
+    missed this (earnings 25 days before expiry)."""
+    pos = await _seed_spread(db_repos, symbol="TSLA", short_expiration=_today() + timedelta(days=35))
+    results = await check_open_positions_for_new_earnings(
+        repos=db_repos, router=None, config=_config_with_strategies(),
+        today=_today(), recheck_state={"ticks_since_check": 99},
+        next_earnings_fn=_stub_lookup({"TSLA": _today() + timedelta(days=10)}),
+    )
+    assert len(results) == 1 and results[0].action_taken == ACTION_FLAG_MANUAL
+    assert (await db_repos.positions.get(pos.id)).state == PositionState.MANUAL_INTERVENTION
+
+
+@pytest.mark.asyncio
+async def test_entry_gate_and_recheck_agree(db_repos, monkeypatch):
+    """Property check over a grid: for every (earnings offset, DTE) the entry
+    gate (proximity mode + time-close) lets in, the very next recheck must NOT
+    flag the position. This is the invariant the 2026-09/10 TSLA/NOK/AAL
+    flags broke."""
+    from data import earnings as earnings_mod
+
+    cfg = _config_with_strategies()
+    for dte in (14, 21, 28, 35, 45):
+        for e_off in range(0, 60, 3):
+            earnings = _today() + timedelta(days=e_off)
+            expiry = _today() + timedelta(days=dte)
+            monkeypatch.setattr(
+                earnings_mod, "next_earnings",
+                lambda *a, _d=earnings, **k: EarningsLookup(symbol="X", next_date=_d, source="t"),
+            )
+            blocked = earnings_mod.in_blackout(
+                "X", expiry, days_before=5, days_after=2, today=_today(),
+                entry_avoid_days=7, time_close_dte=21,
+            )
+            flagged = is_exposed_to_earnings(
+                earnings, expiry, today=_today(), time_close_dte=21,
+                days_before=5, days_after=2,
+            )
+            if not blocked:
+                assert not flagged, f"dte={dte} earnings+{e_off}: gate allowed, recheck flags"

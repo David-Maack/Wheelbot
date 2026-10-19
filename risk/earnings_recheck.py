@@ -45,7 +45,9 @@ from core.models import (
     StateLogTrigger,
 )
 from core.notify import notify
-from data.earnings import EarningsLookup, next_earnings as default_next_earnings
+from core.strategies import planned_time_close_dte
+from data.earnings import EarningsLookup, earnings_overlaps_hold
+from data.earnings import next_earnings as default_next_earnings
 from db.repo import Repos
 from execution.router import OrderRouter
 from strategies.wheel import Proposal
@@ -135,23 +137,33 @@ async def _latest_spread_short_expiration(repos: Repos, cycle_id: int | None) ->
     return None
 
 
-def is_in_earnings_window(
-    earnings_date: date, short_expiration: date, *, days_before: int, days_after: int
+def is_exposed_to_earnings(
+    earnings_date: date,
+    short_expiration: date,
+    *,
+    today: date,
+    time_close_dte: int,
+    days_before: int,
+    days_after: int,
 ) -> bool:
-    """True when an earnings event poses risk to a position with the given
-    short-leg expiration: earnings happens up to `days_before` days BEFORE the
-    expiration (we'd hold through the catalyst), or up to `days_after` days
-    AFTER (gamma is still bleeding through the close).
+    """True when the open position will still be held inside the earnings
+    risk window, given its strategy's time-close. Thin wrapper over
+    data.earnings.earnings_overlaps_hold — the SAME predicate the entry gate
+    uses, so a trade the gate lets in is not flagged on the next recheck.
 
-    NOT the same predicate as risk/limits.py::in_blackout — that one is a
-    window around the EARNINGS date used at entry-time selection. This is a
-    window around the EXPIRATION used at mid-cycle recheck, where the question
-    is 'is the open position now exposed to earnings'. Same days_before /
-    days_after config knobs read from the same block so the dashboard badge
-    and the recheck mutation cannot disagree.
+    Replaces is_in_earnings_window (a window around the EXPIRATION that
+    ignored the time-close and read days_before/days_after in the opposite
+    direction from the entry gate). The recheck, the stale-flag watchdog and
+    the dashboard badge all call this one function.
     """
-    diff = (short_expiration - earnings_date).days
-    return -days_after <= diff <= days_before
+    return earnings_overlaps_hold(
+        earnings_date,
+        today=today,
+        expiration=short_expiration,
+        time_close_dte=time_close_dte,
+        days_before=days_before,
+        days_after=days_after,
+    )
 
 
 def _build_close_proposal(
@@ -314,8 +326,10 @@ async def check_open_positions_for_new_earnings(
         # are irrelevant — they were either handled at entry or aren't a threat.)
         if earnings_date < today:
             continue
-        if not is_in_earnings_window(
+        if not is_exposed_to_earnings(
             earnings_date, short_expiration,
+            today=today,
+            time_close_dte=planned_time_close_dte(config, pos.strategy_id),
             days_before=days_before, days_after=days_after,
         ):
             continue
@@ -472,17 +486,20 @@ async def check_stale_manual_flags(
         if lookup.next_date is None:
             continue  # can't re-evaluate without data; keep the flag quiet
         earnings_date = lookup.next_date
-        still_at_risk = earnings_date >= today and is_in_earnings_window(
+        time_close_dte = planned_time_close_dte(config, pos.strategy_id)
+        still_at_risk = earnings_date >= today and is_exposed_to_earnings(
             earnings_date, short_expiration,
+            today=today, time_close_dte=time_close_dte,
             days_before=days_before, days_after=days_after,
         )
         if still_at_risk:
             continue
 
         rationale = (
-            f"flag stale: earnings now {earnings_date}, outside the "
-            f"[{days_before}d before, {days_after}d after] window around "
-            f"short exp {short_expiration} — position is UNMANAGED while flagged"
+            f"flag stale: earnings now {earnings_date}; the planned hold (short exp "
+            f"{short_expiration}, time-close {time_close_dte} DTE) ends before its "
+            f"[{days_before}d before, {days_after}d after] window — position is "
+            f"UNMANAGED while flagged"
         )
         log_checkpoint(
             "earnings_recheck_flag_stale",

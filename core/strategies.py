@@ -160,3 +160,36 @@ def universe_for_strategy(
         "banned": universe.get("banned", []),
         "banned_rules": universe.get("banned_rules", []),
     }
+
+
+# Which param each strategy type's close path reads for its time-close, and
+# the default that close path falls back to when the param is absent. Mirrors
+# strategies/{wheel_close,spreads,calendar_close,pmcc_close}.py — keep in sync.
+_TIME_CLOSE_PARAM_BY_TYPE: dict[str, tuple[str, int]] = {
+    "wheel": ("time_close_dte", 0),
+    "vertical_spread": ("time_close_dte", 7),
+    "iron_condor": ("time_close_dte", 7),
+    "calendar": ("time_close_short_dte", 2),
+    "pmcc": ("short_time_close_dte", 1),
+}
+
+
+def planned_time_close_dte(config: dict[str, Any], strategy_id: str | None) -> int:
+    """Days-before-expiry at which `strategy_id` force-closes its short leg.
+
+    Used to work out how long a position will really be held (for the
+    earnings exposure check). Unknown strategies, and types without a
+    time-close, return 0 = held to expiration (the conservative answer).
+    Reads the raw config so it has no logging side effects."""
+    for entry in config.get("strategies", []) or []:
+        if not isinstance(entry, dict) or str(entry.get("id", "")).strip() != strategy_id:
+            continue
+        key, default = _TIME_CLOSE_PARAM_BY_TYPE.get(str(entry.get("type", "wheel")), ("", 0))
+        if not key:
+            return 0
+        raw = (entry.get("params") or {}).get(key, default)
+        try:
+            return max(0, int(raw)) if raw is not None else 0
+        except (TypeError, ValueError):
+            return 0
+    return 0

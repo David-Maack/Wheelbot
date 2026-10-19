@@ -33,9 +33,10 @@ from core.broker import Broker, BrokerUnavailable
 from core.broker_factory import make_broker
 from core.config import load_config
 from core.models import Order, OrderStatus, OrderType, PositionState
+from core.strategies import planned_time_close_dte
 from data.earnings import next_earnings as _next_earnings
 from db.repo import Database, Repos
-from risk.earnings_recheck import is_in_earnings_window as _is_in_earnings_window
+from risk.earnings_recheck import is_exposed_to_earnings as _is_exposed_to_earnings
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(ROOT / "templates"))
@@ -597,7 +598,7 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
             last_close_trigger = await deps.repos.orders.last_close_trigger_for_position(p.id)
 
         # TICKET-006: earnings_warning badge — uses the SAME predicate
-        # (is_in_earnings_window) and the SAME days_before/days_after from
+        # (is_exposed_to_earnings) and the SAME days_before/days_after from
         # risk.earnings_recheck as the recheck loop, so the badge and the
         # actual mutation can't disagree. Only meaningful on open short-leg
         # states where the short_expiration is well-defined.
@@ -615,8 +616,10 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 short_expiration = today.date() + timedelta(days=dte)
             if short_expiration is not None:
                 e_date = _lookup_earnings(p.symbol)
-                if e_date is not None and _is_in_earnings_window(
+                if e_date is not None and _is_exposed_to_earnings(
                     e_date, short_expiration,
+                    today=today.date(),
+                    time_close_dte=planned_time_close_dte(deps.config, p.strategy_id),
                     days_before=earnings_days_before,
                     days_after=earnings_days_after,
                 ):

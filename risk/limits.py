@@ -37,6 +37,7 @@ from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.config import effective_wheel_params
 from core.models import OptionType, OrderStatus, OrderType, PositionState
+from core.strategies import planned_time_close_dte
 from data.earnings import in_blackout
 from db.repo import Repos
 from strategies.spreads import MultiLegProposal
@@ -386,6 +387,7 @@ class RiskGate:
             today=today,
             block_if_spans=block_if_spans,
             entry_avoid_days=self._earnings_avoid_days(),
+            time_close_dte=planned_time_close_dte(self._config, proposal.strategy_id),
         )
         if in_window is None:
             result.add("earnings_blackout", "skip", "no earnings data")
@@ -429,6 +431,7 @@ class RiskGate:
             today=today,
             block_if_spans=block_if_spans,
             entry_avoid_days=self._earnings_avoid_days(),
+            time_close_dte=planned_time_close_dte(self._config, proposal.strategy_id),
         )
         if in_window is None:
             result.add("earnings_blackout", "skip", "no earnings data")

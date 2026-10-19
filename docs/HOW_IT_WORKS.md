@@ -42,7 +42,10 @@ runs the same sequence:
    `universe.yaml` when none is applied.
 4. **Earnings recheck** — companies confirm earnings dates late; every open
    short-premium position is periodically re-checked and flagged
-   `MANUAL_INTERVENTION` (+ Discord) if earnings moved inside its window. The
+   `MANUAL_INTERVENTION` (+ Discord) if its **planned hold** — until the
+   strategy's time-close (e.g. 21 DTE), not until expiry — now reaches the
+   earnings window (5 days before → 2 after). Same predicate as the entry
+   gate, so a trade the gate admits is never flagged on the next pass. The
    **position news sentry** (§6) covers *unscheduled* catalysts on the same
    cadence: an hourly Haiku read of each open position's headlines,
    notify-only.
@@ -89,7 +92,8 @@ Every proposed entry passes, in order:
 3. **Risk gate** (deterministic, `risk/limits.py`) — regime allows the
    direction; global (6) and per-strategy concurrent caps; buying-power floor;
    per-position capital caps; IVR floor/ceiling; earnings blackout (no opens
-   within 7 days of earnings, or spanning it); macro blackout (no opens within
+   within 7 days of earnings, nor any whose planned hold — expiry minus the
+   strategy's time-close — reaches 5 days before earnings); macro blackout (no opens within
    2 days of FOMC/CPI/NFP); **tier-2 screen** — tier-2 symbols need TODAY's
    LLM screener score ≥ 50.
 4. **News check** (AI, §6) — headline sniff on wheel CSP entries.
@@ -118,7 +122,7 @@ an open position.
 | Win-rate floor | < 60% over last 10+ cycles | Strategy paused, **manual** reenable only. (Was silently crashing 2026-08-26 → 10-19 on an unknown backfill `cycle_outcome`; any crashing drawdown / win-rate / expectancy monitor now posts a `risk.monitor_check_failed` Discord alert, at most once per 24h per strategy) |
 | Expectancy floor | Mean $/cycle < $0 over last 10+ cycles (currently observe-only — `risk.expectancy_floor.enabled: false`; the `/risk` panel shows what it would do) | Strategy paused, **manual** reenable only — catches a strategy that wins often but loses big, which the win-rate floor can't see |
 | Regime veto (AI) | LLM flags headline risk the numbers can't see | All entry sizes halved for the day — reduce-only |
-| Earnings recheck | Earnings date moves inside an open position's window | Flag MANUAL_INTERVENTION + Discord. A watchdog re-checks flagged positions each pass: if the (estimated, wobbly) earnings date later moves back OUT of the window, Discord gets a "flag looks stale" nudge — clearing stays manual via `scripts/restore_position.py` or the MCP `unflag_position` control |
+| Earnings recheck | Earnings date moves inside an open position's planned hold (time-close date, not expiry) | Flag MANUAL_INTERVENTION + Discord. A watchdog re-checks flagged positions each pass: if the (estimated, wobbly) earnings date later moves back OUT of the window, Discord gets a "flag looks stale" nudge — clearing stays manual via `scripts/restore_position.py` or the MCP `unflag_position` control |
 
 ## 6. Where the AI is involved
 

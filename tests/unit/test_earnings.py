@@ -99,3 +99,51 @@ def test_entry_proximity_allows_weeks_away_earnings_even_at_expiry(monkeypatch):
                     today=TODAY, entry_avoid_days=7)
         is False
     )
+
+
+def test_entry_proximity_with_time_close_blocks_earnings_inside_planned_hold(monkeypatch):
+    # Earnings 10 days out (outside the 7-day proximity window) but a 35-DTE
+    # spread with a 21-DTE close is held 14 days → held through earnings → block.
+    _stub_next_earnings(monkeypatch, date(2026, 7, 3))
+    assert (
+        in_blackout("X", date(2026, 7, 28), days_before=5, days_after=2,
+                    today=TODAY, entry_avoid_days=7)
+        is False  # proximity-only (no time_close_dte) — the old hole
+    )
+    assert (
+        in_blackout("X", date(2026, 7, 28), days_before=5, days_after=2,
+                    today=TODAY, entry_avoid_days=7, time_close_dte=21)
+        is True
+    )
+
+
+def test_entry_proximity_with_time_close_allows_earnings_after_planned_exit(monkeypatch):
+    # Same spread, earnings 32 days out: the 21-DTE close exits on day 14,
+    # long before the [E-5, E+2] window → allowed (the TSLA 2026-09-18 shape).
+    _stub_next_earnings(monkeypatch, date(2026, 7, 25))
+    assert (
+        in_blackout("X", date(2026, 7, 28), days_before=5, days_after=2,
+                    today=TODAY, entry_avoid_days=7, time_close_dte=21)
+        is False
+    )
+
+
+def test_planned_time_close_dte_mirrors_close_paths():
+    from core.strategies import planned_time_close_dte
+
+    cfg = {"strategies": [
+        {"id": "monthly_wheel", "type": "wheel", "params": {"time_close_dte": 21}},
+        {"id": "weekly_wheel", "type": "wheel", "params": {}},
+        {"id": "put_spread", "type": "vertical_spread", "params": {}},
+        {"id": "calendar", "type": "calendar", "params": {"time_close_short_dte": 2}},
+        {"id": "pmcc", "type": "pmcc", "params": {}},
+        {"id": "zero_dte", "type": "zero_dte", "params": {}},
+    ]}
+    assert planned_time_close_dte(cfg, "monthly_wheel") == 21
+    assert planned_time_close_dte(cfg, "weekly_wheel") == 0       # wheel: no default
+    assert planned_time_close_dte(cfg, "put_spread") == 7          # spreads.py default
+    assert planned_time_close_dte(cfg, "calendar") == 2
+    assert planned_time_close_dte(cfg, "pmcc") == 1
+    assert planned_time_close_dte(cfg, "zero_dte") == 0
+    assert planned_time_close_dte(cfg, "unknown") == 0             # conservative
+    assert planned_time_close_dte({}, None) == 0
