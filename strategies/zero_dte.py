@@ -1,21 +1,30 @@
-"""0DTE paper-test strategy (2026-07 research sprint).
+"""0DTE paper-test strategy (2026-07 research sprint, rebuilt 2026-10).
 
-Evidence base: docs/research/0dte_research_2026-07.md. The two structures
-implemented are the research doc's recommended first paper tests (§5b):
+Mechanics (flatten, dual ledger, wing-is-the-stop) come from
+docs/research/0dte_research_2026-07.md. The TRADE was re-specced in 2026-10
+from the spread-paper-logger delta ladder (log/ladder.csv: SPY/QQQ $5 bull put
+spreads quoted at 0.05/0.10/0.15/0.20 delta every half hour, every row settled
+at the close). The July spec — 0.15-0.25 delta, bull put OR bear call by
+session VWAP — never traded (the expiry-day Greeks bug) and the ladder
+contradicts it.
 
-  - ``narrow_vertical`` (default): trend-filtered directional credit spread —
-    bull put when SPY trades above its session VWAP (fallback: the day's
-    opening price), bear call below. $1-2 wide, short delta ~0.20, and THE
-    WING IS THE STOP: no stop orders at all. Narrow width makes max loss
-    structural ("no reliance on fill quality" — zerodte.com via research §3.3),
-    which eliminates the stop-fill slippage gap that is the single largest
-    paper-vs-live divergence (FlashAlpha: realistic fills cut CAGR 30-60%).
-  - ``iron_condor``: the consensus morning baseline — 10-15 delta shorts,
-    $2-5 wings, profit-take at 25% of credit via the normal close path.
+  - ``narrow_vertical`` (default): BULL PUT credit spread only, short delta
+    0.10-0.15, entered only while LIVE spot is above the 20-day SMA of prior
+    closes. Ladder, first slot of each day (10:00 ET on most days), FOMC
+    skipped: with the SMA skip +$165 at 0.10 / +$185 at 0.15 over 20-21
+    trades on 13 days; without it -$478 / -$609 over 35-36 trades on 18 days.
+    There is no bear-call arm: the put side carries ~5 vol points of skew
+    premium (the logger's mirrored call wing, 99% of paired rows), the call
+    side none. THE WING IS THE STOP: no stop orders at all — max loss is
+    structural, which eliminates the stop-fill slippage gap that is the
+    single largest paper-vs-live divergence (research §3.3).
+  - ``iron_condor``: the July consensus baseline — 10-15 delta shorts, $2-5
+    wings, profit-take at 25% of credit. Not part of the rebuilt spec.
 
-Entry only inside a 10:00-10:15 ET window (Option Alpha's profitable cohort
-entered ~10:15, after the opening chaos; research §1.1/§5a). Same-day
-expiration (dte_min = dte_max = 0) on SPY.
+Entry only inside a 10:00-10:15 ET window (research §1.1/§5a; no later ladder
+slot did better once the two breach days are accounted for). Same-day
+expiration (dte_min = dte_max = 0) on whichever symbols universe.yaml tags
+zero_dte, at most max_positions_per_day entries per SYMBOL.
 
 HARD FLATTEN at 15:00 ET regardless of P&L: on expiration day Alpaca REJECTS
 option orders after ~15:15 ET (15:30 for broad-based ETFs like SPY) and
@@ -34,7 +43,9 @@ the reconciler flow.
 
 Out of scope (deliberately): stop orders of any kind, staggered multi-entry
 condors (research §5b variant 3 — test only after the slippage model is
-calibrated), QQQ/XSP underlyings, holding into the final hour.
+calibrated), XSP, holding into the final hour, and the ladder's
+`support_broken` flag (its rows did BETTER than clean ones: +$11.3/lot vs
++$1.4).
 """
 
 from __future__ import annotations
@@ -77,9 +88,11 @@ STRUCTURE_NARROW_VERTICAL = "narrow_vertical"
 STRUCTURE_IRON_CONDOR = "iron_condor"
 
 # No news_check on zero_dte opens: the position lives ~5 hours inside a single
-# session and the macro-blackout risk rule already blocks FOMC/CPI/NFP days
-# (the event-day gate the research recommends). A headline read adds latency
-# inside a 15-minute entry window for little signal.
+# session and the macro-blackout risk rule already blocks event days (the
+# event-day gate the research recommends; which events, and whether only the
+# same day counts, are the strategy's macro_event_types / macro_same_day_only
+# params — see risk/limits.py). A headline read adds latency inside a
+# 15-minute entry window for little signal.
 NEWS_CHECK_PROFILE: str | None = None
 
 
@@ -119,42 +132,54 @@ def past_flatten(params: dict[str, Any], now: datetime | None = None) -> bool:
     return _now_et(now).time() >= _parse_et(str(params.get("flatten_et", "15:00")))
 
 
-# -- trend rule --------------------------------------------------------------
+# -- trend gate --------------------------------------------------------------
 
 
-def pick_direction(spot: float, session_ref: float) -> str:
-    """Narrow-vertical direction: sell the put spread (bullish premium) when
-    SPY is at/above the session reference (VWAP, falling back to the day's
-    open), sell the call spread below it. The simple trend filter is where
-    most of the documented edge lives (Option Alpha SMA5-filtered setups
-    >75% WR, PF > 2.0 — research §1.1/§5b)."""
-    return DIRECTION_BULL_PUT if spot >= session_ref else DIRECTION_BEAR_CALL
+def above_trend(spot: float, sma: float) -> bool:
+    """Bull-put entry gate: live spot strictly above the SMA. The ladder's
+    `downtrend` flag is spot <= ma20, so a tie skips. Its rows lost
+    $13.8/lot vs +$1.4 clean (breach rate 18% vs 8%)."""
+    return spot > sma
 
 
-def _session_vwap_or_open(symbol: str, today: date) -> float | None:
-    """Session VWAP from today's completed 5-min Alpaca bars; falls back to
-    the day's opening price (first bar's open); None on any failure — the
-    caller skips the entry rather than guessing a direction."""
+# (symbol, day, n_days) -> SMA. A day's prior closes never change, so one good
+# fetch per symbol per day is enough; only successes are cached so a yfinance
+# hiccup retries on the next tick.
+_SMA_CACHE: dict[tuple[str, date, int], float] = {}
+
+
+def _prior_close_sma(symbol: str, today: date, n_days: int) -> float | None:
+    """Mean of the last `n_days` daily closes BEFORE `today` — today's
+    in-progress yfinance bar is excluded, matching the ladder's ma20. The
+    regime snapshot's PULLBACK is NOT a substitute: it compares the PRIOR
+    close and read BULL_TREND going into 2026-10-16, when SPY opened below
+    its 20d and settled ~1% lower. None on any failure — the caller skips."""
+    key = (symbol, today, n_days)
+    if key in _SMA_CACHE:
+        return _SMA_CACHE[key]
     try:
-        # Lazy import — pandas/alpaca stack only loads when the strategy is
-        # actually evaluating an entry.
-        from strategies.swing import fetch_swing_frames
+        # Lazy import — the pandas/yfinance stack only loads when the strategy
+        # is actually evaluating an entry.
+        from backtest.data import load_daily_yf
 
-        bars5m, _daily, _weekly, _vix = fetch_swing_frames(symbol)
-        if not len(bars5m):
+        daily = load_daily_yf(symbol, period="3mo")
+        closes = [
+            float(c) for ts, c in zip(daily.index, daily["close"], strict=True)
+            if (ts.date() if isinstance(ts, datetime) else ts) < today
+        ] if len(daily) else []
+        if len(closes) < n_days:
+            log_checkpoint("zero_dte_sma_short_history", status="fail",
+                           symbol=symbol, n_closes=len(closes), need=n_days)
             return None
-        session = bars5m[[d.date() == today for d in bars5m.index]]
-        if not len(session):
-            return None
-        vol = session["volume"]
-        if float(vol.sum()) > 0:
-            typical = (session["high"] + session["low"] + session["close"]) / 3.0
-            return float((typical * vol).sum() / vol.sum())
-        return float(session["open"].iloc[0])
+        sma = sum(closes[-n_days:]) / n_days
     except Exception as exc:  # noqa: BLE001 — data outage must not break the tick
-        log_checkpoint("zero_dte_session_ref_fail", status="fail", symbol=symbol,
+        log_checkpoint("zero_dte_sma_fail", status="fail", symbol=symbol,
                        error=str(exc))
         return None
+    for stale in [k for k in _SMA_CACHE if k[1] != today]:
+        del _SMA_CACHE[stale]
+    _SMA_CACHE[key] = sma
+    return sma
 
 
 # -- selectors ---------------------------------------------------------------
@@ -171,13 +196,12 @@ async def select_zero_dte_vertical(
     broker: Broker,
     symbol: str,
     params: dict[str, Any],
-    direction: str,
     *,
     today: date | None = None,
     record_chain: Any | None = None,
     now: datetime | None = None,
 ) -> SpreadCandidate | None:
-    """Same-day-expiry narrow vertical at ~0.20 short delta.
+    """Same-day-expiry bull put spread at ~0.125 short delta.
 
     `now` is threaded into the chain fetch so the Greeks fallback prices on
     time left to the close; without it (pre-2026-10-19) T was 0 on expiry day,
@@ -189,16 +213,23 @@ async def select_zero_dte_vertical(
     condor's delta-target approach instead: pick the short closest to the
     midpoint of [short_delta_min, short_delta_max], wing it at
     spread_width_dollars via the same protective-long finder.
+
+    Defaults: 0.10-0.15 delta, $2 wide, credit floor 3% of width. At 10:00
+    ET the ladder's 0.10-0.15 delta $5 spreads bid a median $0.12-0.21; a $2
+    wing on the same short keeps ~55-80% of that (~$0.07-0.17, 3-8% of
+    width), so the July floor of 15% could never be met. 3% of $2 is the
+    ladder's own $0.06 credit floor.
     """
     today = today or date.today()
-    delta_min = float(params.get("short_delta_min", 0.15))
-    delta_max = float(params.get("short_delta_max", 0.25))
+    delta_min = float(params.get("short_delta_min", 0.10))
+    delta_max = float(params.get("short_delta_max", 0.15))
     target = (delta_min + delta_max) / 2.0
     width = float(params.get("spread_width_dollars", 2.0))
-    min_credit_pct = float(params.get("min_credit_pct_of_width", 15.0))
+    min_credit_pct = float(params.get("min_credit_pct_of_width", 3.0))
+    direction = DIRECTION_BULL_PUT
 
-    side = "put" if direction == DIRECTION_BULL_PUT else "call"
-    opt_type = OptionType.PUT if side == "put" else OptionType.CALL
+    side = "put"
+    opt_type = OptionType.PUT
     filters = ChainFilters(
         dte_min=0, dte_max=0,
         delta_min=delta_min, delta_max=delta_max,
@@ -409,7 +440,7 @@ def _sizing_quantity(
 ) -> int:
     """floor(cap / max_loss); 0 = skip (never over-risk — audit #13 rule).
     Reads max_capital_per_spread_usd for BOTH structures (the condor variant
-    shares the same $200 defined-risk cap)."""
+    shares the same defined-risk cap)."""
     cap = float(strategy.params.get("max_capital_per_spread_usd", 0) or 0)
     if cap <= 0 or max_loss_per_spread <= 0:
         return 1
@@ -427,13 +458,14 @@ async def propose_for_symbol(
     strategy: StrategyDefinition | None = None,
     size_multiplier: float = 1.0,
     now: datetime | None = None,
-    session_ref: float | None = None,
+    sma_ref: float | None = None,
 ) -> MultiLegProposal | None:
     """Build a same-day-expiry MultiLegProposal, or None.
 
     Gate order: entry window -> position state -> max-positions-per-day ->
-    daily loss cap -> trend/selector. `now` and `session_ref` are injectable
-    for tests; production leaves them None (wall clock + live VWAP).
+    daily loss cap -> trend (narrow_vertical) -> selector. `now` and
+    `sma_ref` are injectable for tests; production leaves them None (wall
+    clock + the yfinance prior-close SMA).
     """
     if strategy is None:
         log_checkpoint("zero_dte_skip_no_strategy", status="fail", symbol=symbol)
@@ -460,11 +492,14 @@ async def propose_for_symbol(
                        strategy=strategy.id, state=str(state))
         return None
 
-    # One round-trip per day by default. Cycles are created on fill, so a
-    # filled-and-flattened morning trade blocks a second entry even though
-    # the position is back to SPREAD_CLOSED.
+    # One round-trip per symbol per day by default. Cycles are created on
+    # fill, so a filled-and-flattened morning trade blocks a second entry even
+    # though the position is back to SPREAD_CLOSED. Counted per symbol since
+    # the 2026-10 rebuild added QQQ — SPY's fill must not lock QQQ out.
     max_per_day = int(params.get("max_positions_per_day", 1))
-    n_today = await repos.cycles.count_started_on(account_id, strategy.id, today)
+    n_today = await repos.cycles.count_started_on(
+        account_id, strategy.id, today, symbol=symbol,
+    )
     if n_today >= max_per_day:
         log_checkpoint("zero_dte_skip_max_per_day", status="ok", symbol=symbol,
                        strategy=strategy.id, n_today=n_today, cap=max_per_day)
@@ -528,7 +563,9 @@ async def propose_for_symbol(
             f"max_loss={max_loss:.2f} qty={quantity}"
         )
     elif structure == STRUCTURE_NARROW_VERTICAL:
-        # Trend rule: SPY vs session VWAP (fallback: day's open).
+        # Trend gate: LIVE spot vs the N-day SMA of prior closes, read at
+        # entry (trend_sma_days, default 20; 0 disables). Fails closed — no
+        # spot or no SMA means no entry.
         try:
             q: Quote = await broker.get_quote(symbol)
             spot = q.mid if q.mid is not None else (q.last or q.bid or q.ask)
@@ -537,14 +574,22 @@ async def propose_for_symbol(
         if spot is None:
             log_checkpoint("zero_dte_skip_no_spot", status="ok", symbol=symbol)
             return None
-        ref = session_ref if session_ref is not None else _session_vwap_or_open(symbol, today)
-        if ref is None:
-            log_checkpoint("zero_dte_skip_no_session_ref", status="ok", symbol=symbol)
-            return None
-        direction = pick_direction(float(spot), float(ref))
+        sma_days = int(params.get("trend_sma_days", 20))
+        sma: float | None = None
+        if sma_days > 0:
+            sma = sma_ref if sma_ref is not None else _prior_close_sma(symbol, today, sma_days)
+            if sma is None:
+                log_checkpoint("zero_dte_skip_no_sma", status="skip", symbol=symbol,
+                               strategy=strategy.id, sma_days=sma_days)
+                return None
+            if not above_trend(float(spot), float(sma)):
+                log_checkpoint("zero_dte_skip_downtrend", status="ok", symbol=symbol,
+                               strategy=strategy.id, spot=round(float(spot), 2),
+                               sma=round(float(sma), 2), sma_days=sma_days)
+                return None
+        direction = DIRECTION_BULL_PUT
         cand_v = await select_zero_dte_vertical(
-            broker, symbol, params, direction, today=today, record_chain=record,
-            now=et,
+            broker, symbol, params, today=today, record_chain=record, now=et,
         )
         if cand_v is None:
             return None
@@ -560,9 +605,10 @@ async def propose_for_symbol(
         max_loss = cand_v.max_loss_per_spread
         width = cand_v.width_dollars
         leg_quotes = [(cand_v.short.bid, cand_v.short.ask), (cand_v.long.bid, cand_v.long.ask)]
+        trend = f"sma{sma_days}={float(sma):.2f} " if sma is not None else ""
         rationale = (
             f"zero_dte_{direction}[{strategy.id}] spot={float(spot):.2f} "
-            f"ref={float(ref):.2f} short={cand_v.short.strike} "
+            f"{trend}short={cand_v.short.strike} "
             f"long={cand_v.long.strike} width={width:.2f} "
             f"credit={net_credit:.2f} max_loss={max_loss:.2f} qty={quantity} "
             f"(wing-is-the-stop)"

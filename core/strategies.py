@@ -174,6 +174,16 @@ _TIME_CLOSE_PARAM_BY_TYPE: dict[str, tuple[str, int]] = {
 }
 
 
+def strategy_params(config: dict[str, Any], strategy_id: str | None) -> dict[str, Any]:
+    """The raw `params` block of `strategy_id` in config, or {} when the id
+    is unknown/None. No validation or logging — for rules that only need to
+    read one optional per-strategy override."""
+    for entry in config.get("strategies", []) or []:
+        if isinstance(entry, dict) and str(entry.get("id", "")).strip() == strategy_id:
+            return dict(entry.get("params") or {})
+    return {}
+
+
 def planned_time_close_dte(config: dict[str, Any], strategy_id: str | None) -> int:
     """Days-before-expiry at which `strategy_id` force-closes its short leg.
 

@@ -37,7 +37,7 @@ from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.config import effective_wheel_params
 from core.models import OptionType, OrderStatus, OrderType, PositionState
-from core.strategies import planned_time_close_dte
+from core.strategies import planned_time_close_dte, strategy_params
 from data.earnings import in_blackout
 from db.repo import Repos
 from strategies.spreads import MultiLegProposal
@@ -873,11 +873,26 @@ class RiskGate:
 
         event_types = list(cfg.get("event_types", []) or [])
         avoid = cfg.get("entry_avoid_days")
+        days_before: int | None = None
+        days_after: int | None = None
+        # Per-strategy overrides (2026-10 zero_dte rebuild). Absent keys keep
+        # the global behaviour above. `macro_event_types` replaces the event
+        # list; `macro_same_day_only` shrinks the window to the event day
+        # itself — a position opened 10:00 and flattened by 15:00 cannot be
+        # alive at a later day's event, yet the global window (days_before +
+        # entry_avoid_days) blocked it up to 3 calendar days ahead.
+        sparams = strategy_params(self._config, getattr(proposal, "strategy_id", None))
+        if sparams.get("macro_event_types") is not None:
+            event_types = list(sparams["macro_event_types"] or [])
+        if bool(sparams.get("macro_same_day_only", False)):
+            avoid, days_before, days_after = 0, 0, 0
         decision = await calendar.is_blackout(
             today=today or _today_nyse(),
             short_expiration=short_exp,
             event_types=event_types,
             entry_avoid_days=int(avoid) if avoid is not None else None,
+            days_before=days_before,
+            days_after=days_after,
         )
         if decision.in_blackout:
             result.add("macro_blackout", "fail", decision.reason or "in macro blackout")

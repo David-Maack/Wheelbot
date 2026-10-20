@@ -694,37 +694,54 @@ strategies:
       auto_disable_drawdown_usd: -300
       drawdown_warning_usd: -150
 
-  # 0DTE paper test (2026-07 sprint — evidence base in
-  # docs/research/0dte_research_2026-07.md). Morning defined-risk premium sale
-  # on SPY, same-day expiry. Default structure = narrow_vertical: a trend-
-  # filtered $2-wide bull-put/bear-call at ~0.20 short delta where THE WING IS
-  # THE STOP — no stop orders at all, which eliminates the stop-fill slippage
-  # gap that is the single largest paper-vs-live divergence (FlashAlpha:
-  # realistic fills cut CAGR 30-60%; zerodte.com structural-stop writeup).
+  # 0DTE paper test (2026-07 sprint — mechanics from
+  # docs/research/0dte_research_2026-07.md; trade re-specced 2026-10 from the
+  # spread-paper-logger delta ladder, see strategies/zero_dte.py). Morning
+  # defined-risk premium sale on SPY + QQQ, same-day expiry. Default structure
+  # = narrow_vertical: a $2-wide BULL PUT at 0.10-0.15 short delta, only while
+  # live spot is above its 20-day SMA (no bear-call arm — the call side has no
+  # skew premium). THE WING IS THE STOP — no stop orders at all, which
+  # eliminates the stop-fill slippage gap that is the single largest
+  # paper-vs-live divergence (FlashAlpha: realistic fills cut CAGR 30-60%;
+  # zerodte.com structural-stop writeup).
   # Entry only 10:00-10:15 ET (Option Alpha's profitable cohort pattern);
   # HARD FLATTEN at 15:00 ET regardless of P&L (Alpaca rejects expiry-day
   # option orders after ~15:15/15:30 ET and force-liquidates at 15:30/15:45).
   # Every trade writes a dual raw/penalized ledger row (zero_dte_ledger) —
   # go/no-go reads PENALIZED P&L only; the strategy's own daily loss cap
-  # reads it too. One round-trip per day, ≤$200 defined risk: worst day is
-  # bounded at roughly one max-loss.
+  # reads it too. One round-trip per symbol per day, ≤$200 defined risk each:
+  # worst day is bounded at roughly two max-losses (~$380).
   - id: zero_dte
-    display_name: "0DTE SPY (paper test)"
+    display_name: "0DTE SPY/QQQ put spread (paper test)"
     type: zero_dte
     enabled: true
-    max_concurrent: 1
+    max_concurrent: 2                  # one per symbol (SPY, QQQ)
     params:
-      symbol: SPY
       structure: narrow_vertical       # narrow_vertical | iron_condor
-      spread_width_dollars: 2.0        # $1-2 wide — the wing IS the stop
-      short_delta_min: 0.15
-      short_delta_max: 0.25            # midpoint 0.20 = selector's delta target
-      min_credit_pct_of_width: 15      # narrow 0DTE verticals pay less than 30-45 DTE; below this the risk/reward is junk
+      # $2 wide, not the ladder's $5: est. +$47..+$139 vs +$213 over the
+      # ladder's 19 in-policy trades, but max loss ~$190 vs ~$490 — one $5
+      # max-loss alone trips this strategy's -$300 7-day breaker (30-day
+      # disable). Going to $5 needs max_capital_per_spread_usd 500 AND
+      # breaker thresholds re-sized (+ GO_LIVE_RUNBOOK) in the same change.
+      spread_width_dollars: 2.0
+      short_delta_min: 0.10            # ladder: 0.10/0.15 rungs +$165/+$185 under the
+      short_delta_max: 0.15            # SMA + FOMC skips; midpoint 0.125 = delta target
+      min_credit_pct_of_width: 3       # $0.06 on $2 = the ladder's credit floor; 0.10-0.15Δ pays ~3-8% (15% never cleared)
+      trend_sma_days: 20               # skip when LIVE spot <= 20d SMA of prior closes (0 = off)
+      # Macro blackout overrides (risk/limits.py). Same-day-only: a position
+      # flattened by 15:00 can't be alive at a later day's event; the global
+      # window blocked zero_dte up to 3 calendar days before each event. The
+      # event list stays at the global FOMC/CPI/NFP: the ladder has ONE CPI
+      # day (fine under the SMA skip: SPY +$12/+$20) and NO NFP day. CPI/NFP
+      # print at 08:30, before entry; FOMC at 14:00, mid-trade (ladder FOMC
+      # rows: -$61.7/lot, 68% breached). Set [FOMC] once CPI/NFP evidence exists.
+      macro_same_day_only: true
+      macro_event_types: [FOMC, CPI, NFP]
       profit_close_pct: 50             # vertical default; SET 25 when structure: iron_condor (module defaults to 25 there if this key is removed)
       entry_start_et: "10:00"          # after the opening-auction chaos
       entry_end_et: "10:15"
       flatten_et: "15:00"              # hard flatten — see block comment
-      max_positions_per_day: 1         # enforced by counting today's zero_dte cycles
+      max_positions_per_day: 1         # PER SYMBOL — counts today's zero_dte cycles on that symbol
       max_capital_per_spread_usd: 200  # defined-risk cap per package (qty sizing)
       stop_slippage_adder: 0.05        # $/share added to PENALIZED exit debit on flatten exits
       zero_dte_daily_loss_usd: 250     # skip entries when today's PENALIZED realized pnl <= -this
