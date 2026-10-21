@@ -598,3 +598,127 @@ async def test_entry_proximity_blocks_imminent_event(db_repos):
         event_types=["FOMC", "CPI", "NFP"], entry_avoid_days=7,
     )
     assert decision.in_blackout is True
+
+
+# -- per-strategy overrides (2026-10 zero_dte rebuild) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_same_day_window_ignores_tomorrows_event(db_repos):
+    """days_before/days_after/entry_avoid_days all 0 → only the event day
+    itself counts; the config's days_before=1 is overridden."""
+    await _seed_event(db_repos, day=_today() + timedelta(days=1), etype="CPI")
+    cal = MacroCalendar(db_repos, _config(entry_avoid_days=2))
+    decision = await cal.is_blackout(
+        today=_today(), short_expiration=_today(),
+        event_types=["FOMC", "CPI", "NFP"], entry_avoid_days=0,
+        days_before=0, days_after=0,
+    )
+    assert decision.in_blackout is False
+
+
+@pytest.mark.asyncio
+async def test_same_day_window_blocks_event_day(db_repos):
+    await _seed_event(db_repos, day=_today(), etype="FOMC")
+    cal = MacroCalendar(db_repos, _config(entry_avoid_days=2))
+    decision = await cal.is_blackout(
+        today=_today(), short_expiration=_today(),
+        event_types=["FOMC"], entry_avoid_days=0, days_before=0, days_after=0,
+    )
+    assert decision.in_blackout is True
+
+
+def _gate_with_strategies(db_repos, strategies: list[dict[str, Any]]):
+    from platforms.paper_broker import PaperBroker
+    from risk.limits import RiskGate
+
+    cfg = _config(entry_avoid_days=2)
+    cfg["wheel"] = {"buying_power_floor_pct": 0, "max_position_pct_of_account": 100,
+                    "open_interest_min": 0, "volume_min": 0, "bid_ask_spread_max_pct": 100}
+    cfg["strategies"] = strategies
+    return RiskGate(
+        PaperBroker(cash=20_000), db_repos, cfg,
+        {"tickers": [UniverseEntry(symbol="SPY", name="SPDR S&P 500", tier=1, overrides={})],
+         "banned": [], "banned_rules": []},
+    )
+
+
+def _put_spread_proposal(strategy_id: str, expiration: date) -> MultiLegProposal:
+    legs = [
+        OrderLeg(
+            contract_symbol="SPY260603P00763000", underlying="SPY",
+            option_type=OptionType.PUT, strike=763.0, expiration=expiration,
+            action=OrderType.SELL_TO_OPEN,
+        ),
+        OrderLeg(
+            contract_symbol="SPY260603P00761000", underlying="SPY",
+            option_type=OptionType.PUT, strike=761.0, expiration=expiration,
+            action=OrderType.BUY_TO_OPEN,
+        ),
+    ]
+    return MultiLegProposal(
+        symbol="SPY", legs=legs, net_credit_per_spread=0.12,
+        max_loss_per_spread=188.0, width_dollars=2.0, quantity=1,
+        rationale="override test", strategy_id=strategy_id, direction="bull_put",
+    )
+
+
+async def _macro_rule(gate, proposal):
+    result = await gate.evaluate(proposal, today=_today(), raise_on_fail=False)
+    return next(r for r in result.results if r.rule == "macro_blackout")
+
+
+@pytest.mark.asyncio
+async def test_zero_dte_without_override_keeps_global_window(db_repos):
+    """No per-strategy keys → current behaviour: tomorrow's CPI blocks a
+    same-day spread today (days_before=1 + entry_avoid_days=2)."""
+    await _seed_event(db_repos, day=_today() + timedelta(days=1), etype="CPI")
+    gate = _gate_with_strategies(db_repos, [
+        {"id": "zero_dte", "type": "zero_dte", "params": {}},
+    ])
+    rule = await _macro_rule(gate, _put_spread_proposal("zero_dte", _today()))
+    assert rule.status == "fail"
+    assert "CPI" in rule.detail
+
+
+@pytest.mark.asyncio
+async def test_same_day_only_override_is_per_strategy(db_repos):
+    """zero_dte with macro_same_day_only trades the eve of CPI; a strategy
+    without the key (put_spread) is still blocked by the same event."""
+    await _seed_event(db_repos, day=_today() + timedelta(days=1), etype="CPI")
+    gate = _gate_with_strategies(db_repos, [
+        {"id": "zero_dte", "type": "zero_dte", "params": {"macro_same_day_only": True}},
+        {"id": "put_spread", "type": "vertical_spread", "params": {}},
+    ])
+    rule = await _macro_rule(gate, _put_spread_proposal("zero_dte", _today()))
+    assert rule.status == "pass", rule.detail
+    other = await _macro_rule(
+        gate, _put_spread_proposal("put_spread", _today() + timedelta(days=35)),
+    )
+    assert other.status == "fail"
+
+
+@pytest.mark.asyncio
+async def test_same_day_only_still_blocks_fomc_day(db_repos):
+    await _seed_event(db_repos, day=_today(), etype="FOMC")
+    gate = _gate_with_strategies(db_repos, [
+        {"id": "zero_dte", "type": "zero_dte", "params": {"macro_same_day_only": True}},
+    ])
+    rule = await _macro_rule(gate, _put_spread_proposal("zero_dte", _today()))
+    assert rule.status == "fail"
+    assert "FOMC" in rule.detail
+
+
+@pytest.mark.asyncio
+async def test_macro_event_types_override(db_repos):
+    """macro_event_types [FOMC] → a CPI day passes for that strategy only."""
+    await _seed_event(db_repos, day=_today(), etype="CPI")
+    gate = _gate_with_strategies(db_repos, [
+        {"id": "zero_dte", "type": "zero_dte",
+         "params": {"macro_same_day_only": True, "macro_event_types": ["FOMC"]}},
+    ])
+    rule = await _macro_rule(gate, _put_spread_proposal("zero_dte", _today()))
+    assert rule.status == "pass", rule.detail
+    await _seed_event(db_repos, day=_today(), etype="FOMC")
+    rule = await _macro_rule(gate, _put_spread_proposal("zero_dte", _today()))
+    assert rule.status == "fail"

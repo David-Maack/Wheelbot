@@ -143,6 +143,8 @@ class MacroCalendar:
         short_expiration: date,
         event_types: list[str],
         entry_avoid_days: int | None = None,
+        days_before: int | None = None,
+        days_after: int | None = None,
     ) -> BlackoutDecision:
         """True when ANY day in the considered window falls within the configured
         `[event_date - days_before, event_date + days_after]` window for any event
@@ -155,13 +157,18 @@ class MacroCalendar:
         30-45 DTE position whose life merely reaches a routine monthly macro event.
         Mirrors the earnings entry-proximity gate.
 
+        `days_before` / `days_after` override the config's blackout_days_* when
+        passed (a per-strategy override; all three at 0 = the event day only).
+
         Returns the FIRST matching event with a reason string encoding the event
         AND the blocked expiration:
             macro_blackout_FOMC_2026-06-17_blocks_expiration_2026-07-18
         """
         cfg = (self._config.get("risk", {}) or {}).get("macro_blackout", {}) or {}
-        days_before = int(cfg.get("blackout_days_before", 1))
-        days_after = int(cfg.get("blackout_days_after", 0))
+        if days_before is None:
+            days_before = int(cfg.get("blackout_days_before", 1))
+        if days_after is None:
+            days_after = int(cfg.get("blackout_days_after", 0))
         horizon = (
             today + timedelta(days=entry_avoid_days)
             if entry_avoid_days is not None else short_expiration

@@ -1,9 +1,10 @@
-"""0DTE paper-test strategy — entry window, flatten, caps, dual-ledger math.
+"""0DTE paper-test strategy — entry window, trend gate, flatten, caps,
+dual-ledger math.
 
 Uses PaperBroker + the db_repos fixture like test_iron_condor / test_spreads.
 Times are injected via the `now` kwarg (aware America/New_York datetimes) so
-tests are independent of the wall clock; the trend reference is injected via
-`session_ref` so no live VWAP fetch happens.
+tests are independent of the wall clock; the 20-day SMA is injected via
+`sma_ref` (or `_prior_close_sma` is monkeypatched) so no yfinance fetch happens.
 """
 
 from __future__ import annotations
@@ -12,8 +13,10 @@ from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import pytest
 
+import strategies.zero_dte as zero_dte
 from core.models import (
     OptionContract,
     OptionType,
@@ -28,16 +31,17 @@ from core.models import (
 from core.strategies import StrategyDefinition
 from platforms.paper_broker import PaperBroker
 from strategies.spreads import (
-    DIRECTION_BEAR_CALL,
     DIRECTION_BULL_PUT,
     DIRECTION_IRON_CONDOR,
 )
 from strategies.zero_dte import (
+    _prior_close_sma,
+    above_trend,
     entry_penalized_credit,
     exit_penalized_debit,
     in_entry_window,
     past_flatten,
-    pick_direction,
+    propose_all,
     propose_all_closes,
     propose_close_for_symbol,
     propose_for_symbol,
@@ -57,9 +61,12 @@ def _config() -> dict:
     return {"account": {"id": "test", "broker": "paper"}}
 
 
-def _universe() -> dict:
+def _universe(*symbols: str) -> dict:
     return {
-        "tickers": [UniverseEntry(symbol="SPY", name="SPY", tier=1, overrides={})],
+        "tickers": [
+            UniverseEntry(symbol=s, name=s, tier=1, overrides={})
+            for s in (symbols or ("SPY",))
+        ],
         "banned": [],
         "banned_rules": [],
     }
@@ -67,15 +74,14 @@ def _universe() -> dict:
 
 def _strategy(**overrides: Any) -> StrategyDefinition:
     params: dict[str, Any] = {
-        "symbol": "SPY",
         "structure": "narrow_vertical",
         "spread_width_dollars": 2.0,
-        "short_delta_min": 0.15,
-        "short_delta_max": 0.25,
+        "short_delta_min": 0.10,
+        "short_delta_max": 0.15,
         # The synthetic chain's premium model (|delta| * 3) yields ~9% credit
-        # on a $2 width — below the production 15% floor. Tests that exercise
-        # the floor itself override this back up.
-        "min_credit_pct_of_width": 5.0,
+        # on a $2 width at 0.10-0.15 delta — clears the 3% production floor.
+        "min_credit_pct_of_width": 3.0,
+        "trend_sma_days": 20,
         "profit_close_pct": 50,
         "entry_start_et": "10:00",
         "entry_end_et": "10:15",
@@ -150,25 +156,22 @@ def _entry_broker(spot: float = 500.0) -> PaperBroker:
     return broker
 
 
-async def _propose(db_repos, broker, *, now, strategy=None, session_ref=499.0):
+async def _propose(db_repos, broker, *, now, strategy=None, sma_ref=499.0):
     return await propose_for_symbol(
         broker, db_repos, "SPY", _config(), _universe(),
         today=TODAY, strategy=strategy or _strategy(),
-        now=now, session_ref=session_ref,
+        now=now, sma_ref=sma_ref,
     )
 
 
-# -- trend rule --------------------------------------------------------------
+# -- trend gate --------------------------------------------------------------
 
 
-def test_pick_direction_above_ref_is_bull_put():
-    assert pick_direction(500.0, 499.0) == DIRECTION_BULL_PUT
-    # At the reference exactly, stay with the bullish default (>=).
-    assert pick_direction(500.0, 500.0) == DIRECTION_BULL_PUT
-
-
-def test_pick_direction_below_ref_is_bear_call():
-    assert pick_direction(498.0, 499.0) == DIRECTION_BEAR_CALL
+def test_above_trend_is_strict():
+    assert above_trend(500.0, 499.99)
+    # The ladder's downtrend flag is spot <= ma20: a tie skips.
+    assert not above_trend(500.0, 500.0)
+    assert not above_trend(499.0, 500.0)
 
 
 # -- entry window gating -----------------------------------------------------
@@ -192,9 +195,9 @@ async def test_entry_before_window_skips(db_repos):
 
 @pytest.mark.asyncio
 async def test_entry_inside_window_proposes_bull_put(db_repos):
-    """SPY above session_ref -> bull put spread, 2 legs, DTE 0, wing-is-the-stop."""
+    """SPY above its 20d SMA -> bull put spread, 2 legs, DTE 0, wing-is-the-stop."""
     proposal = await _propose(db_repos, _entry_broker(500.0), now=_et(10, 5),
-                              session_ref=499.0)
+                              sma_ref=499.0)
     assert proposal is not None
     assert proposal.strategy_id == "zero_dte"
     assert proposal.direction == DIRECTION_BULL_PUT
@@ -220,25 +223,95 @@ async def test_entry_weekend_skips(db_repos):
     proposal = await propose_for_symbol(
         _entry_broker(), db_repos, "SPY", _config(), _universe(),
         today=date(2026, 7, 25), strategy=_strategy(),
-        now=saturday, session_ref=499.0,
+        now=saturday, sma_ref=499.0,
     )
     assert proposal is None
 
 
-# -- trend rule end-to-end ---------------------------------------------------
+# -- trend gate end-to-end ---------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_below_vwap_proposes_bear_call(db_repos):
+@pytest.mark.parametrize("sma", [500.0, 501.0])
+async def test_spot_at_or_below_sma_skips_and_writes_no_ledger(db_repos, sma):
+    """Spot 500 vs SMA 500/501 -> no entry. The July spec sold a call spread
+    here; the rebuilt one sells nothing (and must not leave a ledger row)."""
     proposal = await _propose(db_repos, _entry_broker(500.0), now=_et(10, 5),
-                              session_ref=501.0)  # spot below ref -> bearish
+                              sma_ref=sma)
+    assert proposal is None
+    assert await db_repos.zero_dte_ledger.latest_for_symbol("SPY") is None
+
+
+@pytest.mark.asyncio
+async def test_missing_sma_fails_closed(db_repos, monkeypatch):
+    """No SMA (yfinance outage / short history) -> skip, never trade blind."""
+    monkeypatch.setattr(zero_dte, "_prior_close_sma", lambda *a, **k: None)
+    proposal = await _propose(db_repos, _entry_broker(500.0), now=_et(10, 5),
+                              sma_ref=None)
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_trend_gate_off_with_zero_days(db_repos, monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("SMA must not be fetched when trend_sma_days=0")
+
+    monkeypatch.setattr(zero_dte, "_prior_close_sma", _boom)
+    proposal = await _propose(db_repos, _entry_broker(500.0), now=_et(10, 5),
+                              strategy=_strategy(trend_sma_days=0), sma_ref=None)
     assert proposal is not None
-    assert proposal.direction == DIRECTION_BEAR_CALL
-    for leg in proposal.legs:
-        assert leg.option_type == OptionType.CALL
-    short = next(x for x in proposal.legs if x.action == OrderType.SELL_TO_OPEN)
-    long = next(x for x in proposal.legs if x.action == OrderType.BUY_TO_OPEN)
-    assert long.strike - short.strike == pytest.approx(2.0)
+    assert proposal.direction == DIRECTION_BULL_PUT
+
+
+@pytest.mark.asyncio
+async def test_never_proposes_call_side(db_repos):
+    """Above trend the only structure is a put spread — no bear-call arm."""
+    proposal = await _propose(db_repos, _entry_broker(500.0), now=_et(10, 5))
+    assert proposal is not None
+    assert {leg.option_type for leg in proposal.legs} == {OptionType.PUT}
+
+
+def _daily_frame(closes: list[float], last_day: date) -> pd.DataFrame:
+    idx = pd.bdate_range(end=pd.Timestamp(last_day), periods=len(closes))
+    return pd.DataFrame({"close": closes}, index=idx)
+
+
+def test_prior_close_sma_excludes_todays_bar(monkeypatch):
+    """yfinance's daily frame carries today's in-progress bar during the
+    session; the SMA must use the 20 closes BEFORE today (the ladder's ma20)."""
+    import backtest.data
+
+    monkeypatch.setattr(zero_dte, "_SMA_CACHE", {})
+    prior = [700.0 + i for i in range(25)]           # 25 prior sessions
+    frame = _daily_frame(prior + [9999.0], TODAY)    # + today's partial bar
+    calls: list[str] = []
+
+    def _load(symbol, period="3y", *, weekly=False):
+        calls.append(symbol)
+        return frame
+
+    monkeypatch.setattr(backtest.data, "load_daily_yf", _load)
+    expected = sum(prior[-20:]) / 20
+    assert _prior_close_sma("SPY", TODAY, 20) == pytest.approx(expected)
+    # Cached for the day: no second fetch.
+    assert _prior_close_sma("SPY", TODAY, 20) == pytest.approx(expected)
+    assert calls == ["SPY"]
+
+
+def test_prior_close_sma_short_history_and_errors_return_none(monkeypatch):
+    import backtest.data
+
+    monkeypatch.setattr(zero_dte, "_SMA_CACHE", {})
+    monkeypatch.setattr(backtest.data, "load_daily_yf",
+                        lambda *a, **k: _daily_frame([700.0] * 10, TODAY))
+    assert _prior_close_sma("SPY", TODAY, 20) is None
+
+    def _raise(*a, **k):
+        raise RuntimeError("yfinance down")
+
+    monkeypatch.setattr(backtest.data, "load_daily_yf", _raise)
+    assert _prior_close_sma("QQQ", TODAY, 20) is None
+    assert zero_dte._SMA_CACHE == {}  # failures are never cached
 
 
 # -- credit floor ------------------------------------------------------------
@@ -246,8 +319,8 @@ async def test_below_vwap_proposes_bear_call(db_repos):
 
 @pytest.mark.asyncio
 async def test_min_credit_pct_floor_skips(db_repos):
-    """The synthetic chain pays ~9% of a $2 width — production's 15% floor
-    rejects it."""
+    """The synthetic chain pays ~9% of a $2 width — the July 15% floor
+    rejects it (at real 0.10-0.15 delta quotes it rejected everything)."""
     strat = _strategy(min_credit_pct_of_width=15.0)
     proposal = await _propose(db_repos, _entry_broker(), now=_et(10, 5), strategy=strat)
     assert proposal is None
@@ -264,6 +337,17 @@ async def test_max_positions_per_day_blocks_second_entry(db_repos):
     ))
     proposal = await _propose(db_repos, _entry_broker(), now=_et(10, 5))
     assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_other_symbols_cycle_does_not_block(db_repos):
+    """max_positions_per_day is per symbol: QQQ's fill leaves SPY's slot."""
+    await db_repos.cycles.insert(WheelCycle(
+        account_id="test", symbol="QQQ", strategy_id="zero_dte",
+        started_at=datetime(TODAY.year, TODAY.month, TODAY.day, 14, 5),
+    ))
+    proposal = await _propose(db_repos, _entry_broker(), now=_et(10, 5))
+    assert proposal is not None
 
 
 @pytest.mark.asyncio
@@ -540,13 +624,15 @@ async def test_skips_when_max_loss_exceeds_capital_cap(db_repos):
 # -- 2026-10-19: broker chain WITHOUT Greeks (the live Alpaca paper shape) ---
 
 
-def _seed_delta_less_chain(broker: PaperBroker, symbol: str, spot: float, now: datetime) -> None:
-    """Same-day chain priced off Black-Scholes at 14% vol, with delta=None
+def _seed_delta_less_chain(
+    broker: PaperBroker, symbol: str, spot: float, now: datetime, vol: float = 0.14,
+) -> None:
+    """Same-day chain priced off Black-Scholes at `vol`, with delta=None
     on every contract — the shape the live feed returns. Every pre-fix test
     seeded broker deltas, so the fallback (where T was 0 on expiry day) was
     never exercised and the module shipped unable to trade. Use a realistic
     SPY level: at 14% vol 1 sd over ~6h is only ~$2.80, so $1 strikes around
-    a $500 spot skip straight over the 0.15-0.25 delta band."""
+    a $500 spot skip straight over the delta band."""
     from core.models import Quote
     from data.greeks import bs_price, years_to_expiry
 
@@ -555,7 +641,7 @@ def _seed_delta_less_chain(broker: PaperBroker, symbol: str, spot: float, now: d
     for offset in range(-15, 16):
         strike = spot + offset
         for kind in (OptionType.PUT, OptionType.CALL):
-            p = bs_price(spot, strike, T, 0.14, kind)
+            p = bs_price(spot, strike, T, vol, kind)
             contracts.append(OptionContract(
                 underlying=symbol, occ_symbol=_occ(symbol, TODAY, kind.value, strike),
                 strike=strike, expiration=TODAY, option_type=kind,
@@ -581,15 +667,57 @@ async def test_fetch_same_day_chain_without_broker_greeks():
     assert all(0.15 <= abs(c.delta) <= 0.25 for c in got)
 
 
+def _short_put_delta(spot: float, strike: float, now: datetime, vol: float) -> float:
+    from data.greeks import bs_delta, years_to_expiry
+
+    T = years_to_expiry(TODAY, TODAY, now=now)
+    return abs(bs_delta(spot, strike, T, vol, OptionType.PUT))
+
+
 @pytest.mark.asyncio
 async def test_entry_proposes_from_delta_less_chain(db_repos):
+    """SPY ~766, 14% vol, 10:05 ET, no broker deltas: the short lands in the
+    0.10-0.15 band (763 at ~0.14; 762 is ~0.07, 764 ~0.23), $2 wing, and the
+    credit clears the 3% floor."""
     broker = PaperBroker(cash=50_000)
     now = _et(10, 5)
     _seed_delta_less_chain(broker, "SPY", 766.0, now)
-    proposal = await _propose(db_repos, broker, now=now, session_ref=765.0)
+    proposal = await _propose(db_repos, broker, now=now, sma_ref=765.0)
     assert proposal is not None
     assert proposal.direction == DIRECTION_BULL_PUT
     short = next(x for x in proposal.legs if x.action == OrderType.SELL_TO_OPEN)
     long_ = next(x for x in proposal.legs if x.action == OrderType.BUY_TO_OPEN)
-    assert short.strike < 766.0
+    assert short.option_type == OptionType.PUT
+    assert 0.10 <= _short_put_delta(766.0, short.strike, now, 0.14) <= 0.15
     assert short.strike - long_.strike == pytest.approx(2.0)
+    assert proposal.net_credit_per_spread >= 0.03 * 2.0
+    assert proposal.max_loss_per_spread <= 200.0
+    assert proposal.quantity == 1
+
+
+@pytest.mark.asyncio
+async def test_propose_all_trades_spy_and_qqq_each_against_own_sma(db_repos, monkeypatch):
+    """Universe SPY + QQQ: each symbol is gated on ITS OWN 20d SMA — here
+    QQQ (718) sits below its SMA, the 2026-10-16 shape, so only SPY trades."""
+    broker = PaperBroker(cash=50_000)
+    now = _et(10, 5)
+    _seed_delta_less_chain(broker, "SPY", 766.0, now)
+    _seed_delta_less_chain(broker, "QQQ", 718.0, now, vol=0.18)
+    smas = {"SPY": 760.0, "QQQ": 741.0}
+    monkeypatch.setattr(zero_dte, "_prior_close_sma",
+                        lambda symbol, today, n: smas[symbol])
+    out = await propose_all(
+        broker, db_repos, _config(), _universe("SPY", "QQQ"),
+        today=TODAY, strategy=_strategy(), now=now,
+    )
+    assert [p.symbol for p in out] == ["SPY"]
+
+    smas["QQQ"] = 715.0          # QQQ back above its SMA -> both trade
+    out = await propose_all(
+        broker, db_repos, _config(), _universe("SPY", "QQQ"),
+        today=TODAY, strategy=_strategy(), now=now,
+    )
+    assert sorted(p.symbol for p in out) == ["QQQ", "SPY"]
+    qqq = next(p for p in out if p.symbol == "QQQ")
+    q_short = next(x for x in qqq.legs if x.action == OrderType.SELL_TO_OPEN)
+    assert 0.10 <= _short_put_delta(718.0, q_short.strike, now, 0.18) <= 0.15

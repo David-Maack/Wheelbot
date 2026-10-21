@@ -176,14 +176,17 @@ tickers:
     # calendar. Each strategy on SPY holds independent, separately-keyed
     # positions.
     strategies: [put_spread, iron_condor, pmcc, calendar, spy_swing_opt, zero_dte]
-    notes: "Broad-market hedge candidate too. Iron condor + PMCC + calendar target — deepest liquidity. spy_swing_opt = directional swing (dry-run in 2.1). zero_dte = same-day morning credit structure (2026-07 paper test)."
+    notes: "Broad-market hedge candidate too. Iron condor + PMCC + calendar target — deepest liquidity. spy_swing_opt = directional swing (dry-run in 2.1). zero_dte = same-day morning bull put spread (2026-07 paper test, rebuilt 2026-10)."
 
   - symbol: QQQ
     name: "NASDAQ-100 ETF"
     tier: 1
     # TICKET-014/015/016: see SPY for the overlap rationale.
-    strategies: [put_spread, iron_condor, pmcc, calendar]
-    notes: "Tech-heavy ETF with deep options chain. Iron condor + PMCC + calendar target."
+    # zero_dte (2026-10 rebuild): QQQ carries the ladder evidence — under the
+    # SMA + FOMC skips its 0.10/0.15 rungs were +$222/+$312 over 12 days with
+    # no breach, while SPY alone was -$57/-$127 (one -$120/-$210 day, 9/30).
+    strategies: [put_spread, iron_condor, pmcc, calendar, zero_dte]
+    notes: "Tech-heavy ETF with deep options chain. Iron condor + PMCC + calendar target. zero_dte = same-day bull put (2026-10 rebuild)."
 
   - symbol: AMD
     name: "Advanced Micro Devices"

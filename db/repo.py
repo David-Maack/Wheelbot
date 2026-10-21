@@ -405,16 +405,22 @@ class WheelCyclesRepo(_Repo):
 
     async def count_started_on(
         self, account_id: str, strategy_id: str, day: date,
+        *, symbol: str | None = None,
     ) -> int:
-        """Number of cycles a strategy STARTED on `day` (open or closed).
-        0DTE sprint: enforces zero_dte's max_positions_per_day — a cycle is
-        created on fill, so proposed-but-unfilled entries don't count (the
-        position-state gate covers those)."""
-        row = await self._fetch_one(
+        """Number of cycles a strategy STARTED on `day` (open or closed),
+        optionally for one `symbol` only. 0DTE sprint: enforces zero_dte's
+        max_positions_per_day (per symbol since the 2026-10 rebuild) — a
+        cycle is created on fill, so proposed-but-unfilled entries don't
+        count (the position-state gate covers those)."""
+        sql = (
             "SELECT COUNT(*) AS n FROM wheel_cycles "
-            "WHERE account_id = ? AND strategy_id = ? AND date(started_at) = ?",
-            (account_id, strategy_id, day.isoformat()),
+            "WHERE account_id = ? AND strategy_id = ? AND date(started_at) = ?"
         )
+        args: tuple[Any, ...] = (account_id, strategy_id, day.isoformat())
+        if symbol is not None:
+            sql += " AND symbol = ?"
+            args += (symbol,)
+        row = await self._fetch_one(sql, args)
         return int(row["n"]) if row else 0
 
     async def insert(self, cycle: WheelCycle) -> int:
