@@ -240,9 +240,10 @@ risk:
   # open, the rule has nothing useful to say. bear_call_spread is NOT
   # bypassed (unlike the tier-2 LLM screen): macro events gap both directions.
   #
-  # Populated by scripts/refresh_macro_calendar.py (daily cron). When Finnhub
-  # is unavailable, falls back to config/macro_calendar.yaml (hand-curated;
-  # refresh quarterly — loader warns when valid_until is within 30 days).
+  # Populated by scripts/refresh_macro_calendar.py (daily cron) from
+  # config/macro_calendar.yaml — the only source since 2026-10-27 (Finnhub's
+  # economic calendar 403s on our plan). Official FOMC/CPI/NFP dates; extend
+  # the file before it runs out (the source URLs are in its header).
   macro_blackout:
     enabled: true
     event_types: [FOMC, CPI, NFP]
@@ -258,9 +259,10 @@ risk:
     # event blocks ~2-3 trading days -> ~14+ open days. Further option if still
     # too tight: drop NFP/CPI from event_types and keep only FOMC.
     entry_avoid_days: 2
-    refresh_interval_hours: 24
-    stale_threshold_hours: 48
-    finnhub_impact_min: "high"
+    # Coverage check: once any event type above has no event within this many
+    # days, the gate keeps blocking on what it has and Discord gets a daily
+    # "extend config/macro_calendar.yaml" alert.
+    min_coverage_days: 60
 
   # TICKET-006: mid-cycle earnings recheck. Entry-time earnings blackout fires
   # at order placement, but companies often confirm earnings dates only 2-3

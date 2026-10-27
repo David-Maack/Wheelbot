@@ -6,9 +6,9 @@ Suggested crontab (weekdays pre-market):
 
     0 7 * * 1-5  docker exec wheelbot python -m scripts.refresh_macro_calendar
 
-Pulls events from Finnhub `/calendar/economic` when `FINNHUB_API_KEY` is set,
-otherwise falls back to `config/macro_calendar.yaml`. Upserts via UNIQUE
-(event_date, event_type) so running multiple times the same day is safe.
+Loads `config/macro_calendar.yaml` (the only source since 2026-10-27) and
+replaces every macro_events row dated today-or-later with its events, so
+running it repeatedly is safe and a moved date never leaves a stale row.
 """
 
 from __future__ import annotations

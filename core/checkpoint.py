@@ -71,6 +71,9 @@ def checkpoint(step: str, **context: Any) -> Iterator[dict[str, Any]]:
 
 def configure_logging(level: str = "INFO", json_lines: bool = False) -> None:
     """Bare-bones logging setup. Replace with structlog or similar in Sprint 5."""
+    from core.logs import quiet_noisy_loggers
+
+    quiet_noisy_loggers()
     root = logging.getLogger()
     if root.handlers:
         return

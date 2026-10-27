@@ -614,7 +614,7 @@ async def test_macro_page_renders_empty_when_no_events(app_client):
     deps.config.setdefault("risk", {})["macro_blackout"] = {
         "enabled": True, "event_types": ["FOMC", "CPI", "NFP"],
         "blackout_days_before": 1, "blackout_days_after": 0,
-        "stale_threshold_hours": 48,
+        "min_coverage_days": 60,
     }
     resp = await client.get("/macro", headers=_auth_header("wheelbot", "hunter2"))
     assert resp.status_code == 200
@@ -630,7 +630,7 @@ async def test_macro_page_renders_upcoming_events(app_client):
     deps.config.setdefault("risk", {})["macro_blackout"] = {
         "enabled": True, "event_types": ["FOMC", "CPI", "NFP"],
         "blackout_days_before": 1, "blackout_days_after": 0,
-        "stale_threshold_hours": 48,
+        "min_coverage_days": 60,
     }
     now = datetime.now(UTC).replace(tzinfo=None)
     today = now.date()

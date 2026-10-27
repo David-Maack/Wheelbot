@@ -11,13 +11,15 @@
       <tr><th>Enabled</th><td>{{ "yes" if enabled else "no" }}</td></tr>
       <tr><th>Event types</th><td>{{ ", ".join(event_types) if event_types else "—" }}</td></tr>
       <tr><th>Window</th><td>{{ days_before }} day(s) before · {{ days_after }} day(s) after</td></tr>
-      <tr><th>Last refresh</th>
+      <tr><th>Calendar covers through</th>
         <td>
-          {% if last_refresh %}{{ last_refresh }}{% else %}<span class="neg">never</span>{% endif %}
-          {% if is_stale %}<span class="warn-earnings" title="Calendar exceeded stale_threshold_hours">⚠ stale</span>{% endif %}
+          {% if coverage_end %}{{ coverage_end }}{% else %}<span class="neg">no events</span>{% endif %}
+          {% if is_stale %}<span class="warn-earnings" title="Runs out within {{ min_coverage_days }} days — extend config/macro_calendar.yaml">⚠ running out</span>{% endif %}
         </td>
       </tr>
-      <tr><th>Stale threshold</th><td>{{ stale_threshold_hours }} h</td></tr>
+      <tr><th>Last refresh</th>
+        <td>{% if last_refresh %}{{ last_refresh }}{% else %}<span class="neg">never</span>{% endif %}</td>
+      </tr>
     </tbody>
   </table>
 </section>

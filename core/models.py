@@ -271,10 +271,9 @@ class RegimeSnapshot(_Base):
 class MacroEvent(_Base):
     """One macro economic event in the blackout calendar (TICKET-007).
 
-    `event_type` is the canonical category (FOMC | CPI | NFP | PPI | GDP |
-    JOLTS | OTHER) — Finnhub's raw event names get mapped via
-    `data/macro_calendar._FINNHUB_TYPE_MAP`. Anything that doesn't match is
-    stored as OTHER so the operator notices renames on the dashboard.
+    `event_type` is the canonical category: FOMC | CPI | NFP, loaded from
+    config/macro_calendar.yaml since 2026-10-27. Older rows from the retired
+    Finnhub feed may also carry PPI | GDP | JOLTS | OTHER; no rule reads those.
     """
 
     id: int | None = None

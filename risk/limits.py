@@ -820,9 +820,10 @@ class RiskGate:
         Fail-open paths (rule passes with a logged checkpoint, never blocks):
           - macro_blackout.enabled is false in config
           - `macro_events` table is empty (cron probably not configured)
-          - last refresh > stale_threshold_hours ago (cron probably broken)
-        Each fail-open also fires a rate-limited Discord alert so the
-        operator notices instead of silently flying blind.
+        A calendar that runs out within min_coverage_days still answers for
+        the dates it has and fires a rate-limited Discord alert to extend
+        config/macro_calendar.yaml (2026-10-27: the old refresh-age check
+        stayed green while the table held no future event at all).
         """
         if _is_close(proposal):
             result.add("macro_blackout", "skip", "close — not gated by macro events")
@@ -865,11 +866,8 @@ class RiskGate:
             result.add("macro_blackout", "skip", "macro_events table empty — fail-open")
             return
 
-        # Stale-calendar check — fail-open with rate-limited Discord.
-        if await calendar.is_stale():
-            await calendar.maybe_alert_stale()
-            result.add("macro_blackout", "skip", "macro calendar stale — fail-open")
-            return
+        # Running-out calendar — alert (rate-limited) but keep evaluating.
+        await calendar.maybe_alert_stale()
 
         event_types = list(cfg.get("event_types", []) or [])
         avoid = cfg.get("entry_avoid_days")

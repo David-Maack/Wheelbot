@@ -1,34 +1,76 @@
-# Hand-curated macro event calendar — fallback when Finnhub is unavailable
-# or FINNHUB_API_KEY isn't set.
+# Macro event calendar — the ONLY source for the macro blackout (2026-10-27).
 #
-# Used by data/macro_calendar.py::load_yaml_calendar(). Same canonical
-# event_type values as the Finnhub adapter writes (FOMC | CPI | NFP | PPI |
-# GDP | JOLTS | OTHER).
+# Finnhub's /calendar/economic returns 403 on our plan; since June 2026 the
+# refresh silently fell back to this file, which expired 2026-09-30, so the
+# blackout had no event after 2026-09-16 (FOMC 2026-10-28 was invisible).
+# This file is now authoritative: scripts/refresh_macro_calendar replaces
+# every macro_events row dated today-or-later with exactly these events.
 #
-# valid_until — refresh THIS file before this date or the loader logs
-# `macro_yaml_stale_human_attention` (fires when within 30 days of expiry,
-# escalates when past). Source for dates: official US economic releases
-# calendar (BLS, BEA, Federal Reserve).
+# Used by data/macro_calendar.py::load_yaml_calendar(). event_type values:
+# FOMC | CPI | NFP (anything else is stored but no rule reads it).
 #
-# Pulled 2026-06-03 from public release calendars. Cross-check before
-# trusting in production.
+# Dates are the event DAY in America/New_York: FOMC = decision day (2nd day
+# of the meeting, statement 14:00 ET); CPI and NFP = release day (08:30 ET).
+#
+# Sources (pulled 2026-10-27):
+#   FOMC  https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+#         (2027 dates are tentative until confirmed at the preceding meeting)
+#   CPI   https://www.bls.gov/schedule/news_release/cpi.htm
+#   NFP   https://www.bls.gov/schedule/news_release/empsit.htm
+#
+# valid_until — the last date this file covers. The refresh logs
+# `macro_yaml_stale_human_attention` within 30 days of it, and the risk gate
+# treats the calendar as stale (fail-open + Discord) once any configured
+# event type has no event within risk.macro_blackout.min_coverage_days.
+# Extend this file from the sources above before then.
 
-valid_until: 2026-09-30
+valid_until: 2027-12-10
 
 events:
-  # June 2026 — FOMC meeting + CPI/NFP
-  - { date: 2026-06-12, event_type: NFP,  impact: high, description: "Non Farm Payrolls (May 2026 release)" }
-  - { date: 2026-06-11, event_type: CPI,  impact: high, description: "CPI YoY (May 2026 release)" }
-  - { date: 2026-06-17, event_type: FOMC, impact: high, description: "FOMC Statement + Press Conference" }
+  # 2026 Q4
+  - { date: 2026-10-28, event_type: FOMC, impact: high, description: "FOMC decision (Oct 27-28)" }
+  - { date: 2026-11-06, event_type: NFP,  impact: high, description: "Employment Situation (Oct 2026)" }
+  - { date: 2026-11-10, event_type: CPI,  impact: high, description: "CPI (Oct 2026)" }
+  - { date: 2026-12-04, event_type: NFP,  impact: high, description: "Employment Situation (Nov 2026)" }
+  - { date: 2026-12-09, event_type: FOMC, impact: high, description: "FOMC decision + SEP (Dec 8-9)" }
+  - { date: 2026-12-10, event_type: CPI,  impact: high, description: "CPI (Nov 2026)" }
 
-  # July 2026
-  - { date: 2026-07-02, event_type: NFP,  impact: high, description: "Non Farm Payrolls (June 2026 release)" }
-  - { date: 2026-07-15, event_type: CPI,  impact: high, description: "CPI YoY (June 2026 release)" }
-  - { date: 2026-07-29, event_type: FOMC, impact: high, description: "FOMC Statement + Press Conference" }
+  # 2027 Q1
+  - { date: 2027-01-08, event_type: NFP,  impact: high, description: "Employment Situation (Dec 2026)" }
+  - { date: 2027-01-13, event_type: CPI,  impact: high, description: "CPI (Dec 2026)" }
+  - { date: 2027-01-27, event_type: FOMC, impact: high, description: "FOMC decision (Jan 26-27, tentative)" }
+  - { date: 2027-02-05, event_type: NFP,  impact: high, description: "Employment Situation (Jan 2027)" }
+  - { date: 2027-02-11, event_type: CPI,  impact: high, description: "CPI (Jan 2027)" }
+  - { date: 2027-03-05, event_type: NFP,  impact: high, description: "Employment Situation (Feb 2027)" }
+  - { date: 2027-03-10, event_type: CPI,  impact: high, description: "CPI (Feb 2027)" }
+  - { date: 2027-03-17, event_type: FOMC, impact: high, description: "FOMC decision + SEP (Mar 16-17, tentative)" }
 
-  # August 2026
-  - { date: 2026-08-01, event_type: NFP,  impact: high, description: "Non Farm Payrolls (July 2026 release)" }
-  - { date: 2026-08-12, event_type: CPI,  impact: high, description: "CPI YoY (July 2026 release)" }
+  # 2027 Q2
+  - { date: 2027-04-02, event_type: NFP,  impact: high, description: "Employment Situation (Mar 2027)" }
+  - { date: 2027-04-13, event_type: CPI,  impact: high, description: "CPI (Mar 2027)" }
+  - { date: 2027-04-28, event_type: FOMC, impact: high, description: "FOMC decision (Apr 27-28, tentative)" }
+  - { date: 2027-05-07, event_type: NFP,  impact: high, description: "Employment Situation (Apr 2027)" }
+  - { date: 2027-05-12, event_type: CPI,  impact: high, description: "CPI (Apr 2027)" }
+  - { date: 2027-06-04, event_type: NFP,  impact: high, description: "Employment Situation (May 2027)" }
+  - { date: 2027-06-09, event_type: FOMC, impact: high, description: "FOMC decision + SEP (Jun 8-9, tentative)" }
+  - { date: 2027-06-10, event_type: CPI,  impact: high, description: "CPI (May 2027)" }
 
-  # September 2026 — FOMC meeting (no September NFP/CPI added until refresh)
-  - { date: 2026-09-16, event_type: FOMC, impact: high, description: "FOMC Statement + Press Conference + Economic Projections" }
+  # 2027 Q3
+  - { date: 2027-07-02, event_type: NFP,  impact: high, description: "Employment Situation (Jun 2027)" }
+  - { date: 2027-07-14, event_type: CPI,  impact: high, description: "CPI (Jun 2027)" }
+  - { date: 2027-07-28, event_type: FOMC, impact: high, description: "FOMC decision (Jul 27-28, tentative)" }
+  - { date: 2027-08-06, event_type: NFP,  impact: high, description: "Employment Situation (Jul 2027)" }
+  - { date: 2027-08-11, event_type: CPI,  impact: high, description: "CPI (Jul 2027)" }
+  - { date: 2027-09-03, event_type: NFP,  impact: high, description: "Employment Situation (Aug 2027)" }
+  - { date: 2027-09-14, event_type: CPI,  impact: high, description: "CPI (Aug 2027)" }
+  - { date: 2027-09-15, event_type: FOMC, impact: high, description: "FOMC decision + SEP (Sep 14-15, tentative)" }
+
+  # 2027 Q4
+  - { date: 2027-10-08, event_type: NFP,  impact: high, description: "Employment Situation (Sep 2027)" }
+  - { date: 2027-10-14, event_type: CPI,  impact: high, description: "CPI (Sep 2027)" }
+  - { date: 2027-10-27, event_type: FOMC, impact: high, description: "FOMC decision (Oct 26-27, tentative)" }
+  - { date: 2027-11-05, event_type: NFP,  impact: high, description: "Employment Situation (Oct 2027)" }
+  - { date: 2027-11-10, event_type: CPI,  impact: high, description: "CPI (Oct 2027)" }
+  - { date: 2027-12-03, event_type: NFP,  impact: high, description: "Employment Situation (Nov 2027)" }
+  - { date: 2027-12-08, event_type: FOMC, impact: high, description: "FOMC decision + SEP (Dec 7-8, tentative)" }
+  - { date: 2027-12-10, event_type: CPI,  impact: high, description: "CPI (Nov 2027)" }

@@ -32,9 +32,8 @@ from data.macro_calendar import (
     MacroCalendar,
     _today_nyse,
     load_yaml_calendar,
-    map_finnhub_event_name,
     maybe_log_yaml_stale,
-    parse_finnhub_events,
+    refresh_events,
 )
 from strategies.spreads import MultiLegProposal
 from strategies.wheel import Proposal
@@ -67,7 +66,6 @@ def _config(**macro_overrides: Any) -> dict[str, Any]:
                 "event_types": ["FOMC", "CPI", "NFP"],
                 "blackout_days_before": 1,
                 "blackout_days_after": 0,
-                "stale_threshold_hours": 48,
             },
         },
     }
@@ -284,76 +282,7 @@ def test_macro_calendar_uses_nyse_timezone_for_today(monkeypatch):
     assert _today_nyse() == date(2026, 6, 3)
 
 
-# -- Finnhub mapping (Issue 1) ----------------------------------------------
-
-
-def test_finnhub_event_name_mapping_canonical():
-    """Lock the canonical-mapping behaviour. When Finnhub renames events
-    these will start writing OTHER and the dashboard will flag it."""
-    assert map_finnhub_event_name("FOMC Statement") == "FOMC"
-    assert map_finnhub_event_name("Fed Interest Rate Decision") == "FOMC"
-    assert map_finnhub_event_name("CPI YoY") == "CPI"
-    assert map_finnhub_event_name("Core CPI MoM") == "CPI"
-    assert map_finnhub_event_name("Non Farm Payrolls") == "NFP"
-    assert map_finnhub_event_name("Nonfarm Payrolls") == "NFP"  # punctuation variant
-    assert map_finnhub_event_name("Unemployment Rate") == "NFP"
-    assert map_finnhub_event_name("PPI MoM") == "PPI"
-    assert map_finnhub_event_name("GDP QoQ") == "GDP"
-    assert map_finnhub_event_name("JOLTS Job Openings") == "JOLTS"
-    # Case-insensitive
-    assert map_finnhub_event_name("fomc minutes") == "FOMC"
-    # Unknown → OTHER (visible to operator on dashboard).
-    assert map_finnhub_event_name("Random Speech By Senator") == "OTHER"
-    assert map_finnhub_event_name("") == "OTHER"
-
-
-def test_finnhub_core_cpi_does_not_match_plain_cpi(monkeypatch):
-    """Substring matching would silently route 'Core CPI YoY' to the 'cpi
-    yoy' key depending on dict iteration order; exact matching means an
-    unknown variant correctly routes to OTHER instead of being mis-mapped.
-
-    Proves the fix by removing the 'core cpi yoy' key and asserting the
-    plain 'cpi yoy' key does NOT swallow it via substring fall-through.
-    """
-    monkeypatch.setattr(
-        "data.macro_calendar._FINNHUB_TYPE_MAP",
-        {"cpi yoy": "CPI"},  # only the plain key remains
-    )
-    # Plain CPI still maps correctly.
-    assert map_finnhub_event_name("CPI YoY") == "CPI"
-    # Core CPI must fall to OTHER — NOT be silently swallowed by the
-    # substring "cpi yoy" inside "core cpi yoy".
-    assert map_finnhub_event_name("Core CPI YoY") == "OTHER"
-
-
-def test_finnhub_unknown_variant_falls_to_other():
-    """Anything Finnhub renames or adds that the table doesn't cover routes
-    to OTHER. The /macro page renders OTHER rows so the operator sees the
-    drift and can extend `_FINNHUB_TYPE_MAP` accordingly."""
-    # Geographic variants that share a substring with US series.
-    assert map_finnhub_event_name("Mexico CPI YoY") == "OTHER"
-    assert map_finnhub_event_name("EU Core CPI MoM") == "OTHER"
-    # Brand-new event names Finnhub might add.
-    assert map_finnhub_event_name("Some Brand New Indicator") == "OTHER"
-    # Even a longer Powell-speaks variant doesn't false-positive — exact match.
-    assert map_finnhub_event_name("Fed Chair Powell Speaks at Jackson Hole") == "OTHER"
-    # Whitespace + case still normalize before the exact lookup.
-    assert map_finnhub_event_name("  FOMC Statement  ") == "FOMC"
-
-
-def test_parse_finnhub_events_filters_by_min_impact():
-    """`impact_min=high` filters out medium/low events."""
-    raw = [
-        {"event": "FOMC Statement", "impact": "high", "time": "2026-06-17 14:00:00"},
-        {"event": "Retail Sales MoM", "impact": "medium", "time": "2026-06-18"},
-        {"event": "Random Index", "impact": "low", "date": "2026-06-19"},
-    ]
-    events = parse_finnhub_events(raw, min_impact="high")
-    assert [e.event_type for e in events] == ["FOMC"]
-    assert events[0].event_date == date(2026, 6, 17)
-
-
-# -- YAML fallback + stale warning (decision #4) ----------------------------
+# -- YAML loader + stale warning (decision #4) ------------------------------
 
 
 def test_yaml_loader_parses_valid_file(tmp_path):
@@ -451,16 +380,147 @@ async def test_empty_table_fails_open_with_rate_limited_alert(db_repos, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_is_stale_when_never_refreshed(db_repos):
+async def test_is_stale_when_table_empty(db_repos):
     cal = MacroCalendar(db_repos, _config())
+    assert await cal.is_stale() is True
+    assert await cal.coverage_end() is None
+
+
+async def _seed_all_types(repos, day: date) -> None:
+    for etype in ("FOMC", "CPI", "NFP"):
+        await _seed_event(repos, day=day, etype=etype)
+
+
+@pytest.mark.asyncio
+async def test_is_stale_false_when_every_type_covers_the_horizon(db_repos):
+    """Coverage, not refresh age: every configured type has an event beyond
+    today + min_coverage_days (default 60) -> not stale."""
+    await _seed_all_types(db_repos, _today_nyse() + timedelta(days=90))
+    cal = MacroCalendar(db_repos, _config())
+    assert await cal.coverage_end() == _today_nyse() + timedelta(days=90)
+    assert await cal.is_stale() is False
+
+
+@pytest.mark.asyncio
+async def test_is_stale_when_calendar_runs_out(db_repos):
+    """A freshly re-stamped table whose last event is 30 days out is stale —
+    the 2026-09 failure: fetched_at was fresh every morning, events ran out."""
+    await _seed_all_types(db_repos, _today_nyse() + timedelta(days=30))
+    cal = MacroCalendar(db_repos, _config())
+    assert await cal.is_stale() is True
+    cal_short = MacroCalendar(db_repos, _config(min_coverage_days=20))
+    assert await cal_short.is_stale() is False
+
+
+@pytest.mark.asyncio
+async def test_is_stale_when_one_type_is_missing(db_repos):
+    """FOMC and CPI far out but no NFP rows at all -> stale (coverage_end None)."""
+    far = _today_nyse() + timedelta(days=200)
+    await _seed_event(db_repos, day=far, etype="FOMC")
+    await _seed_event(db_repos, day=far, etype="CPI")
+    cal = MacroCalendar(db_repos, _config())
+    assert await cal.coverage_end() is None
     assert await cal.is_stale() is True
 
 
 @pytest.mark.asyncio
-async def test_is_stale_false_after_recent_refresh(db_repos):
-    await _seed_event(db_repos, day=_today(), etype="FOMC")
-    cal = MacroCalendar(db_repos, _config())
-    assert await cal.is_stale() is False
+async def test_stale_calendar_still_blocks_known_event_and_alerts(db_repos, monkeypatch):
+    """Running out is an alert, not a fail-open: an event the table HAS
+    still blocks, and the 'extend the YAML' notify fires once."""
+    from platforms.paper_broker import PaperBroker
+    from risk.limits import RiskGate
+
+    sent: list[str] = []
+
+    async def _capture_notify(event, message, **fields):
+        sent.append(event)
+
+    monkeypatch.setattr("core.notify.notify", _capture_notify)
+    await _seed_event(db_repos, day=_today(), etype="FOMC")   # only event -> stale
+    cfg = _config()
+    cfg["wheel"] = {"buying_power_floor_pct": 0, "max_position_pct_of_account": 100,
+                    "open_interest_min": 0, "volume_min": 0, "bid_ask_spread_max_pct": 100}
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg,
+                    {"tickers": [UniverseEntry(symbol="F", name="Ford", tier=1, overrides={})],
+                     "banned": [], "banned_rules": []})
+    proposal = Proposal(
+        symbol="F",
+        contract=OptionContract(
+            underlying="F", occ_symbol="F260617P00010000", strike=10.0,
+            expiration=_today() + timedelta(days=14), option_type=OptionType.PUT,
+            bid=0.40, ask=0.42,
+        ),
+        order_type=OrderType.SELL_TO_OPEN, quantity=1, rationale="test",
+    )
+    result = await gate.evaluate(proposal, today=_today(), raise_on_fail=False)
+    rule = next(r for r in result.results if r.rule == "macro_blackout")
+    assert rule.status == "fail" and "FOMC" in rule.detail
+    assert sent == ["macro.calendar_stale"]
+
+
+# -- refresh: the YAML replaces the future (2026-10-27) ----------------------
+
+
+def _yaml_event(day: date, etype: str, desc: str = "yaml") -> MacroEvent:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    return MacroEvent(event_date=day, event_type=etype, impact="high",
+                      description=desc, fetched_at=now, created_at=now, source="yaml")
+
+
+@pytest.mark.asyncio
+async def test_refresh_replaces_future_rows_and_keeps_history(db_repos, monkeypatch):
+    """A future row the YAML no longer lists (a moved FOMC date) is deleted;
+    past rows survive as history; the YAML's future events land."""
+    today = _today_nyse()
+    await _seed_event(db_repos, day=today - timedelta(days=40), etype="CPI")    # history
+    await _seed_event(db_repos, day=today + timedelta(days=10), etype="FOMC")   # moved away
+    yaml_events = [
+        _yaml_event(today - timedelta(days=40), "CPI", "past, ignored"),
+        _yaml_event(today + timedelta(days=11), "FOMC", "moved here"),
+        _yaml_event(today + timedelta(days=20), "NFP"),
+    ]
+    monkeypatch.setattr("data.macro_calendar.load_yaml_calendar",
+                        lambda path=None: (yaml_events, today + timedelta(days=400)))
+    rows, source = await refresh_events(db_repos, _config())
+    assert source == "yaml" and rows == 3
+    future = await db_repos.macro_events.between(today, today + timedelta(days=60))
+    assert [(e.event_date - today).days for e in future] == [11, 20]
+    past = await db_repos.macro_events.between(
+        today - timedelta(days=60), today - timedelta(days=1),
+    )
+    assert [e.event_type for e in past] == ["CPI"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_with_empty_yaml_never_wipes_the_future(db_repos, monkeypatch):
+    today = _today_nyse()
+    await _seed_event(db_repos, day=today + timedelta(days=5), etype="FOMC")
+    monkeypatch.setattr("data.macro_calendar.load_yaml_calendar",
+                        lambda path=None: ([], None))
+    await refresh_events(db_repos, _config())
+    assert len(await db_repos.macro_events.between(today, today + timedelta(days=30))) == 1
+
+
+def test_shipped_yaml_covers_the_official_calendar():
+    """The checked-in calendar: FOMC 2026-10-28 present, CPI and NFP once a
+    month from Nov 2026 through Dec 2027, FOMC every 5-9 weeks, no duplicate
+    (date, type) rows, no weekend dates."""
+    events, valid_until = load_yaml_calendar()
+    assert valid_until is not None and valid_until >= date(2027, 12, 1)
+    keys = [(e.event_date, e.event_type) for e in events]
+    assert len(keys) == len(set(keys))
+    by_type: dict[str, list[date]] = {}
+    for e in events:
+        by_type.setdefault(e.event_type, []).append(e.event_date)
+    assert set(by_type) == {"FOMC", "CPI", "NFP"}
+    assert date(2026, 10, 28) in by_type["FOMC"]
+    for etype in ("CPI", "NFP"):
+        months = {(d.year, d.month) for d in by_type[etype] if d >= date(2026, 11, 1)}
+        assert len(months) == 14, etype      # Nov 2026 .. Dec 2027
+    fomc = sorted(by_type["FOMC"])
+    gaps = [(b - a).days for a, b in zip(fomc, fomc[1:], strict=False)]
+    assert all(35 <= g <= 63 for g in gaps), gaps
+    assert all(d.weekday() < 5 for ds in by_type.values() for d in ds)
 
 
 # -- Idempotent refresh (Issue addendum) ------------------------------------
@@ -485,11 +545,8 @@ async def test_idempotent_refresh_no_duplicates(db_repos):
 @pytest.mark.asyncio
 async def test_upsert_many_returns_attempts_and_distinct_rows(db_repos):
     """4 items mapping to 2 distinct (event_date, event_type) tuples should
-    report (4, 2) — locks in the honest-logging fix for the misleading
-    'rows_upserted=50' we hit in production with only 18 distinct rows."""
+    report (4, 2) — duplicates collapse via UNIQUE(event_date, event_type)."""
     now = datetime.now(UTC).replace(tzinfo=None)
-    # Simulating Finnhub: FOMC Statement + Press Conference same day, then
-    # CPI YoY + Core CPI MoM same day — all collapse via UNIQUE.
     events = [
         MacroEvent(event_date=date(2026, 6, 17), event_type="FOMC", impact="high",
                    description="FOMC Statement", fetched_at=now, created_at=now),

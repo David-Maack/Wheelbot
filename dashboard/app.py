@@ -335,7 +335,7 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         to a future polish ticket — flat list is 10 lines vs 60 and ships
         the rest of the page.
         """
-        from data.macro_calendar import MacroCalendar, _today_nyse
+        from data.macro_calendar import DEFAULT_MIN_COVERAGE_DAYS, MacroCalendar, _today_nyse
         cfg = (deps.config.get("risk", {}) or {}).get("macro_blackout", {}) or {}
         calendar = MacroCalendar(deps.repos, deps.config)
         today = _today_nyse()
@@ -369,6 +369,7 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         upcoming = [e for e in events_in_scope if e.event_date >= today]
         last_refresh = await calendar.last_refresh()
         is_stale = await calendar.is_stale()
+        coverage_end = await calendar.coverage_end()
 
         return TEMPLATES.TemplateResponse(
             request,
@@ -378,7 +379,8 @@ def build_app(deps: DashboardDeps) -> FastAPI:
                 "event_types": event_types,
                 "days_before": days_before,
                 "days_after": days_after,
-                "stale_threshold_hours": float(cfg.get("stale_threshold_hours", 48)),
+                "coverage_end": coverage_end,
+                "min_coverage_days": int(cfg.get("min_coverage_days", DEFAULT_MIN_COVERAGE_DAYS)),
                 "last_refresh": last_refresh,
                 "is_stale": is_stale,
                 "upcoming": upcoming,

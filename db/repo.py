@@ -850,42 +850,68 @@ class MacroEventsRepo(_Repo):
 
     table = "macro_events"
 
-    async def upsert_many(self, events: list) -> tuple[int, int]:
-        """Upsert a batch. Returns `(upsert_attempts, distinct_rows_after)`.
+    _UPSERT_SQL = (
+        "INSERT INTO macro_events "
+        "(event_date, event_type, impact, description, fetched_at, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(event_date, event_type) DO UPDATE SET "
+        "  impact = excluded.impact, "
+        "  description = excluded.description, "
+        "  fetched_at = excluded.fetched_at"
+    )
 
-        The two diverge when several input items share an `(event_date,
-        event_type)` tuple — UNIQUE collapses them to one row, last-writer
-        wins on description. Finnhub returns 4 separate items per FOMC day
-        (Statement / Press Conference / Minutes / Economic Projections) and
-        ~3 per CPI day, so ~50 attempts commonly produce ~18 distinct rows.
-        Returning both makes the refresh log honest:
-            macro_refresh_done upsert_attempts=50 distinct_rows_after=18
-        """
+    @staticmethod
+    def _upsert_args(evt: Any) -> tuple[Any, ...]:
+        return (
+            evt.event_date.isoformat(),
+            evt.event_type,
+            evt.impact,
+            evt.description,
+            evt.fetched_at.isoformat(),
+            evt.created_at.isoformat(),
+        )
+
+    async def upsert_many(self, events: list) -> tuple[int, int]:
+        """Upsert a batch. Returns `(upsert_attempts, distinct_rows_after)` —
+        they diverge when input items share an `(event_date, event_type)`."""
         if not events:
             return 0, await self.count()
         c = await self.db.connect()
-        attempts = 0
         for evt in events:
-            await c.execute(
-                "INSERT INTO macro_events "
-                "(event_date, event_type, impact, description, fetched_at, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(event_date, event_type) DO UPDATE SET "
-                "  impact = excluded.impact, "
-                "  description = excluded.description, "
-                "  fetched_at = excluded.fetched_at",
-                (
-                    evt.event_date.isoformat(),
-                    evt.event_type,
-                    evt.impact,
-                    evt.description,
-                    evt.fetched_at.isoformat(),
-                    evt.created_at.isoformat(),
-                ),
-            )
-            attempts += 1
+            await c.execute(self._UPSERT_SQL, self._upsert_args(evt))
         await c.commit()
-        return attempts, await self.count()
+        return len(events), await self.count()
+
+    async def replace_from(self, start: date, events: list) -> int:
+        """Delete every row dated on/after `start`, then insert `events`, in
+        one transaction — the YAML is the whole truth for the future, so a
+        moved or dropped date can't leave a stale blackout row behind.
+        Returns the row count after."""
+        c = await self.db.connect()
+        try:
+            await c.execute(
+                "DELETE FROM macro_events WHERE event_date >= ?", (start.isoformat(),),
+            )
+            for evt in events:
+                await c.execute(self._UPSERT_SQL, self._upsert_args(evt))
+            await c.commit()
+        except Exception:
+            await c.rollback()
+            raise
+        return await self.count()
+
+    async def latest_dates(self, event_types: list[str]) -> dict[str, date]:
+        """{event_type: latest event_date} for the given types (types with no
+        rows are absent)."""
+        if not event_types:
+            return {}
+        marks = ",".join("?" for _ in event_types)
+        rows = await self._fetch_all(
+            f"SELECT UPPER(event_type) AS t, MAX(event_date) AS last FROM macro_events "
+            f"WHERE UPPER(event_type) IN ({marks}) GROUP BY UPPER(event_type)",
+            tuple(t.upper() for t in event_types),
+        )
+        return {r["t"]: date.fromisoformat(str(r["last"])[:10]) for r in rows if r["last"]}
 
     async def between(self, start: date, end: date) -> list:
         """All events with event_date in [start, end] inclusive, sorted ascending."""
