@@ -129,7 +129,7 @@ The host crontab on CT 105 is authoritative — `crontab -l` to verify.
 - **Macro calendar refresh** — daily 06:00. Loads `config/macro_calendar.yaml` (official FOMC/CPI/NFP dates; the only source since Finnhub's economic calendar started returning 403) and replaces every future row with it. When any event type has nothing within 60 days the gate keeps blocking on what it has and Discord gets a daily "extend the YAML" alert. Before 2026-10-27 the staleness check looked at refresh time, so the calendar ran out on 09-16 without anyone noticing.
 - **Daily summary** — weekday evenings → Discord, including the scorecard
 - **History ingest** — weekday evenings (fills `iv_history`; every IVR gate reads it)
-- **DB backup** — nightly
+- **DB backup** — nightly; keeps 7 daily + 4 weekly backups, and first deletes `chain_snapshots` older than 14 days unless they belong to a cycle or a filled trade (`database.chain_snapshot_retention_days`). `--vacuum` compacts the file (run once with the containers stopped).
 - **Parity check** (`wb_parity_check.py`) — weekday 20:45 UTC broker-vs-DB position diff
 - **Tastytrade parity harness** (`scripts/parity_run.py`) — only during GO_LIVE_RUNBOOK Stage 2
 

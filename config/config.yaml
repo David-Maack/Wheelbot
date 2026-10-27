@@ -11,6 +11,10 @@ account:
 
 database:
   path: "/mnt/wheelbot-storage/wheelbot.db"
+  # Nightly backup job (scripts/backup_db) deletes chain_snapshots older than
+  # this unless tied to a cycle or a filled trade's symbol-day. 0 = keep all.
+  # 2026-10-27: ~200 MB/month of chains from evaluations that never traded.
+  chain_snapshot_retention_days: 14
 
 logging:
   level: "INFO"
