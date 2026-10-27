@@ -45,6 +45,12 @@ class Proposal:
     # Structured close-reason tag for BUY_TO_CLOSE proposals (TICKET-005).
     # Plumbed through the router into orders.trigger_reason. None for entries.
     trigger_reason: str | None = None
+    # Resting profit-take (2026-10-27): a BUY_TO_CLOSE that rests at
+    # `limit_price` (the 50% target) under its own client-id family instead
+    # of crossing the spread. Stale-replace never touches it; an urgent close
+    # on the same contract cancels it first (execution/router.py).
+    resting: bool = False
+    limit_price: float | None = None
 
 
 def _build_proposal(

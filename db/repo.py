@@ -297,6 +297,14 @@ class OrdersRepo(_Repo):
         )
         return [Order(**r) for r in rows]
 
+    async def list_filled_since(self, account_id: str, since: datetime) -> list[Order]:
+        rows = await self._fetch_all(
+            "SELECT * FROM orders WHERE account_id = ? AND status = 'FILLED' "
+            "AND filled_at >= ? ORDER BY filled_at",
+            (account_id, since.isoformat()),
+        )
+        return [Order(**r) for r in rows]
+
     async def oldest_pending_placed_at(self, account_id: str) -> datetime | None:
         """Earliest placed_at among PENDING/PARTIAL orders for this account.
 
@@ -1184,6 +1192,28 @@ class ZeroDteLedgerRepo(_Repo):
         )
 
 
+class OrderQuoteLogRepo(_Repo):
+    """Quote tape for working / just-filled single-leg orders (migration 017,
+    docs/MID_FILL_TEST.md). Read by scripts/fill_report.py."""
+
+    table = "order_quote_log"
+
+    async def insert(
+        self, *, order_id: int, logged_at: datetime, phase: str,
+        bid: float | None, ask: float | None, limit_price: float | None,
+    ) -> int:
+        return await self._insert({
+            "order_id": order_id, "logged_at": logged_at.isoformat(), "phase": phase,
+            "bid": bid, "ask": ask, "limit_price": limit_price,
+        })
+
+    async def list_since(self, since: datetime) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            "SELECT * FROM order_quote_log WHERE logged_at >= ? ORDER BY order_id, logged_at",
+            (since.isoformat(),),
+        )
+
+
 class Repos:
     """Convenience bundle so callers can pass a single object."""
 
@@ -1205,3 +1235,4 @@ class Repos:
         self.broker_parity_log = BrokerParityLogRepo(db)
         self.watchlists = WatchlistsRepo(db)
         self.zero_dte_ledger = ZeroDteLedgerRepo(db)
+        self.order_quote_log = OrderQuoteLogRepo(db)

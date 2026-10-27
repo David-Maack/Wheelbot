@@ -59,7 +59,7 @@ runs the same sequence:
 
 | Strategy | Structure | Wants | Key exits |
 |---|---|---|---|
-| `monthly_wheel` | 30–45 DTE cash-secured puts → assignment → covered calls, on F / NOK / T / VZ / KMI | Cheap, ownable names; IVR ≥ 20; regime allows bullish premium (not PULLBACK / BEAR / HIGH_VOL) | 50% profit, DTE-21, 2× stop, Δ0.55 stop→roll (rule-based roll at Δ0.50, credit-only). **Earnings close (2026-10-27):** a CSP whose remaining hold comes to overlap an earnings window — the date was unknown or moved after entry — is bought back through the normal close path (trigger `earnings`) instead of being flagged and left unmanaged. Covered calls are exempt: the earnings risk sits in the shares |
+| `monthly_wheel` | 30–45 DTE cash-secured puts → assignment → covered calls, on F / NOK / T / VZ / KMI. Entries are limits at mid, re-pegged to the new mid every 15 min until they fill | Cheap, ownable names; IVR ≥ 20; regime allows bullish premium (not BEAR / HIGH_VOL). **PULLBACK no longer blocks it** (`pullback_allows_csps`, 2026-10-27: the 2018–2026 backtest scored it lower with the block) | **Resting 50% profit-take (2026-10-27):** as soon as a short fills, a buy-to-close rests at half the premium received (`resting_profit_take`) and fills only when the market comes to it. Before, the bot waited for the mid to reach the target and then crossed to the ask. **DTE-7 time close** (was 21), 2× stop, Δ0.55 stop→roll (rule-based roll at Δ0.50, credit-only; inside 14 DTE an unrolled Δ0.55 put is closed). These urgent closes cancel the resting order first, then pay the ask (before 2026-10-27 every close, stops included, was priced at mid and could rest unfilled). **Earnings close:** a CSP whose remaining hold comes to overlap an earnings window — the date was unknown or moved after entry — is bought back through the normal close path (trigger `earnings`) instead of being flagged and left unmanaged. Covered calls are exempt: the earnings risk sits in the shares |
 | `zero_dte` | Same-day-expiry **bull put** spread on SPY and QQQ, entered 10:00–10:15 ET only (rebuilt 2026-10 from the spread-paper-logger delta ladder): $2 wide, Δ0.10–0.15 short, credit ≥ 3% of width, and only while **live spot is above the 20-day SMA of prior closes** (`trend_sma_days`; read at entry — not the regime snapshot's PULLBACK, which uses the prior close and missed 2026-10-16). No bear-call arm: the call side carries no skew premium. **The wing is the stop** (no stop orders — kills the sim-to-live stop-slippage gap) | One round-trip per symbol per day, ≤$200 defined risk each; own daily loss cap ($250 penalized); macro blackout skips event days only — `macro_same_day_only` (a position flat by 15:00 can't see tomorrow's event), with `macro_event_types` still FOMC/CPI/NFP (the ladder has one CPI day, no NFP day) | 50% profit take, then **HARD FLATTEN at 15:00 ET regardless of P&L** (Alpaca rejects expiry-day orders ~15:15/15:30 and force-liquidates 15:30/15:45). Same-day contracts are priced on hours left to the 16:00 ET close. Close limits are **hard-clamped at the wing width**. Every trade writes a dual raw/**penalized** ledger row (`zero_dte_ledger` — penalized concedes half the leg spreads each way + $0.05/share on flatten); its scorecard reads penalized P&L only |
 
 ## 4. The entry gauntlet
@@ -80,8 +80,10 @@ Every proposed entry passes, in order:
    2026-10-27); buying-power floor; per-position capital cap; global (6) and
    per-strategy concurrent caps; earnings blackout (no opens within 7 days of
    earnings, nor any whose planned hold — expiry minus the strategy's
-   time-close — reaches 5 days before earnings); CC strike floor; liquidity;
-   regime (CSPs and bull put spreads need `csps_allowed`); macro blackout
+   time-close — reaches 5 days before earnings); CC strike floor; liquidity
+   (entries only — closes are never blocked on spread width); regime (CSPs
+   and bull put spreads need `csps_allowed`, except that a strategy with
+   `pullback_allows_csps` may sell in PULLBACK); macro blackout
    (no opens within 2 days of FOMC/CPI/NFP, from the hand-kept official
    calendar; a strategy may override the event list (`macro_event_types`) or
    narrow it to the event day itself (`macro_same_day_only` — zero_dte
@@ -90,7 +92,16 @@ Every proposed entry passes, in order:
    entries in the last 15 minutes before the close, and cancels/re-places
    limits stale > 15 min. **Close** orders never move a position out of its
    OPEN state, so a close that doesn't cross is re-proposed every tick and
-   re-priced through the same stale-replace path.
+   re-priced through the same stale-replace path. **Resting profit-takes**
+   (`wb-rest-` client ids) are the exception: they are never stale-replaced
+   and are re-placed each session (Alpaca option orders are DAY-only). Any
+   urgent buy-to-close on the same contract cancels the resting order and
+   waits for the cancel to confirm, so two closes can never both fill. A
+   sweep cancels resting orders whose position is no longer open. Every
+   single-leg order records the quote it was priced from (`raw_request.wb_quote`),
+   and the quote tape (`order_quote_log`) records the live quote of each
+   working order every tick, plus 30 minutes after each fill. That is the
+   data for the mid-fill test (`docs/MID_FILL_TEST.md`).
 
 Exits skip most of this on purpose: a bad regime or blackout must never trap
 an open position.

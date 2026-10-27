@@ -44,6 +44,7 @@ from data.ivr import IVRProvider
 from db.repo import Database, Repos
 from execution.kill_switch import KillSwitchResult
 from execution.loop import ReconcilerLoop
+from execution.quote_log import log_order_quotes
 from execution.reconciler import Reconciler
 from execution.router import OrderRouter
 from risk import auto_disable
@@ -203,6 +204,15 @@ async def _execute_roll_action(
         except Exception as exc:
             log_checkpoint(
                 "roll_btc_fail", status="fail", symbol=position.symbol, error=str(exc)
+            )
+            return
+        # 2026-10-27: no new short unless the buyback was actually placed. The
+        # router now holds a BTC back while it cancels a resting profit-take;
+        # opening the roll's new short then would leave two shorts working.
+        if btc_result.placed is None:
+            log_checkpoint(
+                "roll_sto_skipped_no_btc", status="skip", symbol=position.symbol,
+                strategy=position.strategy_id,
             )
             return
 
@@ -556,6 +566,17 @@ async def main(argv: list[str] | None = None) -> int:
             await router.cancel_stale_pending_opens()
         except Exception as exc:  # noqa: BLE001 — sweep must never break the tick
             log_checkpoint("stale_open_sweep_fail", status="fail", error=str(exc))
+        # Resting profit-takes whose position is no longer open (assigned,
+        # closed elsewhere, flagged) are cancelled too — also risk-reducing.
+        try:
+            await router.cancel_orphan_resting()
+        except Exception as exc:  # noqa: BLE001
+            log_checkpoint("orphan_resting_sweep_fail", status="fail", error=str(exc))
+        # Fill-quality tape for the mid-fill test (docs/MID_FILL_TEST.md).
+        try:
+            await log_order_quotes(broker, repos, config)
+        except Exception as exc:  # noqa: BLE001 — observability only
+            log_checkpoint("order_quote_log_fail", status="fail", error=str(exc))
 
         if kill_switch_tripped:
             log_checkpoint("bot_skip_kill_switch", status="ok", reason=ks.reason)

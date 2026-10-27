@@ -19,14 +19,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from core.broker import Broker, BrokerUnavailable, OrderRejected
+from core.broker import Broker, BrokerUnavailable, OrderNotCancelable, OrderRejected
 from core.checkpoint import checkpoint, log_checkpoint
 from core.models import Order, OrderStatus, OrderType, Position, PositionState
 from db.repo import Repos
 from execution.market_hours import within_entry_window
+from execution.resting import RESTING_CLIENT_PREFIX, is_resting, is_working, resting_buy_limit
 from risk.limits import RiskCheckFailed, RiskGate
 from strategies.spreads import MultiLegProposal
 from strategies.wheel import Proposal
@@ -146,6 +147,34 @@ def _client_order_id(proposal: Proposal, today: date | None = None) -> str:
     )
     digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
     return f"wb-{digest}"
+
+
+def _resting_client_order_id(proposal: Proposal, today: date | None = None) -> str:
+    """Own id family for resting profit-takes, so an urgent close on the same
+    contract (base id) never collides with — or stale-replaces — it."""
+    today = today or datetime.now(UTC).date()
+    raw = (
+        f"{proposal.strategy_id}|rest|{proposal.symbol}|{proposal.contract.occ_symbol}|"
+        f"{proposal.quantity}|{today.isoformat()}"
+    )
+    digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
+    return f"{RESTING_CLIENT_PREFIX}{digest}"
+
+
+def _stamp_quote(order: Order, proposal: Proposal) -> None:
+    """Record the quote the order was priced from (raw_request.wb_quote) for
+    the fill-quality report (scripts/fill_report.py)."""
+    c = proposal.contract
+    if c.bid is None or c.ask is None:
+        return
+    if order.raw_request is None:
+        order.raw_request = {}
+    order.raw_request["wb_quote"] = {
+        "bid": c.bid,
+        "ask": c.ask,
+        "mid": round((c.bid + c.ask) / 2, 4),
+        "resting": proposal.resting,
+    }
 
 
 def _router_config(config: dict[str, Any]) -> RouterConfig:
@@ -340,6 +369,141 @@ class OrderRouter:
             )
         return cancelled
 
+    async def cancel_orphan_resting(self) -> int:
+        """Cancel resting profit-takes whose position is no longer open
+        (assigned, closed by another path, flagged). Broker-only, like the
+        stale-open sweep: the reconciler observes the cancel, and a
+        BUY_TO_CLOSE cancel changes no position state."""
+        account_id = self._config.get("account", {}).get("id", "primary")
+        cancelled = 0
+        for order in await self._repos.orders.list_pending(account_id):
+            if not is_resting(order) or order.status != OrderStatus.PENDING:
+                continue
+            pos = await self._repos.positions.get_by_symbol(
+                account_id, order.symbol, strategy_id=order.strategy_id
+            )
+            if pos is not None and pos.state in (PositionState.CSP_OPEN, PositionState.CC_OPEN):
+                continue
+            if order.broker_order_id is None:
+                continue
+            try:
+                await self._broker.cancel_order(order.broker_order_id)
+            except Exception as exc:  # noqa: BLE001 — sweep must never break the tick
+                log_checkpoint(
+                    "router_orphan_resting_cancel_fail", status="fail",
+                    symbol=order.symbol, broker_order_id=order.broker_order_id, error=str(exc),
+                )
+                continue
+            cancelled += 1
+            log_checkpoint(
+                "router_orphan_resting_cancelled", status="ok", symbol=order.symbol,
+                strategy=order.strategy_id, client_order_id=order.client_order_id,
+                position_state=getattr(pos.state, "value", pos.state) if pos is not None else None,
+            )
+        return cancelled
+
+    async def _broker_status(self, order: Order) -> OrderStatus | None:
+        """The broker's current status for one of our orders, or None."""
+        since = (order.placed_at or _utcnow()) - timedelta(minutes=1)
+        try:
+            for o in await self._broker.get_orders_since(since):
+                if o.broker_order_id == order.broker_order_id:
+                    return o.status
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    async def _clear_resting(self, proposal: Proposal, *, sleep: Any) -> bool:
+        """Before an urgent BUY_TO_CLOSE: cancel any resting profit-take on the
+        same contract and confirm it is gone. Two live closes on one short
+        could both fill and leave the account long the option.
+
+        True = clear to place the urgent close now. False = not yet: the
+        resting order filled (the reconciler books it next pass) or the
+        cancel is still in flight; the close is re-proposed next tick.
+        """
+        account_id = self._config.get("account", {}).get("id", "primary")
+        live = [
+            o for o in await self._repos.orders.list_pending(account_id)
+            if is_resting(o) and is_working(o)
+            and o.contract_symbol == proposal.contract.occ_symbol
+            and o.strategy_id == proposal.strategy_id
+        ]
+        for o in live:
+            status: OrderStatus | None = None
+            if o.broker_order_id is not None:
+                try:
+                    await self._broker.cancel_order(o.broker_order_id)
+                except OrderNotCancelable:
+                    pass  # filled or already terminal; look it up below
+                except Exception as exc:  # noqa: BLE001
+                    log_checkpoint(
+                        "router_resting_cancel_fail", status="fail", symbol=o.symbol,
+                        broker_order_id=o.broker_order_id, error=str(exc),
+                    )
+                    return False
+                for attempt in range(3):
+                    status = await self._broker_status(o)
+                    if status is not None and status not in (
+                        OrderStatus.PENDING, OrderStatus.PARTIAL,
+                    ):
+                        break
+                    if attempt < 2:
+                        await sleep(1.0)
+            else:
+                status = OrderStatus.CANCELLED  # never reached the broker
+            if status in (OrderStatus.CANCELLED, OrderStatus.REJECTED):
+                if o.id is not None:
+                    await self._repos.orders.update(o.id, status=OrderStatus.CANCELLED.value)
+                log_checkpoint(
+                    "router_resting_cleared", status="ok", symbol=o.symbol,
+                    client_order_id=o.client_order_id, for_trigger=proposal.trigger_reason,
+                )
+                continue
+            log_checkpoint(
+                "router_resting_not_cleared", status="skip", symbol=o.symbol,
+                client_order_id=o.client_order_id,
+                broker_status=status.value if status is not None else None,
+                for_trigger=proposal.trigger_reason,
+            )
+            return False
+        return True
+
+    async def _place_resting(
+        self, proposal: Proposal, *, sleep: Any, today: date | None,
+    ) -> RouteResult:
+        """Resting profit-take: one working order per contract per day at the
+        proposal's limit. A live one is left alone however old it is."""
+        try:
+            await self._gate.evaluate(proposal, today=today)
+        except RiskCheckFailed as exc:
+            return RouteResult(
+                proposal=proposal, placed=None, risk_failed=True,
+                risk_failure_rule=exc.rule, risk_failure_detail=exc.detail,
+            )
+        if self._cfg.dry_run:
+            log_checkpoint(
+                "router_dry_run", status="ok", symbol=proposal.symbol,
+                occ=proposal.contract.occ_symbol, resting=True,
+            )
+            return RouteResult(proposal=proposal, placed=None, dry_run=True)
+        client_id = _resting_client_order_id(proposal, today)
+        existing = await self._repos.orders.get_by_client_id(client_id)
+        if existing is not None:
+            if is_working(existing):
+                return RouteResult(proposal=proposal, placed=None, skipped_duplicate_pending=True)
+            client_id = f"{client_id}-r{int(_utcnow().timestamp())}"
+        order = self._build_order(proposal, today=today, client_order_id=client_id)
+        placed = await self._submit_with_retry(order, sleep=sleep)
+        _stamp_quote(placed, proposal)
+        await self._persist_order(placed)
+        log_checkpoint(
+            "router_resting_placed", status="ok", symbol=proposal.symbol,
+            strategy=proposal.strategy_id, occ=proposal.contract.occ_symbol,
+            limit_price=placed.limit_price, client_order_id=client_id,
+        )
+        return RouteResult(proposal=proposal, placed=placed)
+
     async def place(
         self,
         proposal: Proposal,
@@ -347,6 +511,9 @@ class OrderRouter:
         sleep: Any = asyncio.sleep,
         today: date | None = None,
     ) -> RouteResult:
+        if proposal.resting:
+            return await self._place_resting(proposal, sleep=sleep, today=today)
+
         # Entry-window gate: don't OPEN new positions near/after the close.
         if proposal.order_type in _OPEN_ORDER_TYPES and not within_entry_window(
             minutes_before_close=self._cfg.entry_cutoff_minutes_before_close,
@@ -390,6 +557,13 @@ class OrderRouter:
             )
             return RouteResult(proposal=proposal, placed=None, dry_run=True)
 
+        # An urgent close must not race a resting profit-take on the same
+        # contract: cancel it and confirm first, or wait a tick.
+        if proposal.order_type == OrderType.BUY_TO_CLOSE and not await self._clear_resting(
+            proposal, sleep=sleep,
+        ):
+            return RouteResult(proposal=proposal, placed=None, skipped_duplicate_pending=True)
+
         # Pre-submission: handle a stale PENDING order with the same
         # deterministic client_order_id (Sprint 14 — Option B). Either skip
         # (still fresh) or cancel + replace with a unique id.
@@ -407,6 +581,7 @@ class OrderRouter:
 
         order = self._build_order(proposal, today=today, client_order_id=effective_client_id)
         placed = await self._submit_with_retry(order, sleep=sleep)
+        _stamp_quote(placed, proposal)
 
         # DB writes. Order first; position state second.
         await self._persist_order(placed)
@@ -582,7 +757,10 @@ class OrderRouter:
             expiration=contract.expiration,
             option_type=contract.option_type,
             quantity=proposal.quantity,
-            limit_price=_option_limit_price(
+            # A resting profit-take carries its own limit (the target, floored
+            # to a tick). Everything else is priced off the quote.
+            limit_price=resting_buy_limit(proposal.limit_price) if proposal.limit_price is not None
+            else _option_limit_price(
                 contract.bid, contract.ask,
                 # Cross the spread on fills that MUST happen: any BUY pays the
                 # ask (entries AND defensive buybacks — a stop-loss BTC at mid

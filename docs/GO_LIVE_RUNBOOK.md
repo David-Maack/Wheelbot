@@ -42,6 +42,9 @@ Stage 1 runs both strategies on Alpaca paper until each one either reaches the s
 ### What's running
 
 - `monthly_wheel` and `zero_dte` (SPY/QQQ same-day bull put).
+  - Since 2026-10-27 monthly_wheel closes at 7 DTE, may sell in PULLBACK, and keeps a resting 50% profit-take.
+  - Its orders are recorded in the quote tape.
+  - Phase 1 of `docs/MID_FILL_TEST.md` runs here.
 - Kill switch, per-strategy drawdown breaker, macro blackout, earnings close trigger.
 
 ### What's NOT running
@@ -58,6 +61,8 @@ Stage 0 clean checklist fully satisfied.
 - Read the scorecard line for each strategy in the daily Discord summary; open `/risk` if a verdict changed.
 - Check `/risk` for any new MANUAL_INTERVENTION rows; resolve before next tick.
 - zero_dte: confirm entries fill inside the 10:00–10:15 ET window (the scorecard's fill rate). A day with an entry proposal and no fill is a pricing question, not noise.
+- Weekly: `docker exec wheelbot python -m scripts.fill_report`, and the `docs/MID_FILL_TEST.md` Phase 1 correctness checks.
+  - A paper fill rate is not evidence that resting orders fill live.
 
 ### Stop conditions (stage-1-specific)
 
@@ -127,6 +132,8 @@ Leave `risk.daily_loss_kill_switch_pct` at 5% (pinned in `config/config.local.ya
 Generic stop conditions live in §3. The following are specific to this stage:
 
 - First 5 live Tastytrade fills: `fill_price` vs `limit_price` divergence outside the band observed during Stage 2 parity. Flatten the affected position, pause the strategy, investigate before resuming.
+- monthly_wheel runs Phase 2 of `docs/MID_FILL_TEST.md`, the live mid-fill probe, over its first 20 entries and 20 profit-target touches. Apply that doc's decision table; a failed resting profit-take means `resting_profit_take: false`.
+  - The 5% position cap in the config table above blocks every wheel contract on a quarter-size account. Decide whether to give the wheel 30% or keep it out of Stage 3 before entering it.
 - Any `MANUAL_INTERVENTION` flag not cleared within 24 hours of being raised.
 - Both strategies entering `paused` / `DISABLED` state within the same calendar week, for any reason (drawdown breaker or operator action).
 

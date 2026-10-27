@@ -57,6 +57,8 @@ from data.earnings import EarningsLookup, earnings_overlaps_hold
 from data.earnings import next_earnings as default_next_earnings
 from data.greeks import fill_greeks
 from db.repo import Repos
+from execution.market_hours import is_market_hours
+from execution.resting import is_resting, is_working, profit_target
 from strategies.wheel import Proposal
 
 
@@ -156,16 +158,24 @@ async def _latest_short_order(repos: Repos, cycle_id: int) -> Order | None:
     return Order(**_row_to_dict(row, JSON_FIELDS_BY_TABLE["orders"]))
 
 
-async def _quote_mid(broker: Broker, contract_symbol: str) -> float | None:
+async def _quote(
+    broker: Broker, contract_symbol: str,
+) -> tuple[float | None, float | None, float | None]:
+    """(mid, bid, ask) for the short leg; mid falls back to last/bid/ask."""
     try:
         q = await broker.get_quote(contract_symbol)
     except Exception:
-        return None
+        return None, None, None
+    bid, ask = q.bid, q.ask
     if q.mid is not None:
-        return q.mid
-    if q.bid is not None and q.ask is not None:
-        return (q.bid + q.ask) / 2
-    return q.last or q.bid or q.ask
+        return q.mid, bid, ask
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2, bid, ask
+    return q.last or bid or ask, bid, ask
+
+
+async def _quote_mid(broker: Broker, contract_symbol: str) -> float | None:
+    return (await _quote(broker, contract_symbol))[0]
 
 
 def _earnings_in_hold(
@@ -246,7 +256,7 @@ async def propose_close_for_position(
         # bailing out keeps us from dividing by it later.
         return None
 
-    current_mid = await _quote_mid(broker, short_order.contract_symbol)
+    current_mid, quote_bid, quote_ask = await _quote(broker, short_order.contract_symbol)
     if current_mid is None:
         log_checkpoint(
             "wheel_close_skip_no_quote",
@@ -443,14 +453,19 @@ async def propose_close_for_position(
     else:
         trigger_reason = "time"
 
+    # The real bid/ask, so the router's BUY_TO_CLOSE pays the ask as designed.
+    # Before 2026-10-27 both were set to the mid, which priced every close —
+    # stop-losses included — at mid, where a rising option can leave it
+    # unfilled (and the in-flight skip below means it is not re-priced).
+    two_sided = quote_bid is not None and quote_ask is not None and quote_ask > 0
     contract = OptionContract(
         underlying=position.symbol,
         occ_symbol=short_order.contract_symbol,
         strike=float(short_order.strike),
         expiration=short_order.expiration,
         option_type=short_order.option_type,
-        bid=current_mid,  # set so router/risk-gate liquidity check has a value
-        ask=current_mid,
+        bid=quote_bid if two_sided else current_mid,
+        ask=quote_ask if two_sided else current_mid,
         mid=current_mid,
     )
     state_val = (
@@ -519,6 +534,56 @@ async def propose_close_for_position(
     )
 
 
+async def _resting_profit_proposal(
+    broker: Broker,
+    repos: Repos,
+    position: Position,
+    strategy: StrategyDefinition,
+    *,
+    skip_contracts: set[str | None],
+) -> Proposal | None:
+    """A resting BUY_TO_CLOSE at the profit target for this position's short,
+    or None when one is already working (or the short can't be read)."""
+    if position.current_cycle_id is None:
+        return None
+    short = await _latest_short_order(repos, position.current_cycle_id)
+    if (
+        short is None or not short.fill_price or short.fill_price <= 0
+        or not short.contract_symbol or short.option_type is None
+        or short.strike is None or short.expiration is None
+    ):
+        return None
+    if short.contract_symbol in skip_contracts:
+        return None
+    pct = _threshold_pct(strategy, position.state)
+    target = profit_target(float(short.fill_price), pct)
+    mid, bid, ask = await _quote(broker, short.contract_symbol)
+    contract = OptionContract(
+        underlying=position.symbol,
+        occ_symbol=short.contract_symbol,
+        strike=float(short.strike),
+        expiration=short.expiration,
+        option_type=short.option_type,
+        bid=bid,
+        ask=ask,
+        mid=mid,
+    )
+    return Proposal(
+        symbol=position.symbol,
+        contract=contract,
+        order_type=OrderType.BUY_TO_CLOSE,
+        quantity=short.quantity,
+        rationale=(
+            f"wheel_close[{strategy.id}] resting profit-take at {target:.2f} "
+            f"(orig {float(short.fill_price):.2f}, pct={pct})"
+        ),
+        strategy_id=strategy.id,
+        trigger_reason="profit",
+        resting=True,
+        limit_price=target,
+    )
+
+
 async def propose_all_closes(
     broker: Broker,
     repos: Repos,
@@ -550,12 +615,22 @@ async def propose_all_closes(
     # (symbol, strategy) means the leg is already being acted on, so skip it
     # and let the pending action resolve first. (Also stops us re-proposing a
     # close while a prior close is still pending.)
+    #
+    # A resting profit-take is the exception: it is meant to sit there for
+    # days, and stops / time closes must keep being evaluated while it does
+    # (the router cancels it before any urgent close on the same contract).
     pending = await repos.orders.list_pending(account_id)
     inflight = {
         (o.symbol.upper(), o.strategy_id)
         for o in pending
-        if o.status in (OrderStatus.PENDING, OrderStatus.PARTIAL)
+        if is_working(o) and not is_resting(o)
     }
+    resting_live = {
+        o.contract_symbol for o in pending
+        if is_working(o) and is_resting(o) and o.strategy_id == strategy.id
+    }
+    resting_on = bool(strategy.params.get("resting_profit_take", False))
+    market_open = is_market_hours()
 
     # Earnings window knobs live in the shared `wheel:` block; the strategy's
     # own params (time_close_dte, overrides) win.
@@ -586,6 +661,17 @@ async def propose_all_closes(
             delta_unavailable_counters=delta_unavailable_counters,
             earnings_params=earnings_params,
         )
+        if resting_on and (proposal is None or proposal.trigger_reason == "profit"):
+            # Patient profit-take: keep one order resting at the target
+            # rather than crossing to the ask once the mid gets there.
+            # Urgent triggers fall through to the normal (crossing) close.
+            if market_open:
+                rest = await _resting_profit_proposal(
+                    broker, repos, pos, strategy, skip_contracts=resting_live,
+                )
+                if rest is not None:
+                    out.append(rest)
+            continue
         if proposal is not None:
             out.append(proposal)
     log_checkpoint(

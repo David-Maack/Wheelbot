@@ -332,3 +332,19 @@ CREATE INDEX IF NOT EXISTS idx_zero_dte_ledger_symbol_entry
     ON zero_dte_ledger(symbol, entry_ts);
 CREATE INDEX IF NOT EXISTS idx_zero_dte_ledger_exit_ts
     ON zero_dte_ledger(exit_ts);
+
+-- Quote tape for working / just-filled single-leg orders (migration 017,
+-- the mid-fill test — docs/MID_FILL_TEST.md).
+CREATE TABLE IF NOT EXISTS order_quote_log (
+    id              INTEGER PRIMARY KEY,
+    order_id        INTEGER NOT NULL,
+    logged_at       DATETIME NOT NULL,
+    phase           TEXT NOT NULL,          -- working | post_fill
+    bid             REAL,
+    ask             REAL,
+    limit_price     REAL,
+    FOREIGN KEY (order_id) REFERENCES orders(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_quote_log_order
+    ON order_quote_log(order_id, logged_at);

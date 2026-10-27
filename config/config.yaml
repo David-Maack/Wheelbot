@@ -175,6 +175,13 @@ execution:
   # Don't open NEW positions in the final N minutes before the 16:00 ET
   # close — no time to fill or manage. Closes/rolls are exempt.
   entry_cutoff_minutes_before_close: 15
+  # Quote tape for the mid-fill test (docs/MID_FILL_TEST.md): each tick, the
+  # live quote of every working single-leg order of these strategies, and
+  # for post_fill_minutes after each fill. Read by scripts/fill_report.py.
+  quote_log:
+    enabled: true
+    strategies: [monthly_wheel]
+    post_fill_minutes: 30
 
 # Strategies registry. The bot iterates these each tick and dispatches by
 # `type` to the right orchestrator. A ticker belongs to a strategy iff its
@@ -207,11 +214,13 @@ strategies:
       # auto-disabled for 30 days (manual re-enable available). Set to 0
       # to disable the feature for this strategy.
       auto_disable_drawdown_usd: -300
-      # Sprint 13 sub-sprint 2: extend the Sprint 12 DTE-21 rule to wheel
-      # CSPs and CCs. Same gamma-cliff rationale: bulk of max-loss outcomes
-      # cluster in the final 21 days, so exit and rotate to a fresh 45-DTE
-      # short.
-      time_close_dte: 21
+      # Time close for CSPs and CCs. 21 (Sprint 13) -> 7 on 2026-10-27: the
+      # 2018-2026 backtest (summary in docs/MID_FILL_TEST.md) found the
+      # 21-DTE close bought back puts before they had worked, and the 2x and
+      # delta stops already cap the gamma risk it was there for. 7 also
+      # lengthens the planned hold the earnings entry gate checks, so more
+      # entries near earnings are skipped.
+      time_close_dte: 7
       # Sprint 14: CSP stop-loss. Closes the short put when current mid
       # hits 2× the original premium received. Caps a runaway loss before
       # assignment risk dominates. CC stop-loss is intentionally not set —
@@ -227,6 +236,16 @@ strategies:
       delta_stop_action: roll
       delta_stop_roll_fallback_dte: 14
       delta_stop_stuck_alert_ticks: 12
+      # 2026-10-27: regime PULLBACK (SPY < 20d SMA) no longer blocks this
+      # strategy's CSPs; the backtest scored it lower with the block in
+      # nearly every variant. HIGH_VOL and BEAR_TREND still block.
+      pullback_allows_csps: true
+      # 2026-10-27: as soon as a short fills, rest a BUY_TO_CLOSE at the
+      # profit target (profit_close_pct of the premium) instead of crossing
+      # to the ask once the mid gets there. Stops, time / earnings / delta
+      # closes and rolls cancel it first and pay the ask. The fill rate of
+      # these orders is what docs/MID_FILL_TEST.md measures.
+      resting_profit_take: true
 
   # 0DTE paper test (2026-07 sprint — mechanics from
   # docs/research/0dte_research_2026-07.md; trade re-specced 2026-10 from the

@@ -506,6 +506,12 @@ class RiskGate:
         proposal: Proposal,
         params: dict[str, Any],
     ) -> None:
+        # Closes are never blocked on liquidity: urgent wheel closes carry the
+        # real bid/ask since 2026-10-27 (so the router can pay the ask), and a
+        # wide spread on a stop-loss is a reason to exit, not to stay.
+        if _is_close(proposal):
+            result.add("liquidity", "skip", "close — not gated by liquidity")
+            return
         c = proposal.contract
         oi_min = int(params.get("open_interest_min", 0))
         vol_min = int(params.get("volume_min", 0))
@@ -558,13 +564,23 @@ class RiskGate:
         # ticket 33 adds it. For now: try a thin direct read; if no rows, skip.
         c = await self._repos.db.connect()
         async with c.execute(
-            "SELECT csps_allowed FROM regime_snapshots ORDER BY snapshot_date DESC LIMIT 1"
+            "SELECT csps_allowed, regime FROM regime_snapshots ORDER BY snapshot_date DESC LIMIT 1"
         ) as cur:
             row = await cur.fetchone()
         if row is None:
             result.add("regime", "skip", "no regime snapshots yet")
             return
         csps_allowed = bool(row["csps_allowed"]) if row["csps_allowed"] is not None else True
+        # Per-strategy PULLBACK opt-out (2026-10-27 backtest: over 2018-2026
+        # the PULLBACK block lowered monthly_wheel's $/trade in nearly every
+        # variant). HIGH_VOL and BEAR_TREND still block.
+        if (
+            not csps_allowed
+            and str(row["regime"] or "").upper() == "PULLBACK"
+            and bool(params.get("pullback_allows_csps", False))
+        ):
+            result.add("regime", "pass", "PULLBACK — strategy sets pullback_allows_csps")
+            return
         if not csps_allowed:
             result.add("regime", "fail", "current regime snapshot disallows new CSPs")
         else:

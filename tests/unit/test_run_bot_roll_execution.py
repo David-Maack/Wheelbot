@@ -190,6 +190,36 @@ async def test_btc_router_failure_aborts_sto():
 
 
 @pytest.mark.asyncio
+async def test_btc_held_back_aborts_sto():
+    """2026-10-27: the router holds a BTC back while it cancels a resting
+    profit-take (placed=None). The roll's new short must not open then."""
+    from types import SimpleNamespace
+
+    class _HoldRouter(_StubRouter):
+        async def place(self, proposal):
+            self.calls.append((proposal.order_type.value, proposal.contract.occ_symbol))
+            return SimpleNamespace(placed=None)
+
+    router = _HoldRouter()
+    outcome = RollOutcome(
+        action=RollAction.ROLL,
+        rule=RollDecision(
+            action=RollAction.ROLL,
+            rationale="credit roll",
+            new_contract=_new_contract(),
+            expected_credit_per_share=0.40,
+        ),
+        halted=False,
+        reason="rule_only",
+    )
+    await _execute_roll_action(
+        router=router, repos=_no_ks_repos(), config={}, outcome=outcome,
+        position=_position(), short=_short_order(), short_contract=_short_contract(),
+    )
+    assert router.calls == [("BUY_TO_CLOSE", "F250706P00009500")]
+
+
+@pytest.mark.asyncio
 async def test_quantity_propagates_from_short_order():
     """A 3-contract short rolls 3 contracts, not 1."""
     router = _StubRouter()

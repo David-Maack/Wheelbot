@@ -110,6 +110,18 @@ cron entries in LXC-local MDT (e.g. the daily macro-calendar refresh at
 - `config/macro_calendar.yaml` is the only macro-event source (official
   FOMC/CPI/NFP dates through 2027-12). Extend it before `/macro` shows
   "running out".
+- monthly_wheel (2026-10-27): `time_close_dte: 7`, `pullback_allows_csps`,
+  and `resting_profit_take`.
+  - The resting profit-take is a `wb-rest-` BUY_TO_CLOSE kept at the 50%
+    target. The router never stale-replaces it and cancels it before any
+    urgent close on the same contract.
+  - Anything new that places a closing order must go through
+    `OrderRouter.place` so that cancel happens.
+  - `scripts.manual_close` goes through it; the MCP `flatten_position` does
+    not. Alpaca will refuse that flatten while a resting order holds the
+    contract.
+  - `docs/MID_FILL_TEST.md` is the open test of whether those orders fill
+    live.
 
 ## Live-deployment authority
 
