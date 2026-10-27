@@ -3,10 +3,11 @@
 #
 # Tier enforcement:
 #   tier 1 — auto-traded if all risk gates pass
-#   tier 2 — requires LLM screener + risk gates
-#   tier 3 — banned — never tradable by any strategy
+#   tier 3 — parked — kept on file with rationale, never traded
+# (Tier 2 — "requires an LLM screener score" — went with the screener in the
+# 2026-10-27 two-strategy cleanup; no ticker is tier 2 any more.)
 #
-# Tier 2 admission criteria (ALL must pass):
+# Admission criteria for a new name (ALL must pass):
 #   - Would I be happy owning 200 shares for 6 months at the strike I'd sell?
 #   - Median daily volume > 5M
 #   - No going-concern / dilution risk in next 12 months
@@ -14,12 +15,12 @@
 #   - Per-contract capital commitment fits within strategy max_position_pct_of_account
 #
 # `strategies:` lists which strategies (from config.yaml strategies block)
-# are allowed to trade this ticker. A ticker can belong to multiple
-# strategies — but in practice we keep the universes separate so each
-# strategy is comparable in isolation. An empty `strategies: []` means
-# the ticker is parked — kept on file with rationale for future revival.
+# are allowed to trade this ticker. An empty `strategies: []` means the
+# ticker is parked.
 #
-# Last reviewed: 2026-06-03 (TICKET-020 — weekly_wheel prune)
+# Last reviewed: 2026-10-27 (two-strategy cleanup: monthly_wheel + zero_dte;
+# symbols that only served the retired strategies were removed — git history
+# has them).
 
 tickers:
   # ============================================================
@@ -33,22 +34,10 @@ tickers:
     overrides:
       csp_delta_max: 0.25         # tighter delta given low premium
 
-  - symbol: BAC
-    name: "Bank of America"
-    tier: 1
-    strategies: [narrow_put_spread, pmcc]   # $5k sim: re-pointed off monthly_wheel — very liquid, clean LEAPs
-    notes: "Low IV but tight spreads, very liquid."
-
   - symbol: NOK
     name: "Nokia"
     tier: 1
     strategies: [monthly_wheel]
-
-  - symbol: SOFI
-    name: "SoFi Technologies"
-    tier: 1
-    strategies: [narrow_put_spread, pmcc, calendar]   # $5k sim: re-pointed off monthly_wheel — higher IV
-    notes: "Higher IV fintech. Good monthly premium."
 
   - symbol: T
     name: "AT&T"
@@ -62,12 +51,6 @@ tickers:
     strategies: [monthly_wheel]
     notes: "Telco income stock; quiet IV."
 
-  - symbol: INTC
-    name: "Intel"
-    tier: 1
-    strategies: [narrow_put_spread, pmcc, calendar]   # $5k sim: re-pointed off monthly_wheel — liquid LEAPs + IV
-    notes: "Cyclical, often in IV-rich pockets after misses."
-
   - symbol: KMI
     name: "Kinder Morgan"
     tier: 1
@@ -75,18 +58,30 @@ tickers:
     notes: "Pipelines, dividend, sub-$25."
 
   # ============================================================
-  # weekly_wheel — 7-14 DTE CSPs, high IV / liquid weeklies
+  # zero_dte — same-day bull put spread (2026-10 rebuild)
   # ============================================================
-  - symbol: HOOD
-    name: "Robinhood Markets"
-    tier: 2
-    strategies: [weekly_wheel]
-    notes: "Wheel the broker. Liquid weeklies; high IV."
+  - symbol: SPY
+    name: "S&P 500 ETF"
+    tier: 1
+    strategies: [zero_dte]
+    notes: "Deepest 0DTE liquidity. Ladder: one -$120/-$210 day (9/30) under the policy."
 
+  - symbol: QQQ
+    name: "NASDAQ-100 ETF"
+    tier: 1
+    # QQQ carries the ladder evidence — under the SMA + FOMC skips its
+    # 0.10/0.15 rungs were +$222/+$312 over 12 days with no breach, while SPY
+    # alone was -$57/-$127 (one -$120/-$210 day, 9/30).
+    strategies: [zero_dte]
+    notes: "Same-day bull put (2026-10 rebuild)."
+
+  # ============================================================
+  # Parked (tier 3) — never traded
+  # ============================================================
   - symbol: PLTR
     name: "Palantir"
-    tier: 3   # demoted 2026-06-03 (TICKET-020): ~$27K/contract capital req incompatible
-              # with weekly_wheel sizing; momentum-driven, not premium-decay friendly.
+    tier: 3   # demoted 2026-06-03 (TICKET-020): ~$27K/contract capital req;
+              # momentum-driven, not premium-decay friendly.
     strategies: []
     notes: "Heavy retail flow, weeklies trade actively. PARKED."
 
@@ -97,13 +92,6 @@ tickers:
     strategies: []
     notes: "Volatile, weekly options trade. PARKED — going-concern risk."
 
-  - symbol: RIVN
-    name: "Rivian"
-    tier: 2
-    strategies: [weekly_wheel]
-    overrides:
-      max_position_pct_of_account: 20
-
   - symbol: MARA
     name: "Marathon Digital"
     tier: 3   # demoted 2026-06-03 (TICKET-020): pure crypto-beta (Bitcoin miner),
@@ -111,173 +99,8 @@ tickers:
     strategies: []
     notes: "BTC-correlated, high IV. PARKED — crypto-beta."
 
-  - symbol: AAL
-    name: "American Airlines"
-    tier: 1
-    strategies: [narrow_put_spread]   # $5k sim: re-pointed off weekly_wheel (LEAPs too thin for PMCC)
-    notes: "Sub-$20 airline, weeklies + earnings IV."
-
-  # $5k sim (2026-06-18): low-price names for the defined-risk + PMCC mix.
-  - symbol: CCL
-    name: "Carnival Corporation"
-    tier: 1
-    strategies: [narrow_put_spread, pmcc, calendar]
-    notes: "~$22 cruise/travel; higher IV → good short-call/credit income + calendar vega; liquid options + LEAPs. Replaces Ford in the small-account set."
-
-  # ============================================================
-  # put_spread — 30-45 DTE bull put credit spreads, defined risk
-  # ============================================================
-  - symbol: AAPL
-    name: "Apple"
-    tier: 1
-    # TICKET-015: pmcc added — quality mega-cap the cash-secured account can't
-    # wheel outright (200 shares ≈ $40k); the LEAP-based PMCC substitutes.
-    strategies: [put_spread, pmcc]
-    notes: "Mega-cap, tight option spreads. PMCC long-LEAP target."
-
-  - symbol: MSFT
-    name: "Microsoft"
-    tier: 1
-    strategies: [put_spread, pmcc]
-
-  - symbol: META
-    name: "Meta Platforms"
-    tier: 1
-    strategies: [put_spread]
-
-  - symbol: GOOGL
-    name: "Alphabet"
-    tier: 1
-    strategies: [put_spread, pmcc]
-
-  - symbol: TSLA
-    name: "Tesla"
-    tier: 1
-    strategies: [put_spread]
-    notes: "High IV, very liquid; defined risk caps the volatility risk."
-
-  - symbol: NVDA
-    name: "NVIDIA"
-    tier: 1
-    strategies: [put_spread]
-    notes: "Mega-cap semi; spreads keep BP requirement reasonable."
-
-  - symbol: SPY
-    name: "S&P 500 ETF"
-    tier: 1
-    # TICKET-014: SPY is in BOTH put_spread (directional) and iron_condor
-    # (neutral-range, defined risk on both sides). Overlap is intentional:
-    # the disjoint-universes comment elsewhere was about avoiding accidental
-    # short strangles from put_spread + bear_call_spread on the same ticker.
-    # That accident does NOT happen with iron_condor since the condor is
-    # itself a defined-risk structure with both wings — there's no implicit
-    # leftover from one strategy that could combine with another.
-    # TICKET-015/016: pmcc + calendar added — index LEAP substitute + low-IV
-    # calendar. Each strategy on SPY holds independent, separately-keyed
-    # positions.
-    strategies: [put_spread, iron_condor, pmcc, calendar, spy_swing_opt, zero_dte]
-    notes: "Broad-market hedge candidate too. Iron condor + PMCC + calendar target — deepest liquidity. spy_swing_opt = directional swing (dry-run in 2.1). zero_dte = same-day morning bull put spread (2026-07 paper test, rebuilt 2026-10)."
-
-  - symbol: QQQ
-    name: "NASDAQ-100 ETF"
-    tier: 1
-    # TICKET-014/015/016: see SPY for the overlap rationale.
-    # zero_dte (2026-10 rebuild): QQQ carries the ladder evidence — under the
-    # SMA + FOMC skips its 0.10/0.15 rungs were +$222/+$312 over 12 days with
-    # no breach, while SPY alone was -$57/-$127 (one -$120/-$210 day, 9/30).
-    strategies: [put_spread, iron_condor, pmcc, calendar, zero_dte]
-    notes: "Tech-heavy ETF with deep options chain. Iron condor + PMCC + calendar target. zero_dte = same-day bull put (2026-10 rebuild)."
-
-  - symbol: AMD
-    name: "Advanced Micro Devices"
-    tier: 1
-    strategies: [put_spread]
-    notes: "Mega-cap semi (~$400). Too rich for CSP cash; defined-risk spread works."
-
-  - symbol: COIN
-    name: "Coinbase Global"
-    tier: 2
-    # 2026-06-03 (TICKET-020): removed weekly_wheel. The 2026-05-23 band-aid
-    # has been retired now that wheel.propose_all manages SHARES_HELD orphans
-    # (wheel_orphan_managed, locked by test_propose_all_manages_orphan_shares_held_outside_universe).
-    # Retained in put_spread for defined-risk crypto exposure — the
-    # capital-req / beta concerns that disqualify weekly_wheel naked-put sizing
-    # don't apply to a $500-cap bull put spread.
-    strategies: [put_spread]
-    notes: "~$300 crypto-correlated. Defined-risk only. Any SHARES_HELD from prior weekly_wheel cycles continues to wheel out via the orphan-management path."
-
-  # ============================================================
-  # bear_call_spread — 30-45 DTE bear call credit spreads, defined risk
-  # Selected for non-ripping tape + liquid option chains.
-  # Disjoint from put_spread universe so strategies don't double up
-  # on the same ticker (would create accidental short strangle exposure).
-  # ============================================================
-  - symbol: IWM
-    name: "iShares Russell 2000 ETF"
-    tier: 1
-    # TICKET-014/016: IWM gets iron_condor + calendar alongside bear_call_spread.
-    # Same rationale as SPY/QQQ — defined-risk structures, bounded interaction.
-    strategies: [bear_call_spread, iron_condor, calendar]
-    notes: "Small caps — chronically weaker than SPY, ETF diversification. Iron condor + calendar target."
-
-  - symbol: DIA
-    name: "SPDR Dow Jones Industrial Average ETF"
-    tier: 1
-    strategies: [bear_call_spread]
-    notes: "DJIA ETF; slower mover than QQQ. Defined-risk friendly."
-
-  - symbol: BA
-    name: "Boeing"
-    tier: 1
-    strategies: [bear_call_spread]
-    notes: "Mega-cap with persistent weakness; liquid weeklies + earnings IV."
-
-  - symbol: DIS
-    name: "Walt Disney"
-    tier: 1
-    strategies: [bear_call_spread]
-    notes: "Sideways tape for years; mega-cap, liquid options."
-
-  - symbol: MU
-    name: "Micron Technology"
-    tier: 1
-    strategies: [bear_call_spread]
-    notes: "Semi cycle, IV-rich; not in put_spread universe."
-
-  - symbol: NFLX
-    name: "Netflix"
-    tier: 1
-    strategies: [bear_call_spread]
-    notes: "High IV mega-cap; deep options chain."
-
-  - symbol: XLE
-    name: "Energy Select Sector SPDR ETF"
-    tier: 1
-    strategies: [bear_call_spread]
-    notes: "Energy ETF — separate macro factor from tech/financials."
-
-  - symbol: WBA
-    name: "Walgreens Boots Alliance"
-    tier: 2
-    strategies: [bear_call_spread]
-    notes: "Retail/pharma weakness, liquid weeklies. Tier 2 = LLM screener required."
-
-  - symbol: CRM
-    name: "Salesforce"
-    tier: 1
-    strategies: [bear_call_spread]
-    notes: >
-      2026-07-09 (David): bearish AI-disruption thesis on seat-based SaaS.
-      Parked here deliberately — bear_call_spread is disabled and regime-gated
-      (bear_calls_allowed), so this activates only if the strategy is enabled
-      AND the tape turns. Quarterly earnings land inside the 30-45 DTE window;
-      expect regular earnings-blackout gating.
-
-# Banned list — explicitly never trade these even if screener suggests
+# Banned list — never opened by any strategy (enforced by the risk gate's
+# `banned` rule since 2026-10-27).
 banned:
   - GME
   - AMC
-
-# Banned categories enforced in code
-banned_rules:
-  - "biotech under $20"           # binary FDA risk

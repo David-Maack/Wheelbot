@@ -1,7 +1,7 @@
 """0DTE paper-test strategy — entry window, trend gate, flatten, caps,
 dual-ledger math.
 
-Uses PaperBroker + the db_repos fixture like test_iron_condor / test_spreads.
+Uses PaperBroker + the db_repos fixture.
 Times are injected via the `now` kwarg (aware America/New_York datetimes) so
 tests are independent of the wall clock; the 20-day SMA is injected via
 `sma_ref` (or `_prior_close_sma` is monkeypatched) so no yfinance fetch happens.
@@ -32,7 +32,6 @@ from core.strategies import StrategyDefinition
 from platforms.paper_broker import PaperBroker
 from strategies.spreads import (
     DIRECTION_BULL_PUT,
-    DIRECTION_IRON_CONDOR,
 )
 from strategies.zero_dte import (
     _prior_close_sma,
@@ -74,7 +73,6 @@ def _universe(*symbols: str) -> dict:
 
 def _strategy(**overrides: Any) -> StrategyDefinition:
     params: dict[str, Any] = {
-        "structure": "narrow_vertical",
         "spread_width_dollars": 2.0,
         "short_delta_min": 0.10,
         "short_delta_max": 0.15,
@@ -127,7 +125,7 @@ def _contract(
 
 def _seed_same_day_chain(broker: PaperBroker, symbol: str, spot: float) -> None:
     """SPY-like chain expiring TODAY. Same delta/premium model as the iron
-    condor tests: put_delta = -0.5 - 0.03*offset, call_delta = 0.5 - 0.03*offset,
+    old condor tests: put_delta = -0.5 - 0.03*offset, call_delta = 0.5 - 0.03*offset,
     mid = max(0.10, |delta| * 3), bid/ask = mid -/+ 0.02."""
     contracts: list[OptionContract] = []
     for offset in range(-25, 26):
@@ -273,24 +271,24 @@ async def test_never_proposes_call_side(db_repos):
 
 def _daily_frame(closes: list[float], last_day: date) -> pd.DataFrame:
     idx = pd.bdate_range(end=pd.Timestamp(last_day), periods=len(closes))
-    return pd.DataFrame({"close": closes}, index=idx)
+    return pd.DataFrame({"Close": closes}, index=idx)
 
 
 def test_prior_close_sma_excludes_todays_bar(monkeypatch):
     """yfinance's daily frame carries today's in-progress bar during the
     session; the SMA must use the 20 closes BEFORE today (the ladder's ma20)."""
-    import backtest.data
+    import data.yf_helpers
 
     monkeypatch.setattr(zero_dte, "_SMA_CACHE", {})
     prior = [700.0 + i for i in range(25)]           # 25 prior sessions
     frame = _daily_frame(prior + [9999.0], TODAY)    # + today's partial bar
     calls: list[str] = []
 
-    def _load(symbol, period="3y", *, weekly=False):
+    def _load(symbol, period, interval="1d"):
         calls.append(symbol)
         return frame
 
-    monkeypatch.setattr(backtest.data, "load_daily_yf", _load)
+    monkeypatch.setattr(data.yf_helpers, "safe_history", _load)
     expected = sum(prior[-20:]) / 20
     assert _prior_close_sma("SPY", TODAY, 20) == pytest.approx(expected)
     # Cached for the day: no second fetch.
@@ -299,17 +297,17 @@ def test_prior_close_sma_excludes_todays_bar(monkeypatch):
 
 
 def test_prior_close_sma_short_history_and_errors_return_none(monkeypatch):
-    import backtest.data
+    import data.yf_helpers
 
     monkeypatch.setattr(zero_dte, "_SMA_CACHE", {})
-    monkeypatch.setattr(backtest.data, "load_daily_yf",
+    monkeypatch.setattr(data.yf_helpers, "safe_history",
                         lambda *a, **k: _daily_frame([700.0] * 10, TODAY))
     assert _prior_close_sma("SPY", TODAY, 20) is None
 
     def _raise(*a, **k):
         raise RuntimeError("yfinance down")
 
-    monkeypatch.setattr(backtest.data, "load_daily_yf", _raise)
+    monkeypatch.setattr(data.yf_helpers, "safe_history", _raise)
     assert _prior_close_sma("QQQ", TODAY, 20) is None
     assert zero_dte._SMA_CACHE == {}  # failures are never cached
 
@@ -581,31 +579,6 @@ async def test_propose_all_closes_walks_open_positions(db_repos):
         broker, db_repos, _config(), strategy=_strategy(), now=_et(15, 5),
     )
     assert len(proposals) == 1
-
-
-# -- iron_condor structure ---------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_condor_structure_builds_four_legs(db_repos):
-    strat = _strategy(
-        structure="iron_condor",
-        max_capital_per_spread_usd=400.0,  # $3 wings -> max_loss > $200
-    )
-    proposal = await _propose(db_repos, _entry_broker(500.0), now=_et(10, 5),
-                              strategy=strat)
-    assert proposal is not None
-    assert proposal.direction == DIRECTION_IRON_CONDOR
-    assert len(proposal.legs) == 4
-    for leg in proposal.legs:
-        assert leg.expiration == TODAY
-    row = await db_repos.zero_dte_ledger.latest_for_symbol("SPY")
-    assert row is not None and row["structure"] == "iron_condor"
-    # Four legs at 0.04-wide quotes -> summed spread 0.16, penalty 0.08.
-    assert row["entry_spread_width_quotes"] == pytest.approx(0.16)
-    assert row["entry_credit_penalized"] == pytest.approx(
-        row["entry_credit_raw"] - 0.08
-    )
 
 
 # -- sizing ------------------------------------------------------------------

@@ -16,10 +16,8 @@ no new order logic.
 | `get_account_risk` | equity / cash / buying-power, net position mark, concurrent-cap usage |
 | `get_strategy_status` | per-strategy config-enabled flag, runtime drawdown/pause state, open count |
 | `get_performance` | realized P&L + win rate by strategy, recent closed cycles |
-| `get_recent_decisions` | recent screener / news_check LLM decisions + today's LLM cost |
 | `get_regime_and_calendar` | regime flags + upcoming macro events + calendar freshness |
 | `diagnose_symbol` | why a symbol may not be trading: owning strategies, regime gate, cap, next earnings, recent orders |
-| `get_watchlists` | applied universe-refresh watchlists per strategy + latest pending proposal diff |
 
 **Guarded controls (require `mcp.controls_enabled: true`, shipped ON):**
 
@@ -29,7 +27,6 @@ no new order logic.
 | `engage_kill_switch` / `release_kill_switch` | global stop via the shared-volume stop file |
 | `refresh_macro_calendar` | idempotent |
 | `flatten_position(symbol, execute=false)` | **dry-run by default** — returns the plan; acts only with `execute=true` |
-| `approve_watchlist(run_id, approve=true)` | applies (or rejects) a PROPOSED universe-refresh run; only `proposed` runs are actionable |
 
 Every control writes an `mcp_control` checkpoint (`triggered_by=MCP`) for the
 audit trail.

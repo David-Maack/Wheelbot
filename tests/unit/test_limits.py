@@ -383,26 +383,6 @@ async def _seed_regime(db_repos, **flags: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_regime_gate_uses_bear_calls_allowed_for_bear_call_proposal(
-    db_repos, monkeypatch
-):
-    """bear_call OPEN with bear_calls_allowed=0 fails the regime gate."""
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    await _seed_regime(db_repos, csps_allowed=1, bear_calls_allowed=0)
-
-    cfg = _config()
-    cfg["regime"] = {"enabled": True}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
-    res = await gate.evaluate(
-        _multi_leg_proposal(direction="bear_call"),
-        today=date(2025, 6, 1),
-        raise_on_fail=False,
-    )
-    statuses = {r.rule: r.status for r in res.results}
-    assert statuses["regime"] == "fail"
-
-
-@pytest.mark.asyncio
 async def test_regime_gate_uses_csps_allowed_for_bull_put_proposal(
     db_repos, monkeypatch
 ):
@@ -420,25 +400,6 @@ async def test_regime_gate_uses_csps_allowed_for_bull_put_proposal(
     )
     statuses = {r.rule: r.status for r in res.results}
     assert statuses["regime"] == "fail"
-
-
-@pytest.mark.asyncio
-async def test_regime_gate_passes_bear_call_when_bear_calls_allowed(
-    db_repos, monkeypatch
-):
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    await _seed_regime(db_repos, csps_allowed=0, bear_calls_allowed=1)
-
-    cfg = _config()
-    cfg["regime"] = {"enabled": True}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
-    res = await gate.evaluate(
-        _multi_leg_proposal(direction="bear_call"),
-        today=date(2025, 6, 1),
-        raise_on_fail=False,
-    )
-    statuses = {r.rule: r.status for r in res.results}
-    assert statuses["regime"] == "pass"
 
 
 @pytest.mark.asyncio
@@ -460,27 +421,6 @@ async def test_regime_gate_iron_condor_passes_when_both_wings_allowed(
     )
     statuses = {r.rule: r.status for r in res.results}
     assert statuses["regime"] == "pass"
-
-
-@pytest.mark.asyncio
-async def test_regime_gate_iron_condor_blocked_when_put_wing_disallowed(
-    db_repos, monkeypatch
-):
-    """csps_allowed=0 (put wing blocked) → condor fails even if bear_calls=1."""
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    await _seed_regime(db_repos, csps_allowed=0, bear_calls_allowed=1)
-
-    cfg = _config()
-    cfg["regime"] = {"enabled": True}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
-    res = await gate.evaluate(
-        _multi_leg_proposal(direction="iron_condor"),
-        today=date(2025, 6, 1),
-        raise_on_fail=False,
-    )
-    rule_results = {r.rule: r for r in res.results}
-    assert rule_results["regime"].status == "fail"
-    assert "BEAR_TREND/HIGH_VOL" in rule_results["regime"].detail
 
 
 @pytest.mark.asyncio
@@ -519,24 +459,6 @@ async def test_regime_gate_calendar_passes_when_range_bound(db_repos, monkeypatc
     )
     statuses = {r.rule: r.status for r in res.results}
     assert statuses["regime"] == "pass"
-
-
-@pytest.mark.asyncio
-async def test_regime_gate_calendar_blocked_when_bearish(db_repos, monkeypatch):
-    """BEAR_TREND/HIGH_VOL (csps_allowed=0) still blocks the calendar; BULL_TREND
-    no longer does (2026-07-01 audit fix)."""
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    await _seed_regime(db_repos, csps_allowed=0, bear_calls_allowed=1)
-    cfg = _config()
-    cfg["regime"] = {"enabled": True}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _universe())
-    res = await gate.evaluate(
-        _multi_leg_proposal(direction="calendar"),
-        today=date(2025, 6, 1), raise_on_fail=False,
-    )
-    rule_results = {r.rule: r for r in res.results}
-    assert rule_results["regime"].status == "fail"
-    assert "BEAR_TREND/HIGH_VOL" in rule_results["regime"].detail
 
 
 @pytest.mark.asyncio
@@ -763,116 +685,6 @@ async def _seed_candidate(db_repos, *, symbol: str, score: float, run_date: str 
     await conn.commit()
 
 
-@pytest.mark.asyncio
-async def test_tier2_screen_skips_when_screener_disabled(db_repos, monkeypatch):
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    cfg = _config()
-    cfg["intelligence"] = {"llm_screener_enabled": False}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
-    res = await gate.evaluate(_hood_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
-    statuses = {r.rule: r.status for r in res.results}
-    assert statuses["tier2_screen"] == "skip"
-
-
-@pytest.mark.asyncio
-async def test_tier2_screen_bypasses_tier1(db_repos, monkeypatch):
-    """F is tier-1 — the screener gate must skip it."""
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    cfg = _config()
-    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
-    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
-    statuses = {r.rule: r.status for r in res.results}
-    assert statuses["tier2_screen"] == "skip"
-
-
-@pytest.mark.asyncio
-async def test_tier2_screen_fails_when_no_candidate_row(db_repos, monkeypatch):
-    """Tier-2 entry with no LLM screener row today → fail (screener didn't run)."""
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    cfg = _config()
-    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
-    res = await gate.evaluate(_hood_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
-    statuses = {r.rule: r.status for r in res.results}
-    assert statuses["tier2_screen"] == "fail"
-
-
-@pytest.mark.asyncio
-async def test_tier2_screen_passes_with_high_score(db_repos, monkeypatch):
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    await _seed_candidate(db_repos, symbol="HOOD", score=72.0)
-    cfg = _config()
-    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
-    res = await gate.evaluate(_hood_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
-    statuses = {r.rule: r.status for r in res.results}
-    assert statuses["tier2_screen"] == "pass"
-
-
-@pytest.mark.asyncio
-async def test_tier2_screen_fails_when_score_below_threshold(db_repos, monkeypatch):
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    await _seed_candidate(db_repos, symbol="HOOD", score=42.0)
-    cfg = _config()
-    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
-    res = await gate.evaluate(_hood_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
-    statuses = {r.rule: r.status for r in res.results}
-    assert statuses["tier2_screen"] == "fail"
-
-
-@pytest.mark.asyncio
-async def test_tier2_screen_skips_bear_call_direction(db_repos, monkeypatch):
-    """Bear-call direction must bypass — current screener prompt is bull-biased."""
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    # No candidate row, low score, etc. — none of it matters; bear-call bypasses.
-    cfg = _config()
-    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
-    bear_call_universe = {
-        "tickers": [UniverseEntry(symbol="WBA", name="Walgreens", tier=2, overrides={})],
-        "banned": [], "banned_rules": [],
-    }
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, bear_call_universe)
-    bc_proposal = _multi_leg_proposal(direction="bear_call")
-    # Override symbol to WBA for this test.
-    from strategies.spreads import MultiLegProposal
-    bc_proposal = MultiLegProposal(
-        symbol="WBA",
-        legs=bc_proposal.legs,
-        net_credit_per_spread=bc_proposal.net_credit_per_spread,
-        max_loss_per_spread=bc_proposal.max_loss_per_spread,
-        width_dollars=bc_proposal.width_dollars,
-        quantity=bc_proposal.quantity,
-        rationale=bc_proposal.rationale,
-        strategy_id="bear_call_spread",
-        direction="bear_call",
-    )
-    res = await gate.evaluate(bc_proposal, today=date(2025, 6, 1), raise_on_fail=False)
-    statuses = {r.rule: r.status for r in res.results}
-    assert statuses["tier2_screen"] == "skip"
-
-
-@pytest.mark.asyncio
-async def test_tier2_screen_skips_closes(db_repos, monkeypatch):
-    """BUY_TO_CLOSE on a tier-2 position must bypass — this is an entry gate."""
-    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
-    cfg = _config()
-    cfg["intelligence"] = {"llm_screener_enabled": True, "tier2_min_score": 50}
-    gate = RiskGate(PaperBroker(cash=20_000), db_repos, cfg, _tier2_universe())
-    close_proposal = Proposal(
-        symbol="HOOD",
-        contract=_hood_proposal().contract,
-        order_type=OrderType.BUY_TO_CLOSE,
-        quantity=1,
-        rationale="close",
-        strategy_id="weekly_wheel",
-    )
-    res = await gate.evaluate(close_proposal, today=date(2025, 6, 1), raise_on_fail=False)
-    statuses = {r.rule: r.status for r in res.results}
-    assert statuses["tier2_screen"] == "skip"
-
-
 def _itm_call(strike: float = 700.0, bid: float = 45.0, ask: float = 45.2) -> OptionContract:
     return OptionContract(
         underlying="SPY", occ_symbol="SPY260821C00700000", strike=strike,
@@ -886,28 +698,6 @@ def _swing_proposal() -> Proposal:
         symbol="SPY", contract=_itm_call(), order_type=OrderType.BUY_TO_OPEN,
         quantity=1, rationale="swing test", strategy_id="spy_swing_opt",
     )
-
-
-def test_notional_long_option_is_premium_not_underlying():
-    # A deep-ITM SPY long: premium ~$45.10/sh → $4,510, NOT ~$73,300 underlying.
-    from risk.limits import _notional
-    assert _notional(_swing_proposal()) == pytest.approx(45.1 * 100)
-
-
-@pytest.mark.asyncio
-async def test_regime_gate_skips_swing(db_repos):
-    # Swing carries its own 200-SMA gate → the CSP regime rule must skip it.
-    from risk.limits import RiskCheckResult
-    cfg = {
-        "account": {"id": "test"}, "regime": {"enabled": True},
-        "strategies": [{"id": "spy_swing_opt", "type": "swing"}],
-    }
-    gate = RiskGate(PaperBroker(cash=100_000), db_repos, cfg, _universe())
-    p = _swing_proposal()
-    res = RiskCheckResult(proposal=p)
-    await gate._rule_regime(res, p, {})
-    assert res.results[-1].status == "skip"
-    assert "swing" in res.results[-1].detail
 
 
 # -- per-strategy concurrent cap (2026-07-08 fix) ------------------------------
@@ -1003,3 +793,46 @@ async def test_concurrent_strategy_cap_ignores_closed_spread_ghosts(db_repos, mo
     statuses = {r.rule: r.status for r in res.results}
     # Without the filter: projected 5 > 4 -> fail. Ghosts excluded -> pass.
     assert statuses["concurrent_positions_cap"] == "pass"
+
+
+# -- 2026-10-27: banned symbols + per-strategy params --------------------------
+
+
+@pytest.mark.asyncio
+async def test_banned_symbol_is_refused_on_open_only(db_repos, monkeypatch):
+    """universe.yaml `banned` used to be enforced only by the (removed)
+    watchlist overlay. The gate now refuses an open; a close still passes."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    universe = _universe()
+    universe["banned"] = ["f"]   # case-insensitive
+    gate = RiskGate(PaperBroker(cash=20_000), db_repos, _config(), universe)
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    assert {r.rule: r.status for r in res.results}["banned"] == "fail"
+
+    close = Proposal(symbol="F", contract=_put_contract(), order_type=OrderType.BUY_TO_CLOSE,
+                     quantity=1, rationale="close")
+    res = await gate.evaluate(close, today=date(2025, 6, 1), raise_on_fail=False)
+    assert {r.rule: r.status for r in res.results}["banned"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_strategy_params_override_the_wheel_block(db_repos, monkeypatch):
+    """Before 2026-10-27 every strategy was gated on the `wheel:` block's
+    caps whatever its own params said. A strategy-level
+    max_position_pct_of_account now wins; per-ticker overrides still win
+    over both."""
+    monkeypatch.setattr("risk.limits.in_blackout", lambda *a, **k: None)
+    broker = PaperBroker(cash=2_000)   # wheel cap 30% = $600 < $950 notional
+    cfg = _config()
+    cfg["strategies"] = [{"id": "monthly_wheel", "type": "wheel",
+                          "params": {"max_position_pct_of_account": 60}}]
+    gate = RiskGate(broker, db_repos, cfg, _universe())
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    assert {r.rule: r.status for r in res.results}["per_position_cap"] == "pass"
+
+    universe = _universe()
+    universe["tickers"] = [UniverseEntry(symbol="F", name="Ford", tier=1,
+                                         overrides={"max_position_pct_of_account": 30})]
+    gate = RiskGate(broker, db_repos, cfg, universe)
+    res = await gate.evaluate(_proposal(), today=date(2025, 6, 1), raise_on_fail=False)
+    assert {r.rule: r.status for r in res.results}["per_position_cap"] == "fail"

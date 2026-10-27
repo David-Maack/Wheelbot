@@ -3,7 +3,7 @@
 A strategy is a config-defined trading approach with its own parameter set,
 universe slice, and concurrent-position cap. The bot iterates registered
 strategies each tick and dispatches by `type` to the appropriate orchestrator
-(currently `wheel`; `vertical_spread` arrives in sub-sprint 3).
+(`wheel` or `zero_dte` since the 2026-10-27 two-strategy cleanup).
 
 config.yaml format:
 
@@ -39,7 +39,7 @@ class StrategyDefinition:
 
     id: str
     display_name: str
-    type: str  # "wheel" | "vertical_spread"
+    type: str  # "wheel" | "zero_dte"
     enabled: bool
     max_concurrent: int
     params: dict[str, Any] = field(default_factory=dict)
@@ -112,11 +112,6 @@ def _validate(strategies: list[StrategyDefinition]) -> None:
     evaluator's trigger must fire AT OR BEFORE the delta-stop threshold —
     otherwise the delta stop wins and the "let the roll handle it" branch is
     unreachable. We raise here rather than silently misordering the triggers.
-
-    PMCC long-roll (2026-07-06): `long_roll_delta` must sit strictly below
-    `long_delta_target` — a roll floor at or above the entry delta would roll
-    every fresh long on its first tick (perpetual churn, one losing
-    commission per tick loop).
     """
     for s in strategies:
         if s.type == "wheel":
@@ -134,43 +129,28 @@ def _validate(strategies: list[StrategyDefinition]) -> None:
                     f"delta_stop_action='roll' — otherwise the delta stop would "
                     f"fire before the roll evaluator gets a chance to act."
                 )
-        elif s.type == "pmcc":
-            roll_delta = s.params.get("long_roll_delta")
-            entry_delta = s.params.get("long_delta_target")
-            if roll_delta is None or float(roll_delta) <= 0 or entry_delta is None:
-                continue  # delta-roll off or entry target unset
-            if float(roll_delta) >= float(entry_delta):
-                raise ValueError(
-                    f"strategy {s.id!r}: long_roll_delta ({roll_delta}) must be "
-                    f"< long_delta_target ({entry_delta}) — otherwise every "
-                    f"fresh long rolls immediately."
-                )
 
 
 def universe_for_strategy(
     strategy: StrategyDefinition, universe: dict[str, Any]
 ) -> dict[str, Any]:
     """Return a universe-shaped dict containing only tickers tagged with
-    this strategy. Preserves banned/banned_rules so risk gates still apply."""
+    this strategy. Preserves `banned` so the risk gate still applies."""
     tickers = [
         t for t in universe.get("tickers", []) if strategy.id in t.strategies
     ]
     return {
         "tickers": tickers,
         "banned": universe.get("banned", []),
-        "banned_rules": universe.get("banned_rules", []),
     }
 
 
 # Which param each strategy type's close path reads for its time-close, and
 # the default that close path falls back to when the param is absent. Mirrors
-# strategies/{wheel_close,spreads,calendar_close,pmcc_close}.py — keep in sync.
+# strategies/wheel_close.py — keep in sync. zero_dte has no time-close (it
+# flattens same-day), so it is absent = held to expiration.
 _TIME_CLOSE_PARAM_BY_TYPE: dict[str, tuple[str, int]] = {
     "wheel": ("time_close_dte", 0),
-    "vertical_spread": ("time_close_dte", 7),
-    "iron_condor": ("time_close_dte", 7),
-    "calendar": ("time_close_short_dte", 2),
-    "pmcc": ("short_time_close_dte", 1),
 }
 
 

@@ -16,7 +16,6 @@ def _config(stop_path: str | None = None, **risk_overrides) -> dict:
         "account": {"id": "test", "broker": "paper"},
         "risk": {
             "daily_loss_kill_switch_pct": 5,
-            "consecutive_losses_pause": 3,
         },
     }
     cfg["risk"].update(risk_overrides)
@@ -75,35 +74,13 @@ async def test_daily_loss_past_threshold_trips(db_repos):
 
 
 @pytest.mark.asyncio
-async def test_consecutive_losses_trips_at_threshold(db_repos):
+async def test_losing_streak_no_longer_trips(db_repos):
+    """2026-10-27: the consecutive-losses rule was removed — a streak halted
+    entries, and with no entries the streak could never end. Five losses in a
+    row (even with the old knob still in config) must not trip."""
     broker = PaperBroker(cash=10_000)
     base = datetime.now(UTC).replace(tzinfo=None)
-    for i in range(3):
-        cid = await db_repos.cycles.insert(
-            WheelCycle(
-                account_id="test",
-                symbol=f"X{i}",
-                started_at=base - timedelta(days=10 + i),
-            )
-        )
-        await db_repos.cycles.update(
-            cid,
-            ended_at=(base - timedelta(days=i)).isoformat(),
-            final_pnl=-50.0,
-            cycle_outcome=CycleOutcome.MANUAL_CLOSE.value,
-        )
-    ks = KillSwitch(broker, db_repos, _config())
-    result = await ks.check(today=date(2025, 6, 1))
-    assert result.tripped is True
-    assert any("consecutive" in r for r in result.reasons)
-
-
-@pytest.mark.asyncio
-async def test_winning_cycle_resets_consecutive_loss_streak(db_repos):
-    broker = PaperBroker(cash=10_000)
-    base = datetime.now(UTC).replace(tzinfo=None)
-    # Two losses, then a win, then two more losses → streak from most-recent = 2.
-    for i, pnl in enumerate([-50.0, -50.0, 25.0, -50.0, -50.0]):
+    for i, pnl in enumerate([-50.0, -50.0, -50.0, -50.0, -50.0]):
         cid = await db_repos.cycles.insert(
             WheelCycle(
                 account_id="test",

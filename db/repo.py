@@ -673,30 +673,6 @@ class StrategyRuntimeStateRepo(_Repo):
         )
         await c.commit()
 
-    async def mark_warning(
-        self,
-        strategy_id: str,
-        *,
-        reason: str,
-        now: datetime | None = None,
-    ) -> None:
-        """TICKET-008: persist a WARNING-tier row. No disabled_until — the
-        state persists until the next check_and_apply observes recovery."""
-        now = now or datetime.now(UTC).replace(tzinfo=None)
-        c = await self.db.connect()
-        await c.execute(
-            "INSERT INTO strategy_runtime_state "
-            "(strategy_id, disabled_at, disabled_until, disabled_reason, drawdown_state) "
-            "VALUES (?, ?, NULL, ?, 'WARNING') "
-            "ON CONFLICT(strategy_id) DO UPDATE SET "
-            "  disabled_at = excluded.disabled_at, "
-            "  disabled_until = NULL, "
-            "  disabled_reason = excluded.disabled_reason, "
-            "  drawdown_state = 'WARNING'",
-            (strategy_id, now.isoformat(), reason),
-        )
-        await c.commit()
-
     async def set_drawdown_state(self, strategy_id: str, state: str) -> None:
         """Update just the drawdown_state column. Used after disable() to
         record the explicit DISABLED tag for the dashboard query."""
@@ -742,8 +718,10 @@ class StrategyRuntimeStateRepo(_Repo):
         first), only the pause_* columns are touched. The disabled_* columns
         and drawdown_state column are NOT modified.
 
-        `state` is the pause_state literal: 'LOW_WIN_RATE' (win-rate floor,
-        TICKET-009) or 'NEGATIVE_EXPECTANCY' (expectancy floor, 2026-07-06).
+        `state` is the pause_state literal. Since 2026-10-27 only the MCP
+        `pause_strategy` control writes one ('OPERATOR_PAUSE'); historical
+        rows may carry 'LOW_WIN_RATE' / 'NEGATIVE_EXPECTANCY' from the
+        removed win-rate / expectancy floors.
         The floors guard against overwriting each other's pause BEFORE
         calling this — this method last-writer-wins on the pause_* columns.
 

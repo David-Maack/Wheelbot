@@ -34,9 +34,9 @@ from core.broker_factory import make_broker
 from core.config import load_config
 from core.models import Order, OrderStatus, OrderType, PositionState
 from core.strategies import planned_time_close_dte
+from data.earnings import earnings_overlaps_hold
 from data.earnings import next_earnings as _next_earnings
 from db.repo import Database, Repos
-from risk.earnings_recheck import is_exposed_to_earnings as _is_exposed_to_earnings
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(ROOT / "templates"))
@@ -188,18 +188,6 @@ def build_app(deps: DashboardDeps) -> FastAPI:
             },
         )
 
-    @app.get("/candidates", response_class=HTMLResponse)
-    async def candidates_view(request: Request, _user: str = Depends(authorize)) -> Any:
-        c = await deps.repos.db.connect()
-        async with c.execute(
-            "SELECT * FROM candidates ORDER BY run_date DESC, rank ASC LIMIT 50"
-        ) as cur:
-            rows = await cur.fetchall()
-        candidates = [dict(r) for r in rows]
-        return TEMPLATES.TemplateResponse(
-            request, "candidates.html", {"candidates": candidates}
-        )
-
     @app.get("/orders", response_class=HTMLResponse)
     async def orders_view(
         request: Request,
@@ -217,56 +205,6 @@ def build_app(deps: DashboardDeps) -> FastAPI:
                 "orders": recent,
                 "filter_strategy": strategy or "",
                 "strategies": _known_strategies(deps),
-            },
-        )
-
-    @app.get("/decisions", response_class=HTMLResponse)
-    async def decisions_view(
-        request: Request,
-        decision_type: str | None = None,
-        decision: str | None = None,
-        _user: str = Depends(authorize),
-    ) -> Any:
-        """Recent LLM decisions — screener, news_check, roll advisor."""
-        c = await deps.repos.db.connect()
-        sql = "SELECT * FROM llm_decisions"
-        params: list[Any] = []
-        wheres: list[str] = []
-        if decision_type:
-            wheres.append("decision_type = ?")
-            params.append(decision_type)
-        if decision:
-            wheres.append("LOWER(decision) = LOWER(?)")
-            params.append(decision)
-        if wheres:
-            sql += " WHERE " + " AND ".join(wheres)
-        sql += " ORDER BY created_at DESC LIMIT 200"
-        async with c.execute(sql, tuple(params)) as cur:
-            rows = await cur.fetchall()
-        decisions = [dict(r) for r in rows]
-
-        async with c.execute(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_decisions "
-            "WHERE date(created_at) = date('now')"
-        ) as cur:
-            spent_today = float((await cur.fetchone())[0])
-        budget_cap = float(
-            deps.config.get("intelligence", {}).get("daily_budget_usd", 1.0)
-        )
-        # 2026-07-07: news-check hit-rate panel — the evidence gate for
-        # flipping news_check_advisory to false (see intelligence/news_hit_rate).
-        from intelligence.news_hit_rate import compute_hit_rate
-        news_hit = await compute_hit_rate(deps.repos)
-        return TEMPLATES.TemplateResponse(
-            request,
-            "decisions.html",
-            {
-                "decisions": decisions,
-                "filter_type": decision_type or "",
-                "filter_decision": decision or "",
-                "spent_today": spent_today,
-                "budget_cap": budget_cap,
-                "news_hit": news_hit,
             },
         )
 
@@ -292,21 +230,15 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         bp_used_pct = None
         if account and account.equity:
             bp_used_pct = (1 - account.buying_power / account.equity) * 100.0
-        # TICKET-008 + TICKET-009: per-strategy drawdown + win-rate panels.
+        # Per-strategy drawdown breaker + the D9 scorecard (2026-10-27).
         from core.strategies import load_strategies
         from risk import auto_disable as _auto_disable
-        from risk import expectancy_floor as _expectancy_floor
-        from risk import win_rate_floor as _win_rate_floor
+        from risk.scorecard import compute_scorecards
         strategies = load_strategies(deps.config)
         drawdown = await _auto_disable.get_drawdown_overview(
             deps.repos, strategies, deps.config,
         )
-        win_rate = await _win_rate_floor.get_win_rate_overview(
-            deps.repos, strategies, deps.config,
-        )
-        expectancy = await _expectancy_floor.get_expectancy_overview(
-            deps.repos, strategies, deps.config,
-        )
+        scorecards = await compute_scorecards(deps.repos, strategies, deps.config)
         return TEMPLATES.TemplateResponse(
             request,
             "risk.html",
@@ -318,11 +250,7 @@ def build_app(deps: DashboardDeps) -> FastAPI:
                 "regime": regime_row,
                 "stop_file": deps.config.get("risk", {}).get("stop_file_path"),
                 "drawdown": drawdown,
-                "win_rate": win_rate,
-                "expectancy": expectancy,
-                "expectancy_enabled": (
-                    (deps.config.get("risk") or {}).get("expectancy_floor") or {}
-                ).get("enabled", False),
+                "scorecards": scorecards,
             },
         )
 
@@ -427,8 +355,9 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         doc is small and operators occasionally need to see edits without a
         bot restart). Authority for the file's location and update rules
         lives in CLAUDE.md "Live-deployment authority"."""
-        import mistune
         from pathlib import Path as _Path
+
+        import mistune
         runbook_path = _Path(__file__).resolve().parent.parent / "docs" / "GO_LIVE_RUNBOOK.md"
         if not runbook_path.exists():
             raise HTTPException(404, f"runbook not found at {runbook_path}")
@@ -449,8 +378,9 @@ def build_app(deps: DashboardDeps) -> FastAPI:
         so doc edits show without a restart. The maintenance rule (update the
         doc in the same commit as any trading-behavior change) lives in
         CLAUDE.md "Workflow conventions"."""
-        import mistune
         from pathlib import Path as _Path
+
+        import mistune
         doc_path = _Path(__file__).resolve().parent.parent / "docs" / "HOW_IT_WORKS.md"
         if not doc_path.exists():
             raise HTTPException(404, f"doc not found at {doc_path}")
@@ -486,47 +416,6 @@ def build_app(deps: DashboardDeps) -> FastAPI:
 
 # --- View helpers -------------------------------------------------------------
 
-async def _swing_leg_summary(
-    deps: DashboardDeps, position: Any, today: datetime, cache: _QuoteCache,
-) -> dict[str, Any] | None:
-    """Single deep-ITM long (call or put) summary for a swing position: the
-    entry debit, current mid, the SPY-level stop/target anchors (from the entry
-    order's raw_request), and the LONG mark — gain = (mid − debit) × 100 × qty.
-    The generic helper assumes a SHORT option, which would invert the sign."""
-    from strategies.pmcc import latest_filled_order
-    if position.current_cycle_id is None:
-        return None
-    entry = await latest_filled_order(
-        deps.repos, position.current_cycle_id, OrderType.BUY_TO_OPEN,
-    )
-    if entry is None:
-        return None
-    ctx = (entry.raw_request or {}).get("swing", {}) if entry.raw_request else {}
-    debit = abs(entry.fill_price) if entry.fill_price is not None else None
-    mid = (
-        await cache.get(deps.broker, entry.contract_symbol)
-        if entry.contract_symbol else None
-    )
-    summary: dict[str, Any] = {
-        "strike": entry.strike,
-        "dte": (entry.expiration - today.date()).days if entry.expiration else None,
-        "entry_debit": debit,
-        "current_mid": mid,
-        "stop_px": ctx.get("stop_px"),
-        "target_px": ctx.get("target_px"),
-        "entry_spot": ctx.get("entry_spot"),
-        "direction": ctx.get("direction"),
-        "unrealized": None,
-        "unrealized_pct": None,
-    }
-    if debit is not None and mid is not None:
-        qty = entry.quantity or 1
-        summary["unrealized"] = (mid - debit) * 100 * qty
-        if debit > 0:
-            summary["unrealized_pct"] = (mid - debit) / debit * 100
-    return summary
-
-
 async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[str, Any]]:
     account_id = deps.config.get("account", {}).get("id", "primary")
     positions = await deps.repos.positions.list_all(account_id)
@@ -536,9 +425,10 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
     # to next_earnings when multiple positions share a symbol (rare but real
     # under multi-strategy on the same underlying). The provider itself
     # already has a 6h TTL — this is just dedup within one render.
-    earnings_cfg = (deps.config.get("risk", {}) or {}).get("earnings_recheck", {}) or {}
-    earnings_days_before = int(earnings_cfg.get("days_before", 5))
-    earnings_days_after = int(earnings_cfg.get("days_after", 2))
+    # Same window the entry gate and the wheel close path use (`wheel:` block).
+    wheel_cfg = deps.config.get("wheel", {}) or {}
+    earnings_days_before = int(wheel_cfg.get("earnings_blackout_days_before", 5))
+    earnings_days_after = int(wheel_cfg.get("earnings_blackout_days_after", 2))
     _earnings_lookup_cache: dict[str, "date | None"] = {}
 
     def _lookup_earnings(symbol: str) -> "date | None":
@@ -599,11 +489,10 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
         if p.id is not None:
             last_close_trigger = await deps.repos.orders.last_close_trigger_for_position(p.id)
 
-        # TICKET-006: earnings_warning badge — uses the SAME predicate
-        # (is_exposed_to_earnings) and the SAME days_before/days_after from
-        # risk.earnings_recheck as the recheck loop, so the badge and the
-        # actual mutation can't disagree. Only meaningful on open short-leg
-        # states where the short_expiration is well-defined.
+        # earnings_warning badge — the SAME predicate (earnings_overlaps_hold)
+        # and window as the entry gate and the CSP earnings close trigger, so
+        # the badge and the bot can't disagree. Only meaningful on open
+        # short-leg states where the short_expiration is well-defined.
         earnings_warning = False
         earnings_date_iso: str | None = None
         if p.state in (
@@ -618,8 +507,9 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 short_expiration = today.date() + timedelta(days=dte)
             if short_expiration is not None:
                 e_date = _lookup_earnings(p.symbol)
-                if e_date is not None and _is_exposed_to_earnings(
-                    e_date, short_expiration,
+                if e_date is not None and earnings_overlaps_hold(
+                    e_date,
+                    expiration=short_expiration,
                     today=today.date(),
                     time_close_dte=planned_time_close_dte(deps.config, p.strategy_id),
                     days_before=earnings_days_before,
@@ -627,41 +517,6 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 ):
                     earnings_warning = True
                     earnings_date_iso = e_date.isoformat()
-
-        # TICKET-015: PMCC two-leg summary (long + optional short, DIFFERENT
-        # expirations) + breakeven + full mark-to-market. None for non-PMCC rows.
-        pmcc = None
-        if p.strategy_id == "pmcc" and p.state in (
-            PositionState.PMCC_LONG_OPEN, PositionState.PMCC_BOTH_OPEN,
-        ):
-            pmcc = await _pmcc_leg_summary(deps, p, today, cache)
-            # Override the generic unrealized: the shared helper only marks the
-            # short leg (or nothing for LONG_OPEN), which is misleading for a
-            # covered structure where the LONG carries most of the P&L. Use the
-            # full long+short mark instead.
-            if pmcc is not None and pmcc.get("unrealized") is not None:
-                unrealized = pmcc["unrealized"]
-                unrealized_pct = pmcc.get("unrealized_pct")
-            else:
-                unrealized = None
-                unrealized_pct = None
-
-        # TICKET-016: calendar two-leg summary (front + back, DIFFERENT
-        # expirations, same strike) + net debit. None for non-calendar rows.
-        calendar = None
-        if p.strategy_id == "calendar" and p.state == PositionState.SPREAD_OPEN:
-            calendar = await _calendar_leg_summary(deps, p, today)
-
-        # Sub-sprint 2.4: swing single deep-ITM long. Override the generic
-        # short-sign unrealized with the LONG mark (mid − debit).
-        swing = None
-        if p.state == PositionState.SWING_OPEN:
-            swing = await _swing_leg_summary(deps, p, today, cache)
-            if swing is not None and swing.get("unrealized") is not None:
-                unrealized = swing["unrealized"]
-                unrealized_pct = swing.get("unrealized_pct")
-                if swing.get("dte") is not None:
-                    dte = swing["dte"]
 
         out.append(
             {
@@ -677,137 +532,9 @@ async def _positions_rows(deps: DashboardDeps, cache: _QuoteCache) -> list[dict[
                 "last_close_trigger": last_close_trigger,
                 "earnings_warning": earnings_warning,
                 "earnings_date_iso": earnings_date_iso,
-                "pmcc": pmcc,
-                "calendar": calendar,
-                "swing": swing,
             }
         )
     return out
-
-
-async def _calendar_leg_summary(
-    deps: DashboardDeps, position: Any, today: datetime,
-) -> dict[str, Any] | None:
-    """Front + back leg summary for a calendar. Same strike, DIFFERENT
-    expirations — surface both DTEs distinctly so it's obvious which is front
-    vs back. Reads the legs from the cycle's MULTI_LEG_OPEN order."""
-    if position.current_cycle_id is None:
-        return None
-    c = await deps.repos.db.connect()
-    async with c.execute(
-        "SELECT * FROM orders WHERE cycle_id = ? AND order_type = ? AND status = ? "
-        "ORDER BY placed_at DESC LIMIT 1",
-        (position.current_cycle_id, OrderType.MULTI_LEG_OPEN.value, OrderStatus.FILLED.value),
-    ) as cur:
-        row = await cur.fetchone()
-    if row is None:
-        return None
-    from db.repo import JSON_FIELDS_BY_TABLE, _row_to_dict
-    order = _row_to_dict(row, JSON_FIELDS_BY_TABLE["orders"])
-    legs = (order.get("raw_request") or {}).get("legs") or []
-    front = back = None
-    for leg in legs:
-        if str(leg.get("action")) == OrderType.SELL_TO_OPEN.value:
-            front = leg
-        elif str(leg.get("action")) == OrderType.BUY_TO_OPEN.value:
-            back = leg
-    if front is None or back is None:
-        return None
-
-    def _dte(leg: dict) -> int | None:
-        exp = leg.get("expiration")
-        if not exp:
-            return None
-        try:
-            d = date.fromisoformat(str(exp)[:10])
-        except ValueError:
-            return None
-        return (d - today.date()).days
-
-    return {
-        "strike": front.get("strike"),
-        "front_dte": _dte(front),
-        "back_dte": _dte(back),
-        "debit": abs(order.get("fill_price") or 0.0),
-    }
-
-
-async def _pmcc_leg_summary(
-    deps: DashboardDeps, position: Any, today: datetime, cache: _QuoteCache,
-) -> dict[str, Any] | None:
-    """Long + (optional) short leg summary for a PMCC position. The legs have
-    DIFFERENT expirations, so we surface both DTEs distinctly. Breakeven =
-    long strike + per-share debit (the floor the short must clear).
-
-    Also computes the FULL position mark-to-market (long appreciation + short
-    decay) — the long carries most of the P&L on a PMCC, so the short-only
-    number the generic helper produces would mislead."""
-    from core.models import OptionType as _OptionType
-    from strategies.pmcc import latest_filled_order, long_breakeven
-    if position.current_cycle_id is None:
-        return None
-    long_order = await latest_filled_order(
-        deps.repos, position.current_cycle_id, OrderType.BUY_TO_OPEN,
-        option_type=_OptionType.CALL,
-    )
-    if long_order is None:
-        return None
-    long_dte = (
-        (long_order.expiration - today.date()).days
-        if long_order.expiration else None
-    )
-    summary: dict[str, Any] = {
-        "long_strike": long_order.strike,
-        "long_dte": long_dte,
-        "breakeven": long_breakeven(long_order),
-        "short_strike": None,
-        "short_dte": None,
-        "has_short": False,
-        "unrealized": None,
-        "unrealized_pct": None,
-    }
-
-    # Full mark-to-market. Long: paid a debit, current value is its mid →
-    # gain = (mid − debit) × 100 × qty. Short (if open): collected premium,
-    # current cost-to-close is its mid → gain = (premium − mid) × 100 × qty.
-    long_debit = abs(long_order.fill_price) if long_order.fill_price is not None else None
-    long_mid = (
-        await cache.get(deps.broker, long_order.contract_symbol)
-        if long_order.contract_symbol else None
-    )
-    unreal: float | None = None
-    if long_debit is not None and long_mid is not None:
-        qty = long_order.quantity or 1
-        unreal = (long_mid - long_debit) * 100 * qty
-
-    if position.state == PositionState.PMCC_BOTH_OPEN:
-        short_order = await latest_filled_order(
-            deps.repos, position.current_cycle_id, OrderType.SELL_TO_OPEN,
-            option_type=_OptionType.CALL,
-        )
-        if short_order is not None:
-            summary["short_strike"] = short_order.strike
-            summary["short_dte"] = (
-                (short_order.expiration - today.date()).days
-                if short_order.expiration else None
-            )
-            summary["has_short"] = True
-            short_mid = (
-                await cache.get(deps.broker, short_order.contract_symbol)
-                if short_order.contract_symbol else None
-            )
-            if (
-                unreal is not None and short_mid is not None
-                and short_order.fill_price is not None
-            ):
-                sqty = short_order.quantity or 1
-                unreal += (short_order.fill_price - short_mid) * 100 * sqty
-
-    if unreal is not None:
-        summary["unrealized"] = unreal
-        if long_debit:
-            summary["unrealized_pct"] = unreal / (long_debit * 100 * (long_order.quantity or 1)) * 100
-    return summary
 
 
 async def _multi_leg_dte_and_unrealized(
@@ -894,7 +621,7 @@ async def _latest_open_option_for_cycle(deps: DashboardDeps, cycle_id: int | Non
         row = await cur.fetchone()
     if row is None:
         return None
-    from db.repo import _row_to_dict, JSON_FIELDS_BY_TABLE
+    from db.repo import JSON_FIELDS_BY_TABLE, _row_to_dict
 
     return Order(**_row_to_dict(row, JSON_FIELDS_BY_TABLE["orders"]))
 

@@ -17,9 +17,8 @@ contradicts it.
     premium (the logger's mirrored call wing, 99% of paired rows), the call
     side none. THE WING IS THE STOP: no stop orders at all — max loss is
     structural, which eliminates the stop-fill slippage gap that is the
-    single largest paper-vs-live divergence (research §3.3).
-  - ``iron_condor``: the July consensus baseline — 10-15 delta shorts, $2-5
-    wings, profit-take at 25% of credit. Not part of the rebuilt spec.
+    single largest paper-vs-live divergence (research §3.3). (The July
+    ``iron_condor`` structure was removed in the 2026-10-27 cleanup.)
 
 Entry only inside a 10:00-10:15 ET window (research §1.1/§5a; no later ladder
 slot did better once the two breach days are accounted for). Same-day
@@ -56,45 +55,24 @@ from zoneinfo import ZoneInfo
 
 from core.broker import Broker
 from core.checkpoint import log_checkpoint
-from core.models import OptionType, OrderLeg, OrderType, PositionState, Quote
+from core.models import OptionContract, OptionType, OrderLeg, OrderType, PositionState, Quote
 from core.strategies import StrategyDefinition
 from data.chain import ChainFilters, fetch_filtered_chain
 from db.repo import Repos
-from strategies.iron_condor import (
-    _build_legs as _build_condor_legs,
-)
-from strategies.iron_condor import (
-    _find_protective_long,
-    _pick_short_at_delta,
-    select_iron_condor,
-)
-from strategies.spread_selector import SpreadCandidate
 from strategies.spreads import (
-    DIRECTION_BEAR_CALL,
     DIRECTION_BULL_PUT,
-    DIRECTION_IRON_CONDOR,
     MultiLegProposal,
+    SpreadCandidate,
     _build_legs,
     _flip_action,
     _leg_quote,
     _make_chain_recorder,
     _open_order_for_position,
-    _tier_flags,
 )
 
 ET = ZoneInfo("America/New_York")
 
 STRUCTURE_NARROW_VERTICAL = "narrow_vertical"
-STRUCTURE_IRON_CONDOR = "iron_condor"
-
-# No news_check on zero_dte opens: the position lives ~5 hours inside a single
-# session and the macro-blackout risk rule already blocks event days (the
-# event-day gate the research recommends; which events, and whether only the
-# same day counts, are the strategy's macro_event_types / macro_same_day_only
-# params — see risk/limits.py). A headline read adds latency inside a
-# 15-minute entry window for little signal.
-NEWS_CHECK_PROFILE: str | None = None
-
 
 # -- time gates --------------------------------------------------------------
 
@@ -160,11 +138,11 @@ def _prior_close_sma(symbol: str, today: date, n_days: int) -> float | None:
     try:
         # Lazy import — the pandas/yfinance stack only loads when the strategy
         # is actually evaluating an entry.
-        from backtest.data import load_daily_yf
+        from data.yf_helpers import safe_history
 
-        daily = load_daily_yf(symbol, period="3mo")
+        daily = safe_history(symbol, period="3mo", interval="1d")
         closes = [
-            float(c) for ts, c in zip(daily.index, daily["close"], strict=True)
+            float(c) for ts, c in zip(daily.index, daily["Close"], strict=True)
             if (ts.date() if isinstance(ts, datetime) else ts) < today
         ] if len(daily) else []
         if len(closes) < n_days:
@@ -192,6 +170,32 @@ def _mid(bid: float | None, ask: float | None) -> float | None:
     return m if m > 0 else None
 
 
+def _pick_short_at_delta(
+    chain: list[OptionContract], *, target_abs_delta: float,
+) -> OptionContract | None:
+    """Closest contract to |delta| = target; None if nothing has a delta."""
+    scored = [c for c in chain if c.delta is not None]
+    if not scored:
+        return None
+    return min(scored, key=lambda c: abs(abs(c.delta) - target_abs_delta))
+
+
+def _find_long_put(
+    chain: list[OptionContract], short: OptionContract, *, width: float,
+) -> OptionContract | None:
+    """The protective long put `width` below the short: exact strike when
+    listed, else the nearest strike below the target, else the lowest strike
+    below the short. None when nothing quoted sits below the short."""
+    below = sorted(
+        (c for c in chain
+         if c.expiration == short.expiration and c.option_type == OptionType.PUT
+         and c.bid is not None and c.ask is not None and c.strike < short.strike),
+        key=lambda c: c.strike, reverse=True,
+    )
+    at_or_below = [c for c in below if c.strike <= short.strike - width]
+    return at_or_below[0] if at_or_below else (below[-1] if below else None)
+
+
 async def select_zero_dte_vertical(
     broker: Broker,
     symbol: str,
@@ -207,12 +211,10 @@ async def select_zero_dte_vertical(
     time left to the close; without it (pre-2026-10-19) T was 0 on expiry day,
     no contract got a delta and this returned None on every tick.
 
-    The existing vertical selectors (spread_selector / call_spread_selector)
-    rank shorts by annualized_yield, which is undefined at DTE 0 (divides by
-    DTE) — every candidate would be dropped. This selector adapts the iron
-    condor's delta-target approach instead: pick the short closest to the
-    midpoint of [short_delta_min, short_delta_max], wing it at
-    spread_width_dollars via the same protective-long finder.
+    Yield-ranked selection is undefined at DTE 0 (annualizing divides by
+    DTE), so this picks the short closest to the midpoint of
+    [short_delta_min, short_delta_max] and wings it spread_width_dollars
+    below.
 
     Defaults: 0.10-0.15 delta, $2 wide, credit floor 3% of width. At 10:00
     ET the ladder's 0.10-0.15 delta $5 spreads bid a median $0.12-0.21; a $2
@@ -227,9 +229,7 @@ async def select_zero_dte_vertical(
     width = float(params.get("spread_width_dollars", 2.0))
     min_credit_pct = float(params.get("min_credit_pct_of_width", 3.0))
     direction = DIRECTION_BULL_PUT
-
     side = "put"
-    opt_type = OptionType.PUT
     filters = ChainFilters(
         dte_min=0, dte_max=0,
         delta_min=delta_min, delta_max=delta_max,
@@ -260,7 +260,7 @@ async def select_zero_dte_vertical(
     full_chain = await fetch_filtered_chain(
         broker, symbol, side, wide, today=today, now=now,
     )
-    long = _find_protective_long(full_chain, short, wing_width=width, side=opt_type)
+    long = _find_long_put(full_chain, short, width=width)
     if long is None:
         log_checkpoint("zero_dte_no_long_wing", status="ok", symbol=symbol,
                        direction=direction, short_strike=short.strike)
@@ -432,19 +432,12 @@ async def _write_exit_ledger(
 # -- entry orchestrator ------------------------------------------------------
 
 
-def _sizing_quantity(
-    strategy: StrategyDefinition,
-    max_loss_per_spread: float,
-    *,
-    size_multiplier: float = 1.0,
-) -> int:
-    """floor(cap / max_loss); 0 = skip (never over-risk — audit #13 rule).
-    Reads max_capital_per_spread_usd for BOTH structures (the condor variant
-    shares the same defined-risk cap)."""
+def _sizing_quantity(strategy: StrategyDefinition, max_loss_per_spread: float) -> int:
+    """floor(cap / max_loss); 0 = skip (never over-risk — audit #13 rule)."""
     cap = float(strategy.params.get("max_capital_per_spread_usd", 0) or 0)
     if cap <= 0 or max_loss_per_spread <= 0:
         return 1
-    return int((cap * float(size_multiplier)) // max_loss_per_spread)
+    return int(cap // max_loss_per_spread)
 
 
 async def propose_for_symbol(
@@ -456,7 +449,6 @@ async def propose_for_symbol(
     *,
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
-    size_multiplier: float = 1.0,
     now: datetime | None = None,
     sma_ref: float | None = None,
 ) -> MultiLegProposal | None:
@@ -521,116 +513,67 @@ async def propose_for_symbol(
         cycle_id=position.current_cycle_id if position else None,
         strategy_id=strategy.id,
     )
-    structure = str(params.get("structure", STRUCTURE_NARROW_VERTICAL))
-
-    if structure == STRUCTURE_IRON_CONDOR:
-        # 10-15Δ shorts, $2-5 wings, 25% profit-take (research §5b variant 1).
-        condor_params = {
-            **params,
-            "dte_min": 0,
-            "dte_max": 0,
-            "short_put_delta_target": float(params.get("condor_short_delta_target", 0.12)),
-            "short_call_delta_target": float(params.get("condor_short_delta_target", 0.12)),
-            "wing_width": float(params.get("condor_wing_width_dollars", 3.0)),
-            "min_credit_pct": float(params.get("condor_min_credit_pct", 10.0)),
-        }
-        cand = await select_iron_condor(
-            broker, symbol, condor_params, today=today, record_chain=record, now=et,
-        )
-        if cand is None:
-            return None
-        quantity = _sizing_quantity(
-            strategy, cand.max_loss_per_spread, size_multiplier=size_multiplier,
-        )
-        if quantity <= 0:
-            log_checkpoint("zero_dte_skip_over_cap", status="skip", symbol=symbol,
-                           strategy=strategy.id, max_loss=cand.max_loss_per_spread)
-            return None
-        legs = _build_condor_legs(cand)
-        direction = DIRECTION_IRON_CONDOR
-        net_credit = cand.net_credit_per_spread
-        max_loss = cand.max_loss_per_spread
-        width = cand.wing_width_dollars
-        leg_quotes = [
-            (c.bid, c.ask)
-            for c in (cand.long_put, cand.short_put, cand.short_call, cand.long_call)
-        ]
-        rationale = (
-            f"zero_dte_condor[{strategy.id}] "
-            f"LP/SP={cand.long_put.strike}/{cand.short_put.strike} "
-            f"SC/LC={cand.short_call.strike}/{cand.long_call.strike} "
-            f"width={width:.2f} credit={net_credit:.2f} "
-            f"max_loss={max_loss:.2f} qty={quantity}"
-        )
-    elif structure == STRUCTURE_NARROW_VERTICAL:
-        # Trend gate: LIVE spot vs the N-day SMA of prior closes, read at
-        # entry (trend_sma_days, default 20; 0 disables). Fails closed — no
-        # spot or no SMA means no entry.
-        try:
-            q: Quote = await broker.get_quote(symbol)
-            spot = q.mid if q.mid is not None else (q.last or q.bid or q.ask)
-        except Exception:
-            spot = None
-        if spot is None:
-            log_checkpoint("zero_dte_skip_no_spot", status="ok", symbol=symbol)
-            return None
-        sma_days = int(params.get("trend_sma_days", 20))
-        sma: float | None = None
-        if sma_days > 0:
-            sma = sma_ref if sma_ref is not None else _prior_close_sma(symbol, today, sma_days)
-            if sma is None:
-                log_checkpoint("zero_dte_skip_no_sma", status="skip", symbol=symbol,
-                               strategy=strategy.id, sma_days=sma_days)
-                return None
-            if not above_trend(float(spot), float(sma)):
-                log_checkpoint("zero_dte_skip_downtrend", status="ok", symbol=symbol,
-                               strategy=strategy.id, spot=round(float(spot), 2),
-                               sma=round(float(sma), 2), sma_days=sma_days)
-                return None
-        direction = DIRECTION_BULL_PUT
-        cand_v = await select_zero_dte_vertical(
-            broker, symbol, params, today=today, record_chain=record, now=et,
-        )
-        if cand_v is None:
-            return None
-        quantity = _sizing_quantity(
-            strategy, cand_v.max_loss_per_spread, size_multiplier=size_multiplier,
-        )
-        if quantity <= 0:
-            log_checkpoint("zero_dte_skip_over_cap", status="skip", symbol=symbol,
-                           strategy=strategy.id, max_loss=cand_v.max_loss_per_spread)
-            return None
-        legs = _build_legs(cand_v)
-        net_credit = cand_v.net_credit_per_spread
-        max_loss = cand_v.max_loss_per_spread
-        width = cand_v.width_dollars
-        leg_quotes = [(cand_v.short.bid, cand_v.short.ask), (cand_v.long.bid, cand_v.long.ask)]
-        trend = f"sma{sma_days}={float(sma):.2f} " if sma is not None else ""
-        rationale = (
-            f"zero_dte_{direction}[{strategy.id}] spot={float(spot):.2f} "
-            f"{trend}short={cand_v.short.strike} "
-            f"long={cand_v.long.strike} width={width:.2f} "
-            f"credit={net_credit:.2f} max_loss={max_loss:.2f} qty={quantity} "
-            f"(wing-is-the-stop)"
-        )
-    else:
-        log_checkpoint("zero_dte_unknown_structure", status="fail",
-                       symbol=symbol, strategy=strategy.id, structure=structure)
+    # Trend gate: LIVE spot vs the N-day SMA of prior closes, read at
+    # entry (trend_sma_days, default 20; 0 disables). Fails closed — no
+    # spot or no SMA means no entry.
+    try:
+        q: Quote = await broker.get_quote(symbol)
+        spot = q.mid if q.mid is not None else (q.last or q.bid or q.ask)
+    except Exception:
+        spot = None
+    if spot is None:
+        log_checkpoint("zero_dte_skip_no_spot", status="ok", symbol=symbol)
         return None
+    sma_days = int(params.get("trend_sma_days", 20))
+    sma: float | None = None
+    if sma_days > 0:
+        sma = sma_ref if sma_ref is not None else _prior_close_sma(symbol, today, sma_days)
+        if sma is None:
+            log_checkpoint("zero_dte_skip_no_sma", status="skip", symbol=symbol,
+                           strategy=strategy.id, sma_days=sma_days)
+            return None
+        if not above_trend(float(spot), float(sma)):
+            log_checkpoint("zero_dte_skip_downtrend", status="ok", symbol=symbol,
+                           strategy=strategy.id, spot=round(float(spot), 2),
+                           sma=round(float(sma), 2), sma_days=sma_days)
+            return None
+    direction = DIRECTION_BULL_PUT
+    cand_v = await select_zero_dte_vertical(
+        broker, symbol, params, today=today, record_chain=record, now=et,
+    )
+    if cand_v is None:
+        return None
+    quantity = _sizing_quantity(strategy, cand_v.max_loss_per_spread)
+    if quantity <= 0:
+        log_checkpoint("zero_dte_skip_over_cap", status="skip", symbol=symbol,
+                       strategy=strategy.id, max_loss=cand_v.max_loss_per_spread)
+        return None
+    legs = _build_legs(cand_v)
+    net_credit = cand_v.net_credit_per_spread
+    max_loss = cand_v.max_loss_per_spread
+    width = cand_v.width_dollars
+    leg_quotes = [(cand_v.short.bid, cand_v.short.ask), (cand_v.long.bid, cand_v.long.ask)]
+    trend = f"sma{sma_days}={float(sma):.2f} " if sma is not None else ""
+    rationale = (
+        f"zero_dte_{direction}[{strategy.id}] spot={float(spot):.2f} "
+        f"{trend}short={cand_v.short.strike} "
+        f"long={cand_v.long.strike} width={width:.2f} "
+        f"credit={net_credit:.2f} max_loss={max_loss:.2f} qty={quantity} "
+        f"(wing-is-the-stop)"
+    )
 
     # Dual-ledger entry write at proposal-time quotes (phase 2: reconcile
     # against the actual fill via the reconciler flow).
     await _write_entry_ledger(
         repos,
         symbol=symbol,
-        structure=structure,
+        structure=STRUCTURE_NARROW_VERTICAL,
         quantity=quantity,
         credit_raw=net_credit,
         spread_width_quotes=_legs_spread_width_quotes(leg_quotes),
         now=now,
     )
 
-    needs_screen, needs_human = _tier_flags(symbol, universe)
     return MultiLegProposal(
         symbol=symbol,
         legs=legs,
@@ -640,10 +583,7 @@ async def propose_for_symbol(
         quantity=quantity,
         rationale=rationale,
         strategy_id=strategy.id,
-        requires_screen=needs_screen,
-        requires_human=needs_human,
         direction=direction,
-        news_check_profile=NEWS_CHECK_PROFILE,
     )
 
 
@@ -655,15 +595,13 @@ async def propose_all(
     *,
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
-    size_multiplier: float = 1.0,
     now: datetime | None = None,
 ) -> list[MultiLegProposal]:
     out: list[MultiLegProposal] = []
     for entry in universe["tickers"]:
         proposal = await propose_for_symbol(
             broker, repos, entry.symbol, config, universe,
-            today=today, strategy=strategy,
-            size_multiplier=size_multiplier, now=now,
+            today=today, strategy=strategy, now=now,
         )
         if proposal is not None:
             out.append(proposal)
@@ -694,10 +632,9 @@ async def propose_close_for_symbol(
        broad-based ETFs like SPY) and force-liquidates expiring positions at
        15:30/15:45 ET — missing our own flatten hands the exit to Alpaca's
        liquidation engine at whatever the market gives (research §3.4).
-    2. Profit take at profit_close_pct of the original credit (condor 25 /
-       vertical 50 defaults).
+    2. Profit take at profit_close_pct of the original credit (default 50).
 
-    NO stop trigger by design: for the narrow vertical THE WING IS THE STOP —
+    NO stop trigger by design: THE WING IS THE STOP —
     max loss is structural, which is precisely what makes this paper test
     credible (no simulated stop fills to flatter, research §3.3/§5b).
     """
@@ -719,12 +656,8 @@ async def propose_close_for_symbol(
     if not legs_raw:
         return None
 
-    structure = str(params.get("structure", STRUCTURE_NARROW_VERTICAL))
-    close_legs: list[OrderLeg] = []
-    has_put = False
-    has_call = False
-    for leg in legs_raw:
-        ol = OrderLeg(
+    close_legs = [
+        OrderLeg(
             contract_symbol=leg["contract_symbol"],
             underlying=leg["underlying"],
             option_type=leg["option_type"],
@@ -733,17 +666,8 @@ async def propose_close_for_symbol(
             action=_flip_action(OrderType(leg["action"])),
             ratio_qty=leg.get("ratio_qty", 1),
         )
-        close_legs.append(ol)
-        if str(leg["option_type"]) == OptionType.PUT.value:
-            has_put = True
-        else:
-            has_call = True
-    if has_put and has_call:
-        direction = DIRECTION_IRON_CONDOR
-    elif has_call:
-        direction = DIRECTION_BEAR_CALL
-    else:
-        direction = DIRECTION_BULL_PUT
+        for leg in legs_raw
+    ]
 
     # Re-quote each leg: MID drives the DECISION, BID/ASK drive the ORDER
     # price so the close is marketable and fills (same convention as
@@ -775,21 +699,9 @@ async def propose_close_for_symbol(
             marketable_debit -= bid
 
     # Hard-clamp the close debit at the wing width (2026-07-23 TSLA lesson —
-    # paying more than the structure's worst settlement value is irrational).
-    put_strikes = sorted(
-        float(ol.strike) for ol in close_legs
-        if str(ol.option_type) == OptionType.PUT.value
-    )
-    call_strikes = sorted(
-        float(ol.strike) for ol in close_legs
-        if str(ol.option_type) == OptionType.CALL.value
-    )
-    widths = []
-    if len(put_strikes) >= 2:
-        widths.append(put_strikes[-1] - put_strikes[0])
-    if len(call_strikes) >= 2:
-        widths.append(call_strikes[-1] - call_strikes[0])
-    max_close_debit = max(widths) if widths else None
+    # paying more than the spread's worst settlement value is irrational).
+    strikes = sorted(float(ol.strike) for ol in close_legs)
+    max_close_debit = strikes[-1] - strikes[0] if len(strikes) >= 2 else None
     if max_close_debit is not None and marketable_debit > max_close_debit:
         log_checkpoint("zero_dte_close_debit_clamped", status="ok",
                        symbol=symbol, strategy=strategy.id,
@@ -798,8 +710,7 @@ async def propose_close_for_symbol(
         marketable_debit = max_close_debit
 
     original_credit = open_order.fill_price or 0.0
-    default_profit_pct = 25.0 if structure == STRUCTURE_IRON_CONDOR else 50.0
-    profit_close_pct = float(params.get("profit_close_pct", default_profit_pct))
+    profit_close_pct = float(params.get("profit_close_pct", 50.0))
     target_max_debit = (1 - profit_close_pct / 100.0) * original_credit
 
     flatten_trigger = past_flatten(params, now)
@@ -849,7 +760,7 @@ async def propose_close_for_symbol(
         rationale=rationale,
         strategy_id=strategy.id,
         order_type=OrderType.MULTI_LEG_CLOSE,
-        direction=direction,
+        direction=DIRECTION_BULL_PUT,
     )
 
 

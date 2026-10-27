@@ -21,6 +21,13 @@ Threshold lookup order (per strategy):
   2. profit_close_pct (legacy single param — backwards compat)
   3. default 50
 
+Earnings (2026-10-27): a CSP whose remaining hold now overlaps an earnings
+window closes here like any other trigger. This replaced risk/earnings_recheck,
+which flagged such positions MANUAL_INTERVENTION — leaving them unmanaged
+exactly when risk peaked (HOOD and INTC rode earnings that way in Oct 2026).
+CC_OPEN is exempt: the earnings risk sits in the shares, and buying back the
+call would not reduce it.
+
 Out of scope (handled elsewhere):
   - Defensive rolls — strategies/roll_orchestrator.py fires on losing positions
   - Order placement / risk gate — execution/router.py + risk/limits.py
@@ -29,6 +36,7 @@ Out of scope (handled elsewhere):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
 from typing import Any
 
@@ -45,6 +53,8 @@ from core.models import (
 )
 from core.notify import notify
 from core.strategies import StrategyDefinition
+from data.earnings import EarningsLookup, earnings_overlaps_hold
+from data.earnings import next_earnings as default_next_earnings
 from data.greeks import fill_greeks
 from db.repo import Repos
 from strategies.wheel import Proposal
@@ -158,6 +168,32 @@ async def _quote_mid(broker: Broker, contract_symbol: str) -> float | None:
     return q.last or q.bid or q.ask
 
 
+def _earnings_in_hold(
+    params: dict[str, Any],
+    symbol: str,
+    expiration: date,
+    today: date,
+    next_earnings_fn: Callable[[str], EarningsLookup],
+) -> date | None:
+    """The upcoming earnings date when it falls inside this position's
+    remaining hold (same predicate and window as the entry gate:
+    earnings_blackout_days_before/after, hold = until the time-close), else
+    None. A provider miss is None — no data never forces a close."""
+    lookup = next_earnings_fn(symbol)
+    earnings = lookup.next_date
+    if earnings is None or earnings < today:
+        return None
+    exposed = earnings_overlaps_hold(
+        earnings,
+        today=today,
+        expiration=expiration,
+        time_close_dte=int(params.get("time_close_dte") or 0),
+        days_before=int(params.get("earnings_blackout_days_before", 5)),
+        days_after=int(params.get("earnings_blackout_days_after", 2)),
+    )
+    return earnings if exposed else None
+
+
 async def propose_close_for_position(
     broker: Broker,
     repos: Repos,
@@ -167,6 +203,8 @@ async def propose_close_for_position(
     strategy: StrategyDefinition | None = None,
     has_inflight: bool = False,
     delta_unavailable_counters: dict[int, int] | None = None,
+    next_earnings_fn: Callable[[str], EarningsLookup] | None = None,
+    earnings_params: dict[str, Any] | None = None,
 ) -> Proposal | None:
     """Build a BUY_TO_CLOSE proposal when any close trigger fires.
 
@@ -181,6 +219,8 @@ async def propose_close_for_position(
          before the underlying drops further. Set to 0/None to disable.
          CCs are intentionally excluded — called-away is the wheel's goal,
          not a loss to stop out of; CC management is its own decision.
+      4. Earnings (2026-10-27, CSP-only) — the upcoming earnings date now
+         falls inside the remaining hold (see module docstring).
 
     Returns None when no trigger fires (or when quote / order data is missing).
     """
@@ -248,6 +288,15 @@ async def propose_close_for_position(
             stop_threshold_mid = stop_loss_mult * original_premium
             stop_trigger = current_mid >= stop_threshold_mid
 
+    # Earnings trigger — CSP only; the lookup is cached (data/earnings, 6h).
+    earnings_date: date | None = None
+    if position.state == PositionState.CSP_OPEN and not (profit_trigger or stop_trigger):
+        earnings_date = _earnings_in_hold(
+            earnings_params or strategy.params, position.symbol, short_order.expiration, today,
+            next_earnings_fn or default_next_earnings,
+        )
+    earnings_trigger = earnings_date is not None
+
     # Delta-stop trigger (TICKET-005) — CSP only (CCs target called-away).
     # Computed AFTER the mid-based checks so the broker quote calls happen only
     # when the cheaper checks haven't already fired. Delta is fetched fresh
@@ -263,7 +312,7 @@ async def propose_close_for_position(
         position.state == PositionState.CSP_OPEN
         and delta_threshold_raw is not None
         and float(delta_threshold_raw) > 0
-        and not (profit_trigger or time_trigger or stop_trigger)
+        and not (profit_trigger or time_trigger or stop_trigger or earnings_trigger)
     ):
         current_delta = await _current_short_delta(broker, position, short_order, today)
         if current_delta is None:
@@ -372,6 +421,7 @@ async def propose_close_for_position(
         profit_trigger
         or time_trigger
         or stop_trigger
+        or earnings_trigger
         or delta_stop_close_trigger
         or delta_stop_fallback_trigger
     ):
@@ -384,6 +434,8 @@ async def propose_close_for_position(
         trigger_reason = "profit"
     elif stop_trigger:
         trigger_reason = "stop_loss"
+    elif earnings_trigger:
+        trigger_reason = "earnings"
     elif delta_stop_close_trigger:
         trigger_reason = "delta_stop_close"
     elif delta_stop_fallback_trigger:
@@ -415,6 +467,8 @@ async def propose_close_for_position(
             f"stop_loss mid={current_mid:.2f} ≥ threshold {stop_threshold_mid:.2f} "
             f"(orig {original_premium:.2f}, mult={stop_loss_mult:.1f}×)"
         )
+    if earnings_trigger:
+        rationale_parts.append(f"earnings {earnings_date} inside the remaining hold")
     if delta_stop_close_trigger or delta_stop_fallback_trigger:
         rationale_parts.append(
             f"delta_stop |delta|={current_delta:.2f} ≥ "
@@ -439,6 +493,7 @@ async def propose_close_for_position(
         profit_trigger=profit_trigger,
         time_trigger=time_trigger,
         stop_trigger=stop_trigger,
+        earnings_date=str(earnings_date) if earnings_date else None,
         delta_stop_close_trigger=delta_stop_close_trigger,
         delta_stop_fallback_trigger=delta_stop_fallback_trigger,
         delta=current_delta,
@@ -502,6 +557,10 @@ async def propose_all_closes(
         if o.status in (OrderStatus.PENDING, OrderStatus.PARTIAL)
     }
 
+    # Earnings window knobs live in the shared `wheel:` block; the strategy's
+    # own params (time_close_dte, overrides) win.
+    earnings_params = strategy.merged_wheel_params(config.get("wheel") or {})
+
     out: list[Proposal] = []
     for pos in active:
         if pos.state not in (PositionState.CSP_OPEN, PositionState.CC_OPEN):
@@ -525,6 +584,7 @@ async def propose_all_closes(
             today=today, strategy=strategy,
             has_inflight=pos_inflight,
             delta_unavailable_counters=delta_unavailable_counters,
+            earnings_params=earnings_params,
         )
         if proposal is not None:
             out.append(proposal)

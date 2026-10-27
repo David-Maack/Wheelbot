@@ -113,7 +113,6 @@ async def test_roll_executes_btc_then_sto():
             new_contract=_new_contract(),
             expected_credit_per_share=0.40,
         ),
-        llm=None,
         halted=False,
         reason="rule_only",
     )
@@ -133,7 +132,6 @@ async def test_close_executes_btc_only():
     outcome = RollOutcome(
         action=RollAction.CLOSE,
         rule=RollDecision(action=RollAction.CLOSE, rationale="cut losses"),
-        llm=None,
         halted=False,
         reason="rule_only",
     )
@@ -150,7 +148,6 @@ async def test_let_assign_is_a_noop():
     outcome = RollOutcome(
         action=RollAction.LET_ASSIGN,
         rule=RollDecision(action=RollAction.LET_ASSIGN, rationale="take shares"),
-        llm=None,
         halted=False,
         reason="rule_only",
     )
@@ -182,7 +179,6 @@ async def test_btc_router_failure_aborts_sto():
             new_contract=_new_contract(),
             expected_credit_per_share=0.40,
         ),
-        llm=None,
         halted=False,
         reason="rule_only",
     )
@@ -205,7 +201,6 @@ async def test_quantity_propagates_from_short_order():
             new_contract=_new_contract(),
             expected_credit_per_share=0.40,
         ),
-        llm=None,
         halted=False,
         reason="rule_only",
     )
@@ -240,7 +235,6 @@ async def test_strategy_id_propagates_from_position():
             new_contract=_new_contract(),
             expected_credit_per_share=0.40,
         ),
-        llm=None,
         halted=False,
         reason="rule_only",
     )
@@ -273,7 +267,6 @@ async def test_roll_sto_skipped_when_kill_switch_armed():
             action=RollAction.ROLL, rationale="credit roll",
             new_contract=_new_contract(), expected_credit_per_share=0.10,
         ),
-        llm=None,
         halted=False,
         reason="rule_only",
     )

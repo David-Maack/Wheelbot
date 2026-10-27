@@ -42,29 +42,9 @@ class Proposal:
     quantity: int
     rationale: str  # short human-readable, e.g. "csp 30d delta 0.24 yield 0.32"
     strategy_id: str = "monthly_wheel"
-    requires_screen: bool = False  # tier 2
-    requires_human: bool = False  # tier 3
     # Structured close-reason tag for BUY_TO_CLOSE proposals (TICKET-005).
     # Plumbed through the router into orders.trigger_reason. None for entries.
     trigger_reason: str | None = None
-    # TICKET-015: per-strategy news_check prompt profile for single-leg opens.
-    # None (default) = legacy behavior: news_check fires only on the wheel CSP
-    # path (SELL_TO_OPEN + PUT) using bullish_csp. When set (PMCC long uses
-    # "bullish_long"), the router fires news_check on that open with the named
-    # profile. Mirrors MultiLegProposal.news_check_profile.
-    news_check_profile: str | None = None
-    # Sub-sprint 2.2b: arbitrary entry context plumbed onto the resulting Order's
-    # raw_request. Swing stashes its SPY-level exit anchors (entry_spot / stop /
-    # target / entry_date) here so the close orchestrator recovers them via
-    # latest_filled_order — keeping the exit math anchored to entry.
-    raw_request: dict[str, Any] | None = None
-
-
-def _tier_flags(symbol: str, universe: dict[str, Any]) -> tuple[bool, bool]:
-    for entry in universe["tickers"]:
-        if entry.symbol.upper() == symbol.upper():
-            return (entry.tier == 2, entry.tier == 3)
-    return (False, False)
 
 
 def _build_proposal(
@@ -75,7 +55,6 @@ def _build_proposal(
     strategy_id: str,
     quantity: int = 1,
 ) -> Proposal:
-    needs_screen, needs_human = _tier_flags(symbol, universe)
     return Proposal(
         symbol=symbol,
         contract=contract,
@@ -83,8 +62,6 @@ def _build_proposal(
         quantity=quantity,
         rationale=rationale,
         strategy_id=strategy_id,
-        requires_screen=needs_screen,
-        requires_human=needs_human,
     )
 
 
@@ -229,19 +206,7 @@ async def propose_all(
     *,
     today: date | None = None,
     strategy: StrategyDefinition | None = None,
-    size_multiplier: float = 1.0,
 ) -> list[Proposal]:
-    # TICKET-008: wheels can't halve at qty=1 (single-contract baseline at
-    # this account size). Log once per call so the limitation is visible in
-    # the audit trail without spamming on every position iteration.
-    if size_multiplier < 1.0:
-        log_checkpoint(
-            "wheel_warning_size_unhalved",
-            status="ok",
-            strategy=strategy.id if strategy else "default",
-            size_multiplier=size_multiplier,
-            note="wheel qty=1 cannot halve — entries proceed at full size",
-        )
     out: list[Proposal] = []
     universe_symbols = {t.symbol.upper() for t in universe["tickers"]}
 

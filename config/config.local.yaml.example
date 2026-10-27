@@ -31,27 +31,13 @@ risk:
   # switch. Base value is also 5%; this is a defensive pin, not a tighten.
   daily_loss_kill_switch_pct: 5
 
-  # Raise from base config (3). Three consecutive losses is too tight for
-  # the paper bring-up window; 5 is the floor that catches broken strategies
-  # without tripping on normal variance. Layered with drawdown breaker
-  # (auto_disable.py, -$300 7d) and win-rate floor (win_rate_floor.py, 60%
-  # over 10 cycles), this is the third-line defense.
-  consecutive_losses_pause: 5
+  # (consecutive_losses_pause and the intelligence block were removed in the
+  # 2026-10-27 two-strategy cleanup — delete them from a live config.local.)
 
-intelligence:
-  # Pin enabled to match the actual live state. The screener (Opus, daily
-  # cron) runs in Phase 1 too — the data value during paper-bring-up
-  # dominates the ~$0.40/day cost.
-  llm_screener_enabled: true
-  # llm_news_check_enabled and llm_roll_advisor_enabled inherit from base
-  # config.yaml (true and false respectively); do not duplicate here unless
-  # you intend to override.
-
-# Stage 1 — flip news_check from advisory (paper) to enforcing.
-# Uncomment when entering Stage 1 per runbook:
-#
-# intelligence:
-#   news_check_advisory: false
+# Strategies that may not OPEN (closes still run). zero_dte stays listed until
+# GO_LIVE_RUNBOOK Stage 1 — delete it from this list to start the paper
+# scorecard run.
+disabled_strategies: [zero_dte]
 
 # Stage 3 — Tastytrade live with 1/4 capital. Apply the diff in one deploy:
 #
@@ -66,5 +52,5 @@ intelligence:
 # Stage 4 — full size. Restore caps:
 #
 # account:
-#   max_concurrent_total: 14
+#   max_concurrent_total: 6
 # # per-strategy max_position_pct_of_account back to base (30)

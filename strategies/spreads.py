@@ -1,59 +1,24 @@
-"""Vertical credit-spread orchestrator.
+"""Shared multi-leg (vertical spread) types and helpers.
 
-Mirrors strategies/wheel.py shape but produces MultiLegProposal — a defined-
-risk package the router submits via broker.place_multi_leg_order.
-
-Two directions supported:
-  - `bull_put` (sprint 9): short higher-strike put + long lower-strike put.
-    Profits when underlying stays flat or rises. Regime gate: csps_allowed.
-  - `bear_call` (sprint 10): short lower-strike call + long higher-strike call.
-    Profits when underlying stays flat or falls. Regime gate: bear_calls_allowed.
-
-Direction is read from `strategy.params["direction"]` (default `bull_put`
-for backwards compatibility with the existing put_spread config). Both
-share the close orchestrator, sizing logic, and reconciliation path —
-they only differ in selector and risk-gate flag.
-
-Out of scope here (lives in risk/limits.py and execution/router.py):
-  - Buying-power floor, concurrent-cap, earnings blackout
-  - Order placement, idempotency, retries
-  - Reconciliation (multi-leg fill → SPREAD_OPEN)
+Since the 2026-10-27 two-strategy cleanup the only multi-leg strategy is
+zero_dte (a same-day bull put spread); the 30-45 DTE put_spread /
+narrow_put_spread / bear_call_spread orchestrators that used to live here
+were removed. What stays is what zero_dte, the router, the risk gate and the
+reconciler share: the MultiLegProposal package, the selected-spread
+candidate, leg building, chain recording, and the close-path helpers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from core.broker import Broker
-from core.checkpoint import log_checkpoint
-from core.models import (
-    ChainSnapshot,
-    OptionContract,
-    OptionType,
-    OrderLeg,
-    OrderType,
-    PositionState,
-    Quote,
-)
-from core.strategies import StrategyDefinition
-from data.ivr import IVRProvider
+from core.models import ChainSnapshot, OptionContract, OrderLeg, OrderType, Quote
 from db.repo import Repos
-from strategies.call_spread_selector import select_bear_call_spread
-from strategies.spread_selector import SpreadCandidate, select_bull_put_spread
 
-# Direction labels — match the values used in config.yaml strategy.params.direction.
 DIRECTION_BULL_PUT = "bull_put"
-DIRECTION_BEAR_CALL = "bear_call"
-# TICKET-014 precursor: iron condor combines bull put + bear call wings on the
-# same expiration. The regime gate AND-combines csps_allowed + bear_calls_allowed
-# for this value — see risk/limits.py::_rule_regime_multi_leg.
-DIRECTION_IRON_CONDOR = "iron_condor"
-# TICKET-016: calendar spread — same-strike, two expirations, net DEBIT. The
-# regime gate treats it like iron_condor (AND-combine = NEUTRAL); the LOW-IV
-# requirement is enforced separately by the selector's inverted IVR gate.
-DIRECTION_CALENDAR = "calendar"
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,28 +37,20 @@ class MultiLegProposal:
     width_dollars: float            # |short - long| strike, in dollars (always positive)
     quantity: int
     rationale: str
-    strategy_id: str = "put_spread"
+    strategy_id: str = "zero_dte"
     # Treated as MULTI_LEG_OPEN at submission. Closes are a separate proposal.
     order_type: OrderType = OrderType.MULTI_LEG_OPEN
-    requires_screen: bool = False   # tier 2
-    requires_human: bool = False    # tier 3
-    # Spread direction — drives regime-gate flag selection in risk/limits.py.
-    # Defaults to bull_put for backwards-compat with existing put_spread proposals.
     direction: str = DIRECTION_BULL_PUT
-    # TICKET-014: per-strategy news_check prompt profile. When None, the router
-    # does NOT fire news_check on this proposal — preserves existing put_spread
-    # and bear_call_spread behavior (no news_check on their opens). When set
-    # to one of the PROFILE_PROMPTS keys (bullish_csp, bullish_long, neutral_range,
-    # neutral_pin), the router fires news_check with that prompt and applies the
-    # standard caution/block handling.
-    news_check_profile: str | None = None
 
 
-def _tier_flags(symbol: str, universe: dict[str, Any]) -> tuple[bool, bool]:
-    for entry in universe["tickers"]:
-        if entry.symbol.upper() == symbol.upper():
-            return (entry.tier == 2, entry.tier == 3)
-    return (False, False)
+@dataclass(frozen=True, slots=True)
+class SpreadCandidate:
+    short: OptionContract
+    long: OptionContract
+    net_credit_per_spread: float    # dollars per share, positive = credit
+    max_loss_per_spread: float      # dollars total per package
+    width_dollars: float            # short.strike - long.strike, positive
+    short_yield: float              # annualized yield of the short leg (0 at DTE 0)
 
 
 def _make_chain_recorder(
@@ -131,11 +88,7 @@ def _make_chain_recorder(
 
 
 def _build_legs(candidate: SpreadCandidate) -> list[OrderLeg]:
-    """Short leg sells to open, long leg buys to open.
-
-    Direction-agnostic: the selector enforces strike relationships
-    (puts: short > long; calls: short < long).
-    """
+    """Short leg sells to open, long leg buys to open."""
     return [
         OrderLeg(
             contract_symbol=candidate.short.occ_symbol,
@@ -158,173 +111,7 @@ def _build_legs(candidate: SpreadCandidate) -> list[OrderLeg]:
     ]
 
 
-def _sizing_quantity(
-    strategy: StrategyDefinition,
-    config: dict[str, Any],
-    candidate: SpreadCandidate,
-    *,
-    size_multiplier: float = 1.0,
-) -> int:
-    """Contracts per package given per-strategy capital cap.
-
-    Uses `max_capital_per_spread_usd` from strategy.params if present;
-    otherwise falls back to a single contract. Defined risk = max_loss_per_spread.
-
-    `size_multiplier` (TICKET-008) scales the effective capital cap. In
-    WARNING state (multiplier=0.5), a spread whose max_loss exceeds half the
-    cap gets qty=0 → skipped. This is the practical mechanism that "halves
-    spread sizes" — for our $500 cap and ~$365 typical max_loss, halving the
-    cap to $250 means no new spreads open at all while in WARNING. That is
-    the intended protection: stop digging.
-
-    Returns 0 when a single spread's defined risk already exceeds the cap — the
-    caller must SKIP rather than trade one anyway. Flooring at 1 (the old
-    behaviour) silently blew through the per-spread capital limit, which is
-    especially dangerous on a small bankroll.
-    """
-    cap = float(strategy.params.get("max_capital_per_spread_usd", 0) or 0)
-    if cap <= 0 or candidate.max_loss_per_spread <= 0:
-        # No cap configured (or undefined risk) — default to a single contract.
-        return 1
-    effective_cap = cap * float(size_multiplier)
-    return int(effective_cap // candidate.max_loss_per_spread)
-
-
-async def propose_for_symbol(
-    broker: Broker,
-    repos: Repos,
-    symbol: str,
-    config: dict[str, Any],
-    universe: dict[str, Any],
-    *,
-    today: date | None = None,
-    strategy: StrategyDefinition | None = None,
-    ivr: IVRProvider | None = None,
-    size_multiplier: float = 1.0,
-) -> MultiLegProposal | None:
-    today = today or date.today()
-    account_id = config.get("account", {}).get("id", "primary")
-    if strategy is None:
-        log_checkpoint("spread_skip_no_strategy", status="fail", symbol=symbol)
-        return None
-    strategy_id = strategy.id
-
-    position = await repos.positions.get_by_symbol(account_id, symbol, strategy_id=strategy_id)
-    state = position.state if position else PositionState.IDLE
-
-    # Only propose when flat. Open spreads close via separate proposals.
-    if state not in (PositionState.IDLE, PositionState.SPREAD_CLOSED):
-        log_checkpoint(
-            "spread_skip_state",
-            status="ok",
-            symbol=symbol,
-            strategy=strategy_id,
-            state=str(state),
-        )
-        return None
-
-    record = _make_chain_recorder(
-        repos,
-        cycle_id=position.current_cycle_id if position else None,
-        strategy_id=strategy_id,
-    )
-
-    direction = str(strategy.params.get("direction", DIRECTION_BULL_PUT))
-    if direction == DIRECTION_BEAR_CALL:
-        candidate = await select_bear_call_spread(
-            broker, symbol, strategy.params, today=today, record_chain=record, ivr=ivr,
-        )
-    elif direction == DIRECTION_BULL_PUT:
-        candidate = await select_bull_put_spread(
-            broker, symbol, strategy.params, today=today, record_chain=record, ivr=ivr,
-        )
-    else:
-        log_checkpoint(
-            "spread_unknown_direction",
-            status="fail",
-            symbol=symbol,
-            strategy=strategy_id,
-            direction=direction,
-        )
-        return None
-    if candidate is None:
-        return None
-
-    quantity = _sizing_quantity(strategy, config, candidate, size_multiplier=size_multiplier)
-    if quantity <= 0:
-        # One spread's defined risk exceeds the per-spread capital cap — skip
-        # rather than over-risk the account (or emit a 0-qty order the broker
-        # would reject).
-        log_checkpoint(
-            "spread_skip_over_cap",
-            status="skip",
-            symbol=symbol,
-            strategy=strategy_id,
-            max_loss=candidate.max_loss_per_spread,
-            cap=float(strategy.params.get("max_capital_per_spread_usd", 0) or 0),
-        )
-        return None
-    legs = _build_legs(candidate)
-    needs_screen, needs_human = _tier_flags(symbol, universe)
-    rationale = (
-        f"{direction}[{strategy_id}] short={candidate.short.strike} "
-        f"long={candidate.long.strike} width={candidate.width_dollars:.2f} "
-        f"credit={candidate.net_credit_per_spread:.2f} "
-        f"max_loss={candidate.max_loss_per_spread:.2f} qty={quantity}"
-    )
-    return MultiLegProposal(
-        symbol=symbol,
-        legs=legs,
-        net_credit_per_spread=candidate.net_credit_per_spread,
-        max_loss_per_spread=candidate.max_loss_per_spread,
-        width_dollars=candidate.width_dollars,
-        quantity=quantity,
-        rationale=rationale,
-        strategy_id=strategy_id,
-        requires_screen=needs_screen,
-        requires_human=needs_human,
-        direction=direction,
-        # 2026-07-01 audit: bull-put OPENS previously bypassed news_check
-        # entirely (profile None → router skips), while condor/calendar/pmcc/
-        # swing were checked — backwards relative to risk. A bull put has the
-        # same negative-catalyst exposure as a CSP; the negative-news veto is
-        # the most robust surviving LLM-sentiment effect (Lopez-Lira v6), and
-        # "block" cancels even in advisory mode. Bear calls stay unchecked
-        # (bearish structure; the bullish prompt doesn't apply).
-        news_check_profile="bullish_csp" if direction == "bull_put" else None,
-    )
-
-
-async def propose_all(
-    broker: Broker,
-    repos: Repos,
-    config: dict[str, Any],
-    universe: dict[str, Any],
-    *,
-    today: date | None = None,
-    strategy: StrategyDefinition | None = None,
-    ivr: IVRProvider | None = None,
-    size_multiplier: float = 1.0,
-) -> list[MultiLegProposal]:
-    out: list[MultiLegProposal] = []
-    for entry in universe["tickers"]:
-        proposal = await propose_for_symbol(
-            broker, repos, entry.symbol, config, universe,
-            today=today, strategy=strategy, ivr=ivr,
-            size_multiplier=size_multiplier,
-        )
-        if proposal is not None:
-            out.append(proposal)
-    log_checkpoint(
-        "spread_propose_all",
-        status="ok",
-        strategy=strategy.id if strategy else "default",
-        n_proposals=len(out),
-    )
-    return out
-
-
-# -- Close orchestrator -----------------------------------------------------
+# -- close-path helpers ------------------------------------------------------
 
 
 async def _open_order_for_position(repos: Repos, position_id: int) -> Any:
@@ -344,8 +131,8 @@ async def _open_order_for_position(repos: Repos, position_id: int) -> Any:
         row = await cur.fetchone()
     if row is None:
         return None
-    from db.repo import _row_to_dict, JSON_FIELDS_BY_TABLE
     from core.models import Order
+    from db.repo import JSON_FIELDS_BY_TABLE, _row_to_dict
 
     return Order(**_row_to_dict(row, JSON_FIELDS_BY_TABLE["orders"]))
 
@@ -367,258 +154,3 @@ async def _leg_quote(broker: Broker, symbol: str) -> Quote | None:
         return await broker.get_quote(symbol)
     except Exception:
         return None
-
-
-async def _close_pricing(
-    broker: Broker, legs: list[OrderLeg]
-) -> tuple[float, float] | None:
-    """Dual pricing for a multi-leg CLOSE: (mid_debit, marketable_debit) per
-    share, or None when any leg lacks a two-sided quote (caller skips).
-
-    Sign convention: positive = we PAY a debit to close (a net-credit close
-    comes back negative). The MID figure is fair value and drives the close
-    DECISION; the MARKETABLE figure crosses the spread — buy legs at the ask,
-    sell legs at the bid — and drives the ORDER LIMIT so the close actually
-    fills instead of cancel-looping behind wide quotes. Shared by the vertical
-    /condor close path and calendar_close (which allows 20% quote spreads,
-    where a mid-priced limit never crosses)."""
-    mid_debit = 0.0
-    marketable_debit = 0.0
-    for leg in legs:
-        q = await _leg_quote(broker, leg.contract_symbol)
-        if q is None or q.mid is None:
-            return None
-        mid = q.mid
-        ask = q.ask if q.ask is not None else mid
-        bid = q.bid if q.bid is not None else mid
-        if leg.action == OrderType.BUY_TO_CLOSE:
-            mid_debit += mid
-            marketable_debit += ask
-        elif leg.action == OrderType.SELL_TO_CLOSE:
-            mid_debit -= mid
-            marketable_debit -= bid
-    return mid_debit, marketable_debit
-
-
-async def propose_close_for_symbol(
-    broker: Broker,
-    repos: Repos,
-    symbol: str,
-    config: dict[str, Any],
-    *,
-    today: date | None = None,
-    strategy: StrategyDefinition | None = None,
-) -> MultiLegProposal | None:
-    """Build a MULTI_LEG_CLOSE proposal for a SPREAD_OPEN position.
-
-    Triggers (any one is sufficient):
-      1. Profit close — current debit-to-close ≤ (1 - profit_close_pct/100) ×
-         original credit collected.
-      2. Time close — short leg DTE ≤ time_close_dte (force exit before
-         gamma/expiration risk dominates).
-    """
-    today = today or date.today()
-    if strategy is None:
-        return None
-    account_id = config.get("account", {}).get("id", "primary")
-    position = await repos.positions.get_by_symbol(
-        account_id, symbol, strategy_id=strategy.id
-    )
-    if position is None or position.state != PositionState.SPREAD_OPEN:
-        return None
-    if position.id is None:
-        return None
-
-    open_order = await _open_order_for_position(repos, position.id)
-    if open_order is None or not open_order.raw_request:
-        return None
-    legs_raw = open_order.raw_request.get("legs") or []
-    if not legs_raw:
-        return None
-
-    # Reconstruct OrderLegs in CLOSE direction. Infer spread direction from
-    # the option_type on any leg (puts → bull_put, calls → bear_call) so the
-    # risk gate picks the right regime flag.
-    #
-    # TICKET-014 precursor #3: detect iron_condor by strategy_id rather than
-    # leg-type inference. The old behavior set direction=bear_call as soon
-    # as any call leg was seen, which mislabeled condor closes (4 legs:
-    # long put + short put + short call + long call). Closes bypass the
-    # regime gate anyway (limits.py:398), so this was a label bug, not a
-    # fill bug — but the rationale string and downstream display showed
-    # the wrong direction.
-    close_legs: list[OrderLeg] = []
-    short_leg: OrderLeg | None = None
-    if strategy.id == "iron_condor":
-        direction = DIRECTION_IRON_CONDOR
-    else:
-        direction = DIRECTION_BULL_PUT
-    for leg in legs_raw:
-        # Each leg dict mirrors OrderLeg.model_dump(mode="json").
-        ol = OrderLeg(
-            contract_symbol=leg["contract_symbol"],
-            underlying=leg["underlying"],
-            option_type=leg["option_type"],
-            strike=leg["strike"],
-            expiration=leg["expiration"],
-            action=_flip_action(OrderType(leg["action"])),
-            ratio_qty=leg.get("ratio_qty", 1),
-        )
-        close_legs.append(ol)
-        if str(leg["action"]) == OrderType.SELL_TO_OPEN.value:
-            short_leg = ol  # remember for DTE check
-        # Leg-type inference for verticals only — iron_condor was already
-        # set above by strategy_id.
-        if (
-            strategy.id != "iron_condor"
-            and str(leg["option_type"]) == OptionType.CALL.value
-        ):
-            direction = DIRECTION_BEAR_CALL
-
-    # Re-quote each leg via the shared dual-pricing helper. The MID drives the
-    # close DECISION (fair value), while the BID/ASK drive the ORDER PRICE: a
-    # close limit at the mid sits behind a fast-moving spread, cancel-loops,
-    # and the position rides to max loss (META/GOOGL did exactly that).
-    # Pricing the package marketably — buy legs at the ask, sell legs at the
-    # bid — makes a stop-loss actually fill.
-    pricing = await _close_pricing(broker, close_legs)
-    if pricing is None:
-        log_checkpoint(
-            "spread_close_skip_no_quote",
-            status="skip",
-            symbol=symbol,
-            strategy=strategy.id,
-        )
-        return None
-    # Two debit-to-close figures, per share. Convention: positive = we pay a
-    # debit. `debit_to_close` (mid) is fair value and drives the trigger;
-    # `marketable_debit` (ask for buys, bid for sells) crosses the spread and
-    # drives the order limit so the close fills.
-    debit_to_close, marketable_debit = pricing
-
-    # 2026-07-23 review fix: HARD CLAMP the close debit at the wing width. A
-    # marketable close (buy at ask, sell at bid) on wide quotes can price
-    # ABOVE the spread's width — TSLA 360/365 closed at a $6.09 debit on a
-    # $5 structure, realizing -$470 on a -$365 max-loss trade. Paying more
-    # than width is strictly irrational: width is the worst possible
-    # settlement value (for a condor, only one wing can finish ITM, so the
-    # wing width bounds it too). The router's close_slippage nickel can
-    # still ride on top — bounded overpay, vs the unbounded quote spread.
-    put_strikes = sorted(
-        float(ol.strike) for ol in close_legs
-        if str(ol.option_type) == OptionType.PUT.value
-    )
-    call_strikes = sorted(
-        float(ol.strike) for ol in close_legs
-        if str(ol.option_type) == OptionType.CALL.value
-    )
-    widths = []
-    if len(put_strikes) >= 2:
-        widths.append(put_strikes[-1] - put_strikes[0])
-    if len(call_strikes) >= 2:
-        widths.append(call_strikes[-1] - call_strikes[0])
-    max_close_debit = max(widths) if widths else None
-    if max_close_debit is not None and marketable_debit > max_close_debit:
-        log_checkpoint(
-            "spread_close_debit_clamped",
-            status="ok",
-            symbol=symbol,
-            strategy=strategy.id,
-            marketable_debit=round(marketable_debit, 2),
-            clamped_to=round(max_close_debit, 2),
-        )
-        marketable_debit = max_close_debit
-
-    # Original credit collected per package = open_order.fill_price (signed).
-    original_credit_per_share = open_order.fill_price or 0.0
-    profit_close_pct = float(strategy.params.get("profit_close_pct", 50))
-    target_max_debit = (1 - profit_close_pct / 100.0) * original_credit_per_share
-
-    time_close_dte = int(strategy.params.get("time_close_dte", 7))
-    short_dte: int | None = None
-    if short_leg is not None:
-        short_dte = (short_leg.expiration - today).days
-
-    # Stop-loss: close when debit-to-close hits stop_loss_mult × original credit.
-    # Research-backed asymmetric defaults: bull_put 2.0, bear_call 1.5
-    # (set per strategy in config.yaml). 2.0 is the safe fallback for any
-    # spread strategy that didn't set the param.
-    stop_loss_mult = float(strategy.params.get("stop_loss_mult", 2.0))
-    stop_threshold_debit = stop_loss_mult * original_credit_per_share
-
-    profit_trigger = debit_to_close <= target_max_debit and original_credit_per_share > 0
-    time_trigger = short_dte is not None and short_dte <= time_close_dte
-    stop_trigger = (
-        original_credit_per_share > 0
-        and stop_loss_mult > 0
-        and debit_to_close >= stop_threshold_debit
-    )
-    if not (profit_trigger or time_trigger or stop_trigger):
-        return None
-
-    quantity = open_order.quantity or 1
-    # MultiLegProposal.net_credit_per_spread for a CLOSE: signed net per share
-    # we'd receive. For a debit close, this is negative. Use the MARKETABLE
-    # debit (crosses the spread) so the close fills; the router concedes an
-    # extra close_slippage on top.
-    net_close_credit = -marketable_debit
-    rationale_parts = []
-    if profit_trigger:
-        rationale_parts.append(
-            f"profit_close at debit={debit_to_close:.2f} ≤ target {target_max_debit:.2f} "
-            f"(orig credit={original_credit_per_share:.2f}, pct={profit_close_pct})"
-        )
-    if stop_trigger:
-        rationale_parts.append(
-            f"stop_loss at debit={debit_to_close:.2f} ≥ threshold {stop_threshold_debit:.2f} "
-            f"(orig credit={original_credit_per_share:.2f}, mult={stop_loss_mult:.1f}×)"
-        )
-    if time_trigger:
-        rationale_parts.append(f"time_close dte={short_dte} ≤ {time_close_dte}")
-    rationale = (
-        f"{direction}_close[{strategy.id}] " + "; ".join(rationale_parts)
-    )
-
-    return MultiLegProposal(
-        symbol=symbol,
-        legs=close_legs,
-        net_credit_per_spread=net_close_credit,
-        max_loss_per_spread=0.0,  # closing — no incremental risk
-        width_dollars=0.0,
-        quantity=quantity,
-        rationale=rationale,
-        strategy_id=strategy.id,
-        order_type=OrderType.MULTI_LEG_CLOSE,
-        direction=direction,
-    )
-
-
-async def propose_all_closes(
-    broker: Broker,
-    repos: Repos,
-    config: dict[str, Any],
-    *,
-    today: date | None = None,
-    strategy: StrategyDefinition | None = None,
-) -> list[MultiLegProposal]:
-    """Walk SPREAD_OPEN positions for this strategy; propose closes."""
-    if strategy is None:
-        return []
-    account_id = config.get("account", {}).get("id", "primary")
-    active = await repos.positions.list_active(account_id, strategy_id=strategy.id)
-    out: list[MultiLegProposal] = []
-    for pos in active:
-        if pos.state != PositionState.SPREAD_OPEN:
-            continue
-        proposal = await propose_close_for_symbol(
-            broker, repos, pos.symbol, config, today=today, strategy=strategy,
-        )
-        if proposal is not None:
-            out.append(proposal)
-    log_checkpoint(
-        "spread_propose_closes",
-        status="ok",
-        strategy=strategy.id,
-        n_proposals=len(out),
-    )
-    return out

@@ -133,17 +133,11 @@ def test_planned_time_close_dte_mirrors_close_paths():
 
     cfg = {"strategies": [
         {"id": "monthly_wheel", "type": "wheel", "params": {"time_close_dte": 21}},
-        {"id": "weekly_wheel", "type": "wheel", "params": {}},
-        {"id": "put_spread", "type": "vertical_spread", "params": {}},
-        {"id": "calendar", "type": "calendar", "params": {"time_close_short_dte": 2}},
-        {"id": "pmcc", "type": "pmcc", "params": {}},
+        {"id": "other_wheel", "type": "wheel", "params": {}},
         {"id": "zero_dte", "type": "zero_dte", "params": {}},
     ]}
     assert planned_time_close_dte(cfg, "monthly_wheel") == 21
-    assert planned_time_close_dte(cfg, "weekly_wheel") == 0       # wheel: no default
-    assert planned_time_close_dte(cfg, "put_spread") == 7          # spreads.py default
-    assert planned_time_close_dte(cfg, "calendar") == 2
-    assert planned_time_close_dte(cfg, "pmcc") == 1
-    assert planned_time_close_dte(cfg, "zero_dte") == 0
+    assert planned_time_close_dte(cfg, "other_wheel") == 0        # wheel: no default
+    assert planned_time_close_dte(cfg, "zero_dte") == 0           # flat same day
     assert planned_time_close_dte(cfg, "unknown") == 0             # conservative
     assert planned_time_close_dte({}, None) == 0

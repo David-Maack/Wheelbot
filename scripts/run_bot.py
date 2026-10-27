@@ -1,36 +1,18 @@
-# =====================================================================
-# DEPLOY NOTE — DB MIGRATIONS
-# =====================================================================
-# Migrations in db/migrations/ are baked into the Docker image at build
-# time. A `git pull` on the LXC host does NOT apply new migrations — the
-# running container still has the old image.
-#
-# To deploy a migration:
-#   1. cd /opt/wheelbot && git pull
-#   2. docker compose build wheelbot
-#   3. docker compose up -d wheelbot
-#   4. Verify:  docker exec wheelbot python -m scripts.db_health
-#                docker exec wheelbot bash scripts/migrate_check.sh
-#
-# The bot's first reconcile tick after restart re-fetches broker state, so
-# any old PENDING orders the cursor lost track of get re-evaluated. Watch
-# for transient MANUAL_INTERVENTION flags in the minute after restart and
-# clear them with scripts.reenable_strategy / manual_close once verified.
-# =====================================================================
+# Deploy: see CLAUDE.md (`docker compose up -d --build`, no service name —
+# rebuilds bot + dashboard together; migrations auto-apply at startup).
 
 """Long-running WheelBot entrypoint.
 
 This is the main process the LXC container runs. It:
 
   - Loads config + secrets, sets up structured logging.
-  - Constructs broker, repos, news source, optional Anthropic client.
-  - Wires the Discord notifier as the global dispatcher.
-  - Wires `news_check` into the OrderRouter.
-  - Wires `roll_orchestrator` into the Reconciler.
+  - Constructs broker and repos; wires the Discord notifier as the global
+    dispatcher and the rule-based roll evaluator into the Reconciler.
   - Each tick:
       1. Reconcile (kill-switch primed, broker polled, state updates written).
-      2. If kill-switch is armed → skip new entries this tick.
-      3. Run wheel orchestrator over the universe → produce Proposals.
+      2. If kill-switch is armed → skip the strategy pass this tick.
+      3. Each strategy (wheel / zero_dte since the 2026-10-27 cleanup)
+         proposes closes, then — when its gates allow — new entries.
       4. Place each Proposal through the router (risk gates + idempotency).
       5. (Reconciler's roll-trigger scan already ran inside step 1; the wired
          roll evaluator handles ROLL/LET_ASSIGN/CLOSE actions.)
@@ -45,11 +27,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from core.broker import Broker
@@ -57,75 +37,36 @@ from core.broker_factory import make_broker
 from core.checkpoint import log_checkpoint
 from core.config import load_config, load_universe
 from core.logs import setup_logging
-from core.models import OptionType, Order, OrderType, Position
+from core.models import Order, OrderType, Position
 from core.notify import make_notifier, notify, set_dispatcher
 from core.strategies import StrategyDefinition, load_strategies, universe_for_strategy
-from core.watchlists import effective_universe
 from data.ivr import IVRProvider
 from db.repo import Database, Repos
 from execution.kill_switch import KillSwitchResult
 from execution.loop import ReconcilerLoop
 from execution.reconciler import Reconciler
 from execution.router import OrderRouter
-from risk.earnings_recheck import check_open_positions_for_new_earnings
-from intelligence.anthropic_client import AnthropicClient
-from intelligence.budget import BudgetTracker
-from intelligence.news import make_news_source
-from intelligence.news_check import news_check as run_news_check
-from intelligence.position_news_sentry import run_position_news_sentry
+from risk import auto_disable
 from strategies import roll_orchestrator
-from strategies.roll_advisor import RollAction, RollContext
-from strategies.iron_condor import propose_all as propose_all_iron_condor
-from strategies.calendar import propose_all as propose_all_calendar
-from strategies.calendar_close import propose_all_closes as propose_all_calendar_closes
-from strategies.pmcc import propose_all as propose_all_pmcc
-from strategies.pmcc_close import propose_all_closes as propose_all_pmcc_closes
-from strategies.spreads import (
-    MultiLegProposal,
-    propose_all as propose_all_spreads,
-    propose_all_closes as propose_all_spread_closes,
-)
-from risk import auto_disable, expectancy_floor, win_rate_floor
-from strategies.swing import propose_all_swing_closes, propose_all_swings
-from strategies.zero_dte import (
-    propose_all as propose_all_zero_dte,
-    propose_all_closes as propose_all_zero_dte_closes,
-)
+from strategies.roll_advisor import RollContext
+from strategies.spreads import MultiLegProposal
 from strategies.wheel import propose_all
 from strategies.wheel_close import propose_all_closes as propose_all_wheel_closes
+from strategies.zero_dte import (
+    propose_all as propose_all_zero_dte,
+)
+from strategies.zero_dte import (
+    propose_all_closes as propose_all_zero_dte_closes,
+)
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-async def _make_news_check_callable(news, anthropic, config):
-    """Returns the callable the OrderRouter expects, or None when disabled.
-
-    TICKET-014: the inner closure now accepts an optional `profile` kwarg so
-    the router can dispatch per-strategy prompts (bullish_csp / bullish_long
-    / neutral_range / neutral_pin). Default = bullish_csp preserves the
-    wheel CSP path's existing prompt byte-for-byte (locked by
-    test_wheel_csp_*_unchanged regression tests)."""
-    intel = config.get("intelligence", {}) or {}
-    if not bool(intel.get("llm_news_check_enabled", True)):
-        return None
-    if anthropic is None or news is None:
-        return None
-
-    async def _check(symbol: str, profile: str = "bullish_csp"):
-        return await run_news_check(
-            symbol=symbol, news=news, anthropic=anthropic, config=config,
-            profile=profile,
-        )
-
-    return _check
-
-
 async def _make_roll_evaluator(
     broker: Broker,
     repos: Repos,
-    anthropic,
     config,
     universe,
     *,
@@ -135,8 +76,7 @@ async def _make_roll_evaluator(
 
     When `router` is provided, ROLL/CLOSE outcomes are *executed* leg-by-leg
     through the same router (full risk gates + idempotency). LET_ASSIGN is a
-    no-op by design — wait for the broker to assign. Disagreement halts the
-    position via the orchestrator and never reaches here.
+    no-op by design — wait for the broker to assign.
     """
 
     async def _eval(position: Position, short: Order, current_mid: float):
@@ -193,11 +133,11 @@ async def _make_roll_evaluator(
             current_short_mid=current_mid,
             underlying_price=spot,
             cycle_id=position.current_cycle_id,
+            strategy_id=position.strategy_id,
         )
         outcome = await roll_orchestrator.evaluate(
             broker=broker,
             repos=repos,
-            anthropic=anthropic,
             ctx=ctx,
             position_id=position.id,
             config=config,
@@ -317,11 +257,11 @@ MONITOR_FAILURE_COOLDOWN_HOURS = 24.0
 async def _report_monitor_failure(
     repos: Repos, step: str, strategy_id: str, exc: Exception,
 ) -> None:
-    """A crashing risk monitor (drawdown / win-rate / expectancy) must never
-    break trading, but it must not be silent either: the win-rate floor threw
-    on every tick from 2026-08-26 to 2026-10-19 (unknown cycle_outcome) and
-    only the JSON log knew. Checkpoint every time; Discord at most once per
-    24h per (monitor, strategy)."""
+    """A crashing risk monitor (the drawdown breaker) must never break
+    trading, but it must not be silent either: the since-removed win-rate
+    floor threw on every tick from 2026-08-26 to 2026-10-19 (unknown
+    cycle_outcome) and only the JSON log knew. Checkpoint every time; Discord
+    at most once per 24h per (monitor, strategy)."""
     log_checkpoint(step, status="fail", strategy=strategy_id, error=str(exc))
     try:
         if await repos.alert_rate_limits.try_fire(
@@ -358,46 +298,26 @@ async def _propose_and_route(
     total_proposals = 0
     total_placed = 0
     total_blocked = 0
-    # 2026-07-01 AI audit item #2: daily LLM exception veto (reduce-only). If
-    # today's regime snapshot carries llm_risk_veto, halve ALL strategies' entry
-    # sizes for the day (closes unaffected, like every other gate). Read once
-    # per tick; any failure reads as no-veto.
-    veto_multiplier = 1.0
-    regime_snap = None
-    try:
-        from intelligence.regime_veto import veto_size_multiplier
-        regime_snap = await repos.regime.latest()
-        veto_multiplier = veto_size_multiplier(regime_snap)
-        if veto_multiplier < 1.0:
-            log_checkpoint("bot_llm_risk_veto_active", status="ok",
-                           size_multiplier=veto_multiplier)
-    except Exception:  # noqa: BLE001 — reduce-only: never let the veto read break the loop
-        veto_multiplier = 1.0
     # 2026-07-06: regime-aware IVR floor. Hand the latest VIX close to the
     # provider so the selectors' effective_ivr_min can relax the floor when
     # the whole market is rich (IVR reads "low" in sustained high-vol —
     # the rank compares against an elevated 52w high). A missing snapshot
     # reads as no-modulation; calm-regime behavior is unchanged either way.
     try:
+        regime_snap = await repos.regime.latest()
         ivr.set_regime_vix(regime_snap.vix_close if regime_snap else None)
     except Exception:  # noqa: BLE001 — context-only: never let the read break the loop
         ivr.set_regime_vix(None)
     for strategy in strategies:
         # TICKET-029: existing positions are MANAGED (closes / stops / rolls)
-        # on EVERY tick regardless of the gates below — disabling a strategy, or
-        # the drawdown breaker / win-rate floor tripping, must NEVER orphan its
-        # open positions (that left a disabled-wheel PLTR CSP unmanaged to
-        # -300%). Only NEW ENTRIES are gated. `opens_allowed` aggregates every
-        # entry-suppressing gate; closes always run further down.
-        opens_allowed = True
-        size_multiplier = 1.0
+        # on EVERY tick regardless of the gates below — disabling a strategy,
+        # or the drawdown breaker tripping, must NEVER orphan its open
+        # positions (that left a disabled-wheel PLTR CSP unmanaged to -300%).
+        # Only NEW ENTRIES are gated.
         strategy_universe = universe_for_strategy(strategy, universe)
-        if not strategy.enabled:
-            opens_allowed = False
-        else:
-            # Sprint 13 sub-sprint 1 + TICKET-008: tri-state drawdown breaker.
-            # DISABLED → no new entries (closes still run). WARNING → size
-            # spreads at half (wheels stay qty=1). NORMAL → unchanged.
+        opens_allowed = strategy.enabled
+        if opens_allowed:
+            # Drawdown breaker: DISABLED → no new entries (closes still run).
             drawdown_state = await auto_disable.current_state(repos, strategy.id)
             if drawdown_state is auto_disable.DrawdownState.DISABLED:
                 log_checkpoint(
@@ -407,32 +327,18 @@ async def _propose_and_route(
                     state=drawdown_state.value,
                 )
                 opens_allowed = False
-            else:
-                # TICKET-009 + expectancy floor (2026-07-06): independent
-                # pause gate. ANY non-NULL pause_state (LOW_WIN_RATE from the
-                # win-rate floor, NEGATIVE_EXPECTANCY from the expectancy
-                # floor) suppresses entries while drawdown is NORMAL or
-                # WARNING. Notify fires once on the NORMAL→PAUSED transition
-                # inside the owning floor's check_and_apply (24h limit).
-                runtime_row = await repos.strategy_runtime.get(strategy.id) or {}
-                pause_state = runtime_row.get("pause_state")
-                if pause_state:
-                    log_checkpoint(
-                        "bot_strategy_runtime_paused",
-                        status="skip",
-                        strategy=strategy.id,
-                        state=pause_state,
-                    )
-                    opens_allowed = False
-                else:
-                    size_multiplier = drawdown_state.size_multiplier * veto_multiplier
-                    if drawdown_state is auto_disable.DrawdownState.WARNING:
-                        log_checkpoint(
-                            "bot_strategy_warning_size_halved",
-                            status="ok",
-                            strategy=strategy.id,
-                            size_multiplier=size_multiplier,
-                        )
+        if opens_allowed:
+            # Operator pause (MCP pause_strategy / scripts.reenable_strategy
+            # clears it): any non-NULL pause_state suppresses entries.
+            runtime_row = await repos.strategy_runtime.get(strategy.id) or {}
+            if runtime_row.get("pause_state"):
+                log_checkpoint(
+                    "bot_strategy_runtime_paused",
+                    status="skip",
+                    strategy=strategy.id,
+                    state=runtime_row["pause_state"],
+                )
+                opens_allowed = False
         # A non-empty universe is required to OPEN; closes never need it.
         if opens_allowed and not strategy_universe["tickers"]:
             log_checkpoint(
@@ -449,9 +355,7 @@ async def _propose_and_route(
         # logs + notifies and the loop moves on.
         try:
             if strategy.type == "wheel":
-                # Profit-closes first — free up capital before considering new
-                # entries. Closes are unaffected by drawdown WARNING; only new
-                # entries scale.
+                # Closes first — free up capital before considering new entries.
                 close_proposals = await propose_all_wheel_closes(
                     broker, repos, config, strategy=strategy,
                     delta_unavailable_counters=delta_unavailable_counters,
@@ -460,97 +364,22 @@ async def _propose_and_route(
                 if opens_allowed:
                     open_proposals = await propose_all(
                         broker, repos, config, strategy_universe, ivr, strategy=strategy,
-                        size_multiplier=size_multiplier,
-                    )
-                proposals = close_proposals + open_proposals
-            elif strategy.type == "vertical_spread":
-                # Closes first — free up capital before considering new entries.
-                close_proposals = await propose_all_spread_closes(
-                    broker, repos, config, strategy=strategy,
-                )
-                open_proposals = []
-                if opens_allowed:
-                    open_proposals = await propose_all_spreads(
-                        broker, repos, config, strategy_universe,
-                        strategy=strategy, ivr=ivr,
-                        size_multiplier=size_multiplier,
-                    )
-                proposals = close_proposals + open_proposals
-            elif strategy.type == "iron_condor":
-                # TICKET-014: closes reuse propose_all_spread_closes — the close
-                # orchestrator detects iron_condor by strategy.id and tags
-                # rationale + direction correctly (precursor fix #3). Opens go
-                # through the dedicated iron_condor selector.
-                close_proposals = await propose_all_spread_closes(
-                    broker, repos, config, strategy=strategy,
-                )
-                open_proposals = []
-                if opens_allowed:
-                    open_proposals = await propose_all_iron_condor(
-                        broker, repos, config, strategy_universe,
-                        strategy=strategy, ivr=ivr,
-                        size_multiplier=size_multiplier,
-                    )
-                proposals = close_proposals + open_proposals
-            elif strategy.type == "pmcc":
-                # TICKET-015: PMCC. Closes first (short profit/time, long roll),
-                # then opens (long when IDLE, short when LONG_OPEN). All single-leg
-                # Proposals routed via place(). size_multiplier does not apply —
-                # PMCC is sized at 1 long + 1 short per position.
-                close_proposals = await propose_all_pmcc_closes(
-                    broker, repos, config, strategy=strategy,
-                )
-                open_proposals = []
-                if opens_allowed:
-                    open_proposals = await propose_all_pmcc(
-                        broker, repos, config, strategy_universe,
-                        strategy=strategy, ivr=ivr,
-                    )
-                proposals = close_proposals + open_proposals
-            elif strategy.type == "calendar":
-                # TICKET-016: Calendar. 2-leg MLEG (same strike, two expirations),
-                # net DEBIT. Closes first (25% profit / 2-DTE force-close), then
-                # opens (ATM, INVERTED IVR gate — enter only on LOW IV). Both are
-                # MultiLegProposals → place_multi_leg. size_multiplier N/A.
-                close_proposals = await propose_all_calendar_closes(
-                    broker, repos, config, strategy=strategy,
-                )
-                open_proposals = []
-                if opens_allowed:
-                    open_proposals = await propose_all_calendar(
-                        broker, repos, config, strategy_universe,
-                        strategy=strategy, ivr=ivr,
                     )
                 proposals = close_proposals + open_proposals
             elif strategy.type == "zero_dte":
-                # 0DTE paper test (docs/research/0dte_research_2026-07.md).
                 # Closes FIRST and unconditionally — the 15:00 ET hard flatten
                 # must fire even when opens are gated (Alpaca rejects expiry-
                 # day option orders after ~15:15/15:30 ET and force-liquidates
                 # at 15:30/15:45). Opens are additionally gated inside the
                 # module by the 10:00-10:15 ET entry window, max-positions-
-                # per-day, and the strategy's own penalized daily loss cap.
+                # per-day, the live-spot 20d SMA, and its own daily loss cap.
                 close_proposals = await propose_all_zero_dte_closes(
                     broker, repos, config, strategy=strategy,
                 )
                 open_proposals = []
                 if opens_allowed:
                     open_proposals = await propose_all_zero_dte(
-                        broker, repos, config, strategy_universe,
-                        strategy=strategy, size_multiplier=size_multiplier,
-                    )
-                proposals = close_proposals + open_proposals
-            elif strategy.type == "swing":
-                # Directional SPY swing (sub-sprint 2.1: DRY-RUN — evaluates and logs
-                # the live signal, places nothing. 2.2 adds deep-ITM long-option entry).
-                close_proposals = await propose_all_swing_closes(
-                    broker, repos, config, strategy=strategy,
-                )
-                open_proposals = []
-                if opens_allowed:
-                    open_proposals = await propose_all_swings(
-                        broker, repos, config, strategy_universe,
-                        strategy=strategy, size_multiplier=size_multiplier,
+                        broker, repos, config, strategy_universe, strategy=strategy,
                     )
                 proposals = close_proposals + open_proposals
             else:
@@ -598,7 +427,7 @@ async def _propose_and_route(
                 continue
             if result.placed is not None:
                 placed += 1
-            elif result.risk_failed or result.news_decision == "block":
+            elif result.risk_failed:
                 blocked += 1
         log_checkpoint(
             "bot_strategy_summary",
@@ -619,22 +448,6 @@ async def _propose_and_route(
             await auto_disable.check_and_apply(repos, strategy, config)
         except Exception as exc:  # defensive — never let monitoring break trading
             await _report_monitor_failure(repos, "auto_disable_check_failed", strategy.id, exc)
-        # TICKET-009: evaluate the win-rate floor right after drawdown so
-        # both signals are re-derived from the freshest cycle data. Independent
-        # of drawdown — a single tick can trip drawdown WARNING and win-rate
-        # PAUSE in the same iteration if both thresholds breach. Defensive
-        # catch — never let monitoring break trading.
-        try:
-            await win_rate_floor.check_and_apply(repos, strategy, config)
-        except Exception as exc:
-            await _report_monitor_failure(repos, "win_rate_floor_check_failed", strategy.id, exc)
-        # 2026-07-06: expectancy floor — same cadence, same defensive catch.
-        # Runs after the win-rate floor; whichever trips first owns the pause
-        # (neither overwrites the other).
-        try:
-            await expectancy_floor.check_and_apply(repos, strategy, config)
-        except Exception as exc:
-            await _report_monitor_failure(repos, "expectancy_floor_check_failed", strategy.id, exc)
     log_checkpoint(
         "bot_propose_route_summary",
         status="ok",
@@ -699,22 +512,6 @@ async def main(argv: list[str] | None = None) -> int:
     set_dispatcher(notifier)
     log_checkpoint("bot_notifier", status="ok", name=notifier.name)
 
-    # Anthropic — optional. If the key isn't set, news_check + roll LLM degrade
-    # to fail-open / rule-only; the bot still runs.
-    anthropic: AnthropicClient | None = None
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        # strict=True refuses to price unknown models so a typo'd *_model
-        # config value or a deprecated model surfaces loudly instead of
-        # silently bypassing the daily cap at $0/tok.
-        budget = BudgetTracker(repos.llm_decisions, config, strict=True)
-        anthropic = AnthropicClient(repos.llm_decisions, budget)
-        log_checkpoint(
-            "bot_anthropic", status="ok", daily_budget_usd=budget.daily_cap_usd
-        )
-    else:
-        log_checkpoint("bot_anthropic", status="skip", detail="ANTHROPIC_API_KEY unset")
-
-    news = make_news_source(config)
     # 2026-07-06: regime-aware IVR floor knobs. Absent block → delta 0 → the
     # floor never modulates (new-knob convention). Per-strategy
     # ivr_relax_vix / ivr_relax_delta params override these defaults.
@@ -725,10 +522,9 @@ async def main(argv: list[str] | None = None) -> int:
         relax_floor_delta=float(ivr_relax.get("floor_delta", 0.0)),
     )
 
-    news_check_callable = await _make_news_check_callable(news, anthropic, config)
-    router = OrderRouter(broker, repos, config, universe, news_checker=news_check_callable)
+    router = OrderRouter(broker, repos, config, universe)
     roll_evaluator = await _make_roll_evaluator(
-        broker, repos, anthropic, config, universe, router=router
+        broker, repos, config, universe, router=router
     )
 
     reconciler = Reconciler(
@@ -748,41 +544,8 @@ async def main(argv: list[str] | None = None) -> int:
     # detector. dict[position_id, consecutive_failures]. Resets on process
     # restart (acceptable — restart implies someone's looking).
     delta_unavailable_counters: dict[int, int] = {}
-    # TICKET-006: rate-limit state for the mid-cycle earnings recheck. Single
-    # counter incremented on every _post_tick, only does the per-position
-    # work when it crosses risk.earnings_recheck.check_interval_ticks.
-    earnings_recheck_state: dict[str, int] = {"ticks_since_check": 0}
-    # 2026-07-09: same pattern for the position news sentry.
-    news_sentry_state: dict[str, int] = {"ticks_since_check": 0}
-
     async def _post_tick(_loop: ReconcilerLoop, ks: KillSwitchResult | None):
         kill_switch_tripped = ks is not None and ks.tripped
-        # Universe-refresh overlay: when enabled and a watchlist run is APPLIED,
-        # refresh strategy membership each tick. Mutates the SHARED universe
-        # dict in place — router, risk gate, and reconciler all hold this same
-        # object, so membership stays consistent everywhere. Fail-open: any
-        # error leaves the previous tick's membership untouched.
-        if bool((config.get("universe_refresh") or {}).get("enabled", False)):
-            try:
-                refreshed = await effective_universe(repos, config)
-                universe["tickers"] = refreshed["tickers"]
-            except Exception as exc:  # noqa: BLE001 — overlay must never break the loop
-                log_checkpoint("bot_universe_overlay_fail", status="fail", error=str(exc))
-        # TICKET-006: earnings recheck runs even when the kill switch is
-        # tripped — for action='flag_manual' it MUST run (state annotation
-        # the operator needs to see), and for action='close' the function
-        # itself logs earnings_recheck_close_skipped_kill_switch and skips.
-        # Always before _propose_and_route so any flag_manual writes are
-        # visible to the proposers (they'd skip MANUAL_INTERVENTION anyway).
-        try:
-            await check_open_positions_for_new_earnings(
-                repos=repos, router=router, config=config,
-                kill_switch_tripped=kill_switch_tripped,
-                recheck_state=earnings_recheck_state,
-            )
-        except Exception as exc:  # defensive — recheck must not block trading
-            log_checkpoint("earnings_recheck_fail", status="fail", error=str(exc))
-
         # 2026-07-08: stale-open sweep. Entry orders that never fill leave
         # their positions *_PENDING all day (no re-proposal → the router's
         # stale-replace path never fires for opens). Cancel them at the
@@ -793,18 +556,6 @@ async def main(argv: list[str] | None = None) -> int:
             await router.cancel_stale_pending_opens()
         except Exception as exc:  # noqa: BLE001 — sweep must never break the tick
             log_checkpoint("stale_open_sweep_fail", status="fail", error=str(exc))
-
-        # 2026-07-09: position news sentry — hourly Haiku read of each open
-        # position's headlines. NOTIFY-ONLY (Discord + llm_decisions); never
-        # places or closes. Runs even under the kill switch — the operator
-        # needs the signal most exactly when trading is halted.
-        try:
-            await run_position_news_sentry(
-                repos=repos, news=news, anthropic=anthropic, config=config,
-                sentry_state=news_sentry_state,
-            )
-        except Exception as exc:  # noqa: BLE001 — sentry must never break the tick
-            log_checkpoint("news_sentry_pass_fail", status="fail", error=str(exc))
 
         if kill_switch_tripped:
             log_checkpoint("bot_skip_kill_switch", status="ok", reason=ks.reason)
@@ -824,8 +575,6 @@ async def main(argv: list[str] | None = None) -> int:
         status="ok",
         broker=broker.name,
         notifier=notifier.name,
-        anthropic=bool(anthropic),
-        news=bool(news),
     )
 
     try:

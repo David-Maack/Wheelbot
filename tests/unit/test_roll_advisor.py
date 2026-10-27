@@ -196,3 +196,25 @@ async def test_close_when_no_credit_roll_for_call():
     decision = await evaluate_roll(broker=broker, ctx=ctx, config=_config(), universe=_universe(), today=date(2025, 6, 1))
     assert decision is not None
     assert decision.action == RollAction.CLOSE
+
+
+@pytest.mark.asyncio
+async def test_strategy_roll_trigger_overrides_wheel_block():
+    """2026-10-27: evaluate_roll read only the `wheel:` block, so a strategy's
+    own roll_trigger_delta never applied. Delta 0.47 is below the wheel's
+    0.50 but above a strategy-level 0.45."""
+    broker = PaperBroker()
+    broker.seed_chain("F", [_put_chain_candidate(strike=9.5, days_out=35, mid=2.00, delta=-0.25)])
+    ctx = RollContext(
+        symbol="F", short_contract=_put_short(delta=-0.47), short_quantity=1,
+        short_premium_collected_per_share=0.50, current_short_mid=1.50,
+        underlying_price=9.5, strategy_id="some_wheel",
+    )
+    config = _config()
+    assert await evaluate_roll(broker=broker, ctx=ctx, config=config,
+                               universe=_universe(), today=date(2025, 6, 1)) is None
+    config["strategies"] = [{"id": "some_wheel", "type": "wheel",
+                             "params": {"roll_trigger_delta": 0.45}}]
+    decision = await evaluate_roll(broker=broker, ctx=ctx, config=config,
+                                   universe=_universe(), today=date(2025, 6, 1))
+    assert decision is not None

@@ -85,7 +85,6 @@ def load_universe(config_dir: Path | None = None) -> dict[str, Any]:
     return {
         "tickers": tickers,
         "banned": list(raw.get("banned", [])),
-        "banned_rules": list(raw.get("banned_rules", [])),
     }
 
 

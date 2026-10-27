@@ -8,7 +8,9 @@ Rules:
   8. Daily P&L drawdown — `daily_loss_kill_switch_pct` (default 5%) of equity
      from session-open. Anchor stored in `daily_state` so a mid-day restart
      keeps the baseline.
-  9. Consecutive losing cycles — N closed cycles with `final_pnl < 0` in a row.
+  9. (Removed 2026-10-27) Consecutive losing cycles. It could deadlock: a
+     streak halts entries, and with no entries the streak can't end. The
+     per-strategy drawdown breaker (risk/auto_disable.py) covers the case.
  10. Manual stop file — existence of `risk.stop_file_path` halts new orders.
 
 A tripped switch sets `daily_state.kill_switch_armed = True` so a mid-day
@@ -114,23 +116,17 @@ class KillSwitch:
                     f"daily drawdown {drawdown_pct:.2f}% > {loss_pct_max}%"
                 )
 
-        # Rule 9 — consecutive losing cycles.
-        max_losses = int(self._config.get("risk", {}).get("consecutive_losses_pause", 3))
-        losses = await self._consecutive_losses(account_id, max_losses)
-        if losses >= max_losses:
-            reasons.append(f"{losses} consecutive losing cycles >= {max_losses}")
-
         # 2026-07-23 review fix: SESSION LATCH. Before this, tripped was
         # recomputed fresh every tick — equity bouncing from -5.1% to -4.9%
         # DISARMED the daily-loss stop mid-session and trading resumed. An
-        # automatic trip (drawdown / consecutive losses) now stays tripped
+        # automatic (drawdown) trip now stays tripped
         # for the rest of the snapshot_date. Manual stop-file trips are NOT
         # latched — removing the file (scripts or MCP release_kill_switch)
         # must release, and the MCP release also clears this latch so the
         # operator always has the override.
         if not reasons and anchor and anchor.kill_switch_armed:
             prior = anchor.kill_switch_reason or ""
-            if "drawdown" in prior or "consecutive" in prior:
+            if "drawdown" in prior:
                 reasons.append(f"latched for the session: {prior}")
 
         # Persist arming state.
@@ -140,7 +136,7 @@ class KillSwitch:
                     account_id=account_id,
                     snapshot_date=today,
                     session_open_equity=anchor.session_open_equity if anchor else None,
-                    consecutive_losses=losses,
+                    consecutive_losses=anchor.consecutive_losses if anchor else 0,
                     kill_switch_armed=bool(reasons),
                     kill_switch_reason="; ".join(reasons) if reasons else None,
                 )
@@ -165,21 +161,3 @@ class KillSwitch:
                 reasons="; ".join(reasons),
             )
         return result
-
-    async def _consecutive_losses(self, account_id: str, look: int) -> int:
-        """Count closed cycles in a row (most-recent-first) with final_pnl < 0."""
-        c = await self._repos.db.connect()
-        async with c.execute(
-            "SELECT final_pnl FROM wheel_cycles "
-            "WHERE account_id = ? AND ended_at IS NOT NULL AND final_pnl IS NOT NULL "
-            "ORDER BY ended_at DESC LIMIT ?",
-            (account_id, max(look + 1, 5)),
-        ) as cur:
-            rows = await cur.fetchall()
-        streak = 0
-        for row in rows:
-            if row["final_pnl"] < 0:
-                streak += 1
-            else:
-                break
-        return streak

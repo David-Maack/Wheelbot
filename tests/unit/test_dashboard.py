@@ -5,15 +5,12 @@ from __future__ import annotations
 import base64
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from core.models import (
-    DailyState,
-    OptionType,
     Order,
     OrderStatus,
     OrderType,
@@ -82,155 +79,6 @@ async def test_positions_view_renders(app_client):
     assert resp.status_code == 200
     assert "F" in resp.text
     assert "SHARES_HELD" in resp.text
-
-
-@pytest.mark.asyncio
-async def test_positions_renders_pmcc_both_legs(app_client):
-    """TICKET-015: a PMCC_BOTH_OPEN position shows both legs (long + short,
-    different expirations) and the breakeven."""
-    client, deps, _broker = app_client
-    now = datetime.now(UTC).replace(tzinfo=None)
-    cycle_id = await deps.repos.cycles.insert(
-        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
-                   started_at=now, n_orders=2)
-    )
-    await deps.repos.orders.insert(
-        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
-              order_type=OrderType.BUY_TO_OPEN, contract_symbol="AAPL260116C00140000",
-              strike=140.0, expiration=date(2026, 1, 16), option_type=OptionType.CALL,
-              quantity=1, fill_price=16.0, status=OrderStatus.FILLED,
-              placed_at=now, client_order_id="pl")
-    )
-    await deps.repos.orders.insert(
-        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
-              order_type=OrderType.SELL_TO_OPEN, contract_symbol="AAPL250620C00160000",
-              strike=160.0, expiration=date(2025, 6, 20), option_type=OptionType.CALL,
-              quantity=1, fill_price=1.20, status=OrderStatus.FILLED,
-              placed_at=now, client_order_id="ps")
-    )
-    await deps.repos.positions.insert(
-        Position(account_id="test", symbol="AAPL", strategy_id="pmcc",
-                 state=PositionState.PMCC_BOTH_OPEN, shares=0,
-                 current_cycle_id=cycle_id, state_changed_at=now)
-    )
-    resp = await client.get("/", headers=_auth_header("wheelbot", "hunter2"))
-    assert resp.status_code == 200
-    body = resp.text
-    assert "PMCC_BOTH_OPEN" in body
-    assert "L 140.0c" in body          # long leg
-    assert "S 160.0c" in body          # short leg
-    assert "be 156.00" in body         # breakeven = 140 + 16
-
-
-@pytest.mark.asyncio
-async def test_positions_renders_pmcc_long_only(app_client):
-    """A PMCC_LONG_OPEN position (no short yet) shows the long + a 'no short'
-    indicator."""
-    client, deps, _broker = app_client
-    now = datetime.now(UTC).replace(tzinfo=None)
-    cycle_id = await deps.repos.cycles.insert(
-        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
-                   started_at=now, n_orders=1)
-    )
-    await deps.repos.orders.insert(
-        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
-              order_type=OrderType.BUY_TO_OPEN, contract_symbol="AAPL260116C00140000",
-              strike=140.0, expiration=date(2026, 1, 16), option_type=OptionType.CALL,
-              quantity=1, fill_price=16.0, status=OrderStatus.FILLED,
-              placed_at=now, client_order_id="pl")
-    )
-    await deps.repos.positions.insert(
-        Position(account_id="test", symbol="AAPL", strategy_id="pmcc",
-                 state=PositionState.PMCC_LONG_OPEN, shares=0,
-                 current_cycle_id=cycle_id, state_changed_at=now)
-    )
-    resp = await client.get("/", headers=_auth_header("wheelbot", "hunter2"))
-    assert resp.status_code == 200
-    body = resp.text
-    assert "PMCC_LONG_OPEN" in body
-    assert "L 140.0c" in body
-    assert "no short" in body
-
-
-@pytest.mark.asyncio
-async def test_pmcc_full_unrealized_marks_long_and_short(app_client):
-    """The PMCC unrealized must reflect the FULL position (long appreciation +
-    short decay), not just the short leg. Long paid 16, now 20 → +400; short
-    sold for 1.20, now 0.40 → +80; total +480."""
-    client, deps, broker = app_client
-    now = datetime.now(UTC).replace(tzinfo=None)
-    cycle_id = await deps.repos.cycles.insert(
-        WheelCycle(account_id="test", symbol="AAPL", strategy_id="pmcc",
-                   started_at=now, n_orders=2)
-    )
-    await deps.repos.orders.insert(
-        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
-              order_type=OrderType.BUY_TO_OPEN, contract_symbol="AAPL_long",
-              strike=140.0, expiration=date(2026, 1, 16), option_type=OptionType.CALL,
-              quantity=1, fill_price=16.0, status=OrderStatus.FILLED,
-              placed_at=now, client_order_id="pl")
-    )
-    await deps.repos.orders.insert(
-        Order(account_id="test", symbol="AAPL", strategy_id="pmcc", cycle_id=cycle_id,
-              order_type=OrderType.SELL_TO_OPEN, contract_symbol="AAPL_short",
-              strike=160.0, expiration=date(2026, 6, 20), option_type=OptionType.CALL,
-              quantity=1, fill_price=1.20, status=OrderStatus.FILLED,
-              placed_at=now, client_order_id="ps")
-    )
-    await deps.repos.positions.insert(
-        Position(account_id="test", symbol="AAPL", strategy_id="pmcc",
-                 state=PositionState.PMCC_BOTH_OPEN, shares=0,
-                 current_cycle_id=cycle_id, state_changed_at=now)
-    )
-    # Seed current quotes: long up to 20.0, short down to 0.40.
-    from core.models import Quote
-    from dashboard.app import _positions_rows, _QuoteCache
-    broker.seed_quote(Quote(symbol="AAPL_long", bid=19.95, ask=20.05))
-    broker.seed_quote(Quote(symbol="AAPL_short", bid=0.38, ask=0.42))
-
-    rows = await _positions_rows(deps, _QuoteCache(0.0))
-    pmcc_row = next(r for r in rows if r["strategy_id"] == "pmcc")
-    # long (20 − 16)*100 = +400 ; short (1.20 − 0.40)*100 = +80 ; total +480
-    assert pmcc_row["unrealized"] == pytest.approx(480.0)
-
-
-@pytest.mark.asyncio
-async def test_positions_renders_calendar_two_expirations(app_client):
-    """TICKET-016: a calendar SPREAD_OPEN shows front/back DTEs (different
-    expirations), the shared strike, and the net debit."""
-    client, deps, _broker = app_client
-    now = datetime.now(UTC).replace(tzinfo=None)
-    cycle_id = await deps.repos.cycles.insert(
-        WheelCycle(account_id="test", symbol="SPY", strategy_id="calendar",
-                   started_at=now, n_orders=1)
-    )
-    legs = [
-        {"contract_symbol": "SPY250620C00500000", "underlying": "SPY",
-         "option_type": "CALL", "strike": 500.0, "expiration": "2026-06-24",
-         "action": "SELL_TO_OPEN", "ratio_qty": 1},
-        {"contract_symbol": "SPY250801C00500000", "underlying": "SPY",
-         "option_type": "CALL", "strike": 500.0, "expiration": "2026-08-09",
-         "action": "BUY_TO_OPEN", "ratio_qty": 1},
-    ]
-    await deps.repos.orders.insert(
-        Order(account_id="test", symbol="SPY", strategy_id="calendar", cycle_id=cycle_id,
-              order_type=OrderType.MULTI_LEG_OPEN, contract_symbol=legs[0]["contract_symbol"],
-              strike=500.0, expiration=date(2026, 6, 24), option_type=OptionType.CALL,
-              quantity=1, fill_price=-1.75, status=OrderStatus.FILLED,
-              placed_at=now, client_order_id="cal",
-              raw_request={"underlying": "SPY", "legs": legs, "quantity": 1, "width_dollars": 0.0})
-    )
-    await deps.repos.positions.insert(
-        Position(account_id="test", symbol="SPY", strategy_id="calendar",
-                 state=PositionState.SPREAD_OPEN, shares=0,
-                 current_cycle_id=cycle_id, state_changed_at=now)
-    )
-    resp = await client.get("/", headers=_auth_header("wheelbot", "hunter2"))
-    assert resp.status_code == 200
-    body = resp.text
-    assert "500.0c" in body              # shared strike
-    assert "debit 1.75" in body          # net debit
-    assert "calendar-legs" in body       # the leg block rendered
 
 
 @pytest.mark.asyncio
@@ -751,27 +599,18 @@ async def test_orders_view_renders_recent_orders(app_client):
 
 
 @pytest.mark.asyncio
-async def test_candidates_view_handles_empty_state(app_client):
-    client, _deps, _broker = app_client
-    resp = await client.get("/candidates", headers=_auth_header("wheelbot", "hunter2"))
-    assert resp.status_code == 200
-    assert "no screener output" in resp.text.lower() or "Sprint 7" in resp.text
-
-
-@pytest.mark.asyncio
 async def test_risk_view_renders(app_client):
     client, _deps, _broker = app_client
     resp = await client.get("/risk", headers=_auth_header("wheelbot", "hunter2"))
     assert resp.status_code == 200
     assert "Kill switch" in resp.text
-    # TICKET-008: Drawdown Status section with tri-state badge.
+    # Drawdown breaker section.
     assert "Drawdown status" in resp.text
     # At least one strategy renders → NORMAL badge appears (default state).
     assert "NORMAL" in resp.text
-    # TICKET-009: Win-rate Status section.
-    assert "Win-rate status" in resp.text
-    # Insufficient-data badge for fresh strategies (no cycles in test DB).
-    assert "N/A (0/10)" in resp.text
+    # D9 scorecard (2026-10-27): fresh strategies are still collecting.
+    assert "Scorecard" in resp.text
+    assert "COLLECTING (0/30)" in resp.text
 
 
 @pytest.mark.asyncio
@@ -933,46 +772,3 @@ async def test_missing_password_returns_503(db_repos):
         assert resp.status_code == 503
 
 
-@pytest.mark.asyncio
-async def test_positions_table_swing_long_marks_long_sign(app_client):
-    """A SWING_OPEN long shows the LONG mark (mid > entry → positive) and its
-    SPY-level stop/target — not the generic short-option sign that would invert it."""
-    from dashboard.app import _positions_rows, _QuoteCache
-    _client, deps, broker = app_client
-    OptionType = __import__("core.models", fromlist=["OptionType"]).OptionType
-    Quote = __import__("core.models", fromlist=["Quote"]).Quote
-    today = datetime.now(UTC).date()
-    expiration = today + timedelta(days=60)
-    occ = f"SPY{expiration.strftime('%y%m%d')}C00585000"
-    cycle_id = await deps.repos.cycles.insert(
-        WheelCycle(account_id="test", symbol="SPY", strategy_id="spy_swing_opt",
-                   started_at=datetime.now(UTC).replace(tzinfo=None))
-    )
-    await deps.repos.orders.insert(Order(
-        account_id="test", symbol="SPY", strategy_id="spy_swing_opt", cycle_id=cycle_id,
-        order_type=OrderType.BUY_TO_OPEN, contract_symbol=occ, strike=585.0,
-        expiration=expiration, option_type=OptionType.CALL, quantity=1,
-        fill_price=20.0, status=OrderStatus.FILLED,
-        placed_at=datetime.now(UTC).replace(tzinfo=None),
-        filled_at=datetime.now(UTC).replace(tzinfo=None),
-        raw_request={"swing": {"entry_spot": 600.0, "stop_px": 596.0,
-                               "target_px": 606.0, "direction": 1,
-                               "entry_date": today.isoformat()}},
-    ))
-    await deps.repos.positions.insert(Position(
-        account_id="test", symbol="SPY", strategy_id="spy_swing_opt",
-        state=PositionState.SWING_OPEN, shares=0, current_cycle_id=cycle_id,
-        state_changed_at=datetime.now(UTC).replace(tzinfo=None),
-    ))
-    broker.seed_quote(Quote(symbol=occ, bid=23.9, ask=24.1))  # mid 24.0
-
-    rows = await _positions_rows(deps, _QuoteCache(0.0))
-    row = next(r for r in rows if r["strategy_id"] == "spy_swing_opt")
-    assert row["state"] == "SWING_OPEN"
-    # LONG mark: (24 - 20) * 100 * 1 = +400 (a short-sign would show -400).
-    assert row["unrealized"] == pytest.approx(400.0)
-    assert row["unrealized_pct"] == pytest.approx(20.0)
-    assert row["dte"] == 60
-    assert row["swing"]["stop_px"] == 596.0
-    assert row["swing"]["target_px"] == 606.0
-    assert row["swing"]["strike"] == 585.0

@@ -2,8 +2,8 @@
 (2026-07-23 review fix).
 
 Pre-fix, one strategy's propose pass raising aborted the whole tick, skipping
-every downstream strategy's stops/closes (swing, last in config order, lost
-the most). Now the failure logs + notifies and the loop continues.
+every downstream strategy's stops/closes. Now the failure logs + notifies
+and the loop continues.
 """
 
 from __future__ import annotations
@@ -39,18 +39,18 @@ async def test_one_strategy_exception_does_not_skip_the_rest(db_repos, monkeypat
     async def _boom(*args, **kwargs):
         raise RuntimeError("chain fetch exploded")
 
-    async def _spread_closes(*args, **kwargs):
-        calls.append("spread_closes")
+    async def _zero_dte_closes(*args, **kwargs):
+        calls.append("zero_dte_closes")
         return []
 
     monkeypatch.setattr("scripts.run_bot.propose_all_wheel_closes", _boom)
-    monkeypatch.setattr("scripts.run_bot.propose_all_spread_closes", _spread_closes)
+    monkeypatch.setattr("scripts.run_bot.propose_all_zero_dte_closes", _zero_dte_closes)
 
     broker = PaperBroker(cash=20_000)
     router = OrderRouter(broker, db_repos, _config(), _universe())
     strategies = [
         _strategy("monthly_wheel", "wheel"),          # raises
-        _strategy("put_spread", "vertical_spread"),   # must still run
+        _strategy("zero_dte", "zero_dte"),            # must still run
     ]
     # Must not raise — the wheel failure is isolated.
     await _propose_and_route(
@@ -59,4 +59,4 @@ async def test_one_strategy_exception_does_not_skip_the_rest(db_repos, monkeypat
         config=_config(), universe=_universe(), strategies=strategies,
         delta_unavailable_counters={},
     )
-    assert calls == ["spread_closes"]
+    assert calls == ["zero_dte_closes"]

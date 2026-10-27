@@ -100,16 +100,17 @@ async def compute_metrics(
         "✓" if regime_row and regime_row["csps_allowed"] else
         ("✗" if regime_row else "—")
     )
-    calls_flag = (
-        "✓" if regime_row and regime_row["bear_calls_allowed"] else
-        ("✗" if regime_row else "—")
-    )
 
     # Auto-disabled strategies (auto-clears stale rows as side effect)
     disabled = await repos.strategy_runtime.list_disabled(now=now)
     disabled_summary = (
         ", ".join(f"{r['strategy_id']}" for r in disabled) if disabled else "none"
     )
+
+    # D9 scorecard (2026-10-27): the go-live / retire rule, one line each.
+    from core.strategies import load_strategies
+    from risk.scorecard import compute_scorecards, format_scorecard_line
+    cards = await compute_scorecards(repos, load_strategies(config), config)
 
     return {
         "date": now.date().isoformat(),
@@ -125,8 +126,8 @@ async def compute_metrics(
         ) or "none",
         "regime": regime_label,
         "csps_allowed": csps_flag,
-        "bear_calls_allowed": calls_flag,
         "auto_disabled": disabled_summary,
+        "scorecard": "; ".join(format_scorecard_line(c) for c in cards) or "none",
     }
 
 

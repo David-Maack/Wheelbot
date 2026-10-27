@@ -101,8 +101,6 @@ async def test_idle_state_proposes_csp():
     assert proposal is not None
     assert proposal.contract.option_type == OptionType.PUT
     assert proposal.quantity == 1
-    assert proposal.requires_screen is False  # tier 1
-    assert proposal.requires_human is False
 
 
 @pytest.mark.asyncio
@@ -165,31 +163,6 @@ async def test_shares_held_without_cost_basis_skips():
         broker, repos, "F", _config(), _universe(), _NullIvr(), today=date(2025, 6, 1)
     )
     assert proposal is None
-
-
-@pytest.mark.asyncio
-async def test_tier_2_marks_proposal_requires_screen():
-    broker = PaperBroker()
-    broker.seed_quote(Quote(symbol="F", bid=10.0, ask=10.04))
-    broker.seed_chain("F", [_put()])
-    proposal = await propose_for_symbol(
-        broker, _FakeRepos(), "F", _config(), _universe(tier=2), _NullIvr(), today=date(2025, 6, 1)
-    )
-    assert proposal is not None
-    assert proposal.requires_screen is True
-    assert proposal.requires_human is False
-
-
-@pytest.mark.asyncio
-async def test_tier_3_marks_proposal_requires_human():
-    broker = PaperBroker()
-    broker.seed_quote(Quote(symbol="F", bid=10.0, ask=10.04))
-    broker.seed_chain("F", [_put()])
-    proposal = await propose_for_symbol(
-        broker, _FakeRepos(), "F", _config(), _universe(tier=3), _NullIvr(), today=date(2025, 6, 1)
-    )
-    assert proposal is not None
-    assert proposal.requires_human is True
 
 
 # -- Orphan position management (Sprint 14) ---------------------------------

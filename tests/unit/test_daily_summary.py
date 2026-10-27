@@ -173,7 +173,7 @@ async def test_regime_pulled_from_latest_snapshot(db_repos):
     m = await compute_metrics(db_repos, _config(), now=datetime.now(UTC).replace(tzinfo=None))
     assert m["regime"] == "BEAR_TREND"
     assert m["csps_allowed"] == "✗"
-    assert m["bear_calls_allowed"] == "✓"
+    assert "bear_calls_allowed" not in m   # no bear-call strategy since 2026-10-27
 
 
 # -- auto-disabled inclusion ------------------------------------------------

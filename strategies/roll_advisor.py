@@ -28,6 +28,7 @@ from core.broker import Broker
 from core.checkpoint import log_checkpoint
 from core.config import effective_wheel_params
 from core.models import OptionContract, OptionType
+from core.strategies import strategy_params
 from data.chain import ChainFilters, annualized_yield, fetch_filtered_chain
 
 
@@ -48,6 +49,9 @@ class RollContext:
     current_short_mid: float                  # cost to BTC right now (per share)
     underlying_price: float
     cycle_id: int | None = None
+    # The position's strategy, so its own params (roll_trigger_delta, DTE and
+    # delta bands) win over the shared `wheel:` block.
+    strategy_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +83,12 @@ async def evaluate_roll(
     is one of ROLL/LET_ASSIGN/CLOSE.
     """
     today = today or date.today()
-    params = effective_wheel_params(ctx.symbol, config, universe)
+    # wheel block < strategy params < per-ticker overrides — the risk gate's
+    # precedence. Before 2026-10-27 the strategy's params were ignored here,
+    # so a strategy-level roll_trigger_delta (weekly_wheel's 0.45) never fired.
+    params = dict(config.get("wheel", {}) or {})
+    params.update(strategy_params(config, ctx.strategy_id))
+    params.update(effective_wheel_params(ctx.symbol, {"wheel": {}}, universe))
     trigger = float(params.get("roll_trigger_delta", 0.50))
     only_credit = bool(params.get("roll_only_for_credit", True))
 

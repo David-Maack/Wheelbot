@@ -84,33 +84,7 @@ _PROFIT_TO_LOSS_OUTCOME = {
     CycleOutcome.CSP_CLOSED_PROFIT: CycleOutcome.CSP_CLOSED_LOSS,
     CycleOutcome.CC_CLOSED_PROFIT: CycleOutcome.CC_CLOSED_LOSS,
     CycleOutcome.SPREAD_CLOSED_PROFIT: CycleOutcome.SPREAD_CLOSED_LOSS,
-    # TICKET-014: iron condor uses its own outcome family so post-hoc
-    # filtering on /cycles can split iron_condor results from vanilla
-    # vertical spreads.
-    CycleOutcome.IRON_CONDOR_CLOSED_PROFIT: CycleOutcome.IRON_CONDOR_CLOSED_LOSS,
-    # TICKET-016: calendar.
-    CycleOutcome.CALENDAR_CLOSED_PROFIT: CycleOutcome.CALENDAR_CLOSED_LOSS,
 }
-
-
-def _spread_close_outcome(strategy_id: str | None) -> CycleOutcome:
-    """Pick the right CycleOutcome at MULTI_LEG_CLOSE. iron_condor and calendar
-    cycles get tagged distinctly from vanilla spreads so the /cycles filter and
-    /performance breakdown can separate them."""
-    if strategy_id == "iron_condor":
-        return CycleOutcome.IRON_CONDOR_CLOSED_PROFIT
-    if strategy_id == "calendar":
-        return CycleOutcome.CALENDAR_CLOSED_PROFIT
-    return CycleOutcome.SPREAD_CLOSED_PROFIT
-
-
-def _spread_expired_outcome(strategy_id: str | None) -> CycleOutcome:
-    """Same dispatch for MULTI_LEG_OPEN expiration paths (all legs OTM)."""
-    if strategy_id == "iron_condor":
-        return CycleOutcome.IRON_CONDOR_EXPIRED_PROFIT
-    if strategy_id == "calendar":
-        return CycleOutcome.CALENDAR_EXPIRED
-    return CycleOutcome.SPREAD_EXPIRED_PROFIT
 
 
 # TICKET-014.5: PositionStates that _diff_one INTENTIONALLY does not act on —
@@ -121,7 +95,7 @@ def _spread_expired_outcome(strategy_id: str | None) -> CycleOutcome:
 # shape-only transition today). The complement of this set and the states
 # _diff_one explicitly branches on must cover EVERY PositionState — enforced
 # by test_diff_one_covers_every_position_state. When a new state is added
-# (e.g. PMCC_* in TICKET-015) it must be categorized here or given a branch,
+# it must be categorized here or given a branch,
 # otherwise the test fails AND _diff_one flags it MANUAL_INTERVENTION at
 # runtime rather than silently skipping it.
 _DIFF_ONE_NO_TRANSITION_STATES: frozenset[PositionState] = frozenset({
@@ -135,19 +109,13 @@ _DIFF_ONE_NO_TRANSITION_STATES: frozenset[PositionState] = frozenset({
     PositionState.CALLED_AWAY,
     PositionState.SPREAD_CLOSED,
     PositionState.SPREAD_ASSIGNED,
-    # TICKET-015 PMCC: CLOSING is the transient full-unwind state driven by
-    # _on_fill of the long SELL_TO_CLOSE. The two *_PENDING states got their
-    # own stranded-PENDING self-heal branch in _diff_one (2026-08-03: CCL and
-    # F sat in PMCC_SHORT_PENDING for weeks after restarts dropped the order
-    # events, holding cap slots and freezing short-call income). The two
-    # ACTIVE states (PMCC_LONG_OPEN, PMCC_BOTH_OPEN) also have branches.
+    # PMCC_* / SWING_* belong to strategies retired 2026-10-27. The enum keeps
+    # them so historical rows still load; nothing produces them any more.
+    PositionState.PMCC_LONG_PENDING,
+    PositionState.PMCC_LONG_OPEN,
+    PositionState.PMCC_SHORT_PENDING,
+    PositionState.PMCC_BOTH_OPEN,
     PositionState.PMCC_CLOSING,
-    # Sub-sprint 2.2b swing: SWING_PENDING is driven by _on_swing_fill
-    # (PENDING → OPEN on the observed fill). SWING_OPEN has no shape-only
-    # transition — the single long is closed via a SELL_TO_CLOSE fill, and our
-    # 7-day max hold keeps it far from expiry, so there's no shape ambiguity to
-    # reconcile (mirrors SHARES_HELD). v1 limitation: a long that vanishes at the
-    # broker without a close fill is not auto-detected here (acceptable on paper).
     PositionState.SWING_PENDING,
     PositionState.SWING_OPEN,
     PositionState.BROKER_DOWN,
@@ -231,11 +199,7 @@ class Reconciler:
         # When provided, the reconciler runs the roll trigger scan after the
         # standard fill/expiration/assignment sweep. Tests pass a stub.
         self._roll_evaluator = roll_evaluator
-        self._universe = universe or {"tickers": [], "banned": [], "banned_rules": []}
-        # Sub-sprint 2.2b: ids of "swing"-type strategies — their fills follow the
-        # single deep-ITM long lifecycle (_on_swing_fill), like pmcc's firewall.
-        from core.strategies import load_strategies
-        self._swing_strategy_ids = {s.id for s in load_strategies(config) if s.type == "swing"}
+        self._universe = universe or {"tickers": [], "banned": []}
         # In-memory cursor for "orders updated since"; persists across reconcile_once
         # calls within a single Reconciler instance. Loop runner re-uses the
         # instance so this stays tight.
@@ -447,19 +411,6 @@ class Reconciler:
         )
         fill_price = broker_view.fill_price if broker_view.fill_price is not None else (local.limit_price or 0.0)
 
-        # TICKET-015: PMCC fills follow their own lifecycle — the long LEAP
-        # persists across many short calls within ONE cycle. Dispatch them
-        # before the wheel/spread order-type chain so the wheel CSP/CC path
-        # below stays byte-identical (the strategy_id guard is the firewall).
-        if local.strategy_id == "pmcc":
-            await self._on_pmcc_fill(local, position, fill_price, summary)
-            return
-
-        # Sub-sprint 2.2b: swing fills follow their own single-long lifecycle.
-        if local.strategy_id in self._swing_strategy_ids:
-            await self._on_swing_fill(local, position, fill_price, summary)
-            return
-
         if local.order_type == OrderType.MULTI_LEG_OPEN:
             cycle_id = await self._open_cycle_for_spread(local, fill_price, summary)
             await self._set_position_state(
@@ -488,7 +439,7 @@ class Reconciler:
                     await self._repos.orders.update(local.id, cycle_id=position.current_cycle_id)
                 await self._close_cycle(
                     position.current_cycle_id,
-                    _spread_close_outcome(local.strategy_id),
+                    CycleOutcome.SPREAD_CLOSED_PROFIT,
                     summary,
                 )
                 # Clear the cycle pointer — the spread is closed and the
@@ -587,229 +538,6 @@ class Reconciler:
                 strategy_id=local.strategy_id,
             )
 
-    # -- PMCC fill dispatch (TICKET-015) --------------------------------------
-
-    async def _on_pmcc_fill(
-        self,
-        local: Order,
-        position: Position | None,
-        fill_price: float,
-        summary: ReconcileSummary,
-    ) -> None:
-        """Route a PMCC fill. The long LEAP is bought first (BUY_TO_OPEN call)
-        and persists across many short calls (SELL_TO_OPEN / BUY_TO_CLOSE)
-        within ONE cycle. Closing the long (SELL_TO_CLOSE call) ends the cycle.
-
-        Every leg here is an option (option_type set), so _compute_cycle_pnl
-        prices them all at 100x via the TICKET-014.5 is_option discriminator —
-        PMCC P&L needs no special handling in the P&L computer.
-        """
-        symbol = local.symbol
-        ot = local.order_type
-        is_call = local.option_type == OptionType.CALL
-        existing_cycle = position.current_cycle_id if position else None
-
-        if ot == OrderType.BUY_TO_OPEN and is_call:
-            # Long LEAP opened → open a PMCC cycle → PMCC_LONG_OPEN.
-            cycle_id = await self._open_cycle_for_pmcc_long(local, fill_price, summary)
-            await self._set_position_state(
-                position, symbol, PositionState.PMCC_LONG_OPEN,
-                f"fill:{local.client_order_id}",
-                cycle_id=cycle_id or existing_cycle,
-                strategy_id=local.strategy_id,
-            )
-            if cycle_id is not None and local.id is not None:
-                await self._repos.orders.update(local.id, cycle_id=cycle_id)
-            return
-
-        if ot == OrderType.SELL_TO_OPEN and is_call:
-            # Short call sold against the long → PMCC_BOTH_OPEN, SAME cycle.
-            await self._set_position_state(
-                position, symbol, PositionState.PMCC_BOTH_OPEN,
-                f"fill:{local.client_order_id}",
-                cycle_id=existing_cycle,
-                strategy_id=local.strategy_id,
-            )
-            if existing_cycle is not None and local.id is not None:
-                await self._repos.orders.update(local.id, cycle_id=existing_cycle)
-            return
-
-        if ot == OrderType.BUY_TO_CLOSE and is_call:
-            # Short bought back → PMCC_LONG_OPEN, cycle CONTINUES (the long
-            # persists; many shorts per cycle). Tag the buyback so its debit
-            # is captured in cycle P&L (mirrors the CC-buyback pattern).
-            if existing_cycle is not None and local.id is not None and local.cycle_id is None:
-                await self._repos.orders.update(local.id, cycle_id=existing_cycle)
-            await self._set_position_state(
-                position, symbol, PositionState.PMCC_LONG_OPEN,
-                f"close:{local.client_order_id}",
-                cycle_id=existing_cycle,
-                strategy_id=local.strategy_id,
-            )
-            return
-
-        if ot == OrderType.SELL_TO_CLOSE and is_call:
-            # Long LEAP closed → the cycle ENDS. trigger_reason distinguishes a
-            # roll (PMCC_LONG_ROLLED — a new long opens a fresh cycle next) from
-            # a full unwind (PMCC_FULL_CLOSED). NOTE: if a roll's new-long open
-            # later fails to fill, the cycle is still correctly closed/labelled
-            # "rolled" — a cosmetic inaccuracy, not a state bug (you are flat).
-            if existing_cycle is not None and local.id is not None and local.cycle_id is None:
-                await self._repos.orders.update(local.id, cycle_id=existing_cycle)
-            outcome = (
-                CycleOutcome.PMCC_LONG_ROLLED
-                if (local.trigger_reason or "").startswith("pmcc_roll")
-                else CycleOutcome.PMCC_FULL_CLOSED
-            )
-            await self._set_position_state(
-                position, symbol, PositionState.IDLE,
-                f"close:{local.client_order_id}",
-                strategy_id=local.strategy_id,
-            )
-            if existing_cycle is not None:
-                await self._close_cycle(existing_cycle, outcome, summary)
-                if position is not None and position.id is not None:
-                    await self._repos.positions.update(position.id, current_cycle_id=None)
-            return
-
-        # Unhandled PMCC fill shape (e.g. a PUT, or option_type missing) —
-        # flag rather than silently skip.
-        log_checkpoint(
-            "reconcile_pmcc_unhandled_fill",
-            status="fail",
-            symbol=symbol,
-            order_type=ot.value if hasattr(ot, "value") else str(ot),
-            option_type=str(local.option_type),
-            client_order_id=local.client_order_id,
-        )
-        await self._flag_manual_intervention(
-            symbol,
-            f"_on_pmcc_fill: unhandled fill {ot}/{local.option_type} "
-            f"({local.client_order_id})",
-            summary,
-            strategy_id=local.strategy_id,
-        )
-
-    async def _open_cycle_for_pmcc_long(
-        self, order: Order, fill_price: float, summary: ReconcileSummary,
-    ) -> int | None:
-        """Open a PMCC cycle on the long-LEAP fill. `fill_price` is the
-        per-share debit paid; defined max loss = the debit. Reuses the
-        WheelCycle fields (initial_csp_strike = long strike, initial_csp_premium
-        = debit paid as a negative cash flow, initial_capital_at_risk = debit)."""
-        if order.order_type != OrderType.BUY_TO_OPEN:
-            return None
-        debit = abs(fill_price)
-        qty = order.quantity or 1
-        cycle = WheelCycle(
-            account_id=self._account_id,
-            symbol=order.symbol,
-            strategy_id=order.strategy_id,
-            started_at=_utcnow(),
-            initial_csp_strike=order.strike,
-            initial_csp_premium=-debit * 100 * qty,
-            initial_capital_at_risk=debit * 100 * qty,
-            n_orders=1,
-        )
-        cycle_id = await self._repos.cycles.insert(cycle)
-        summary.cycles_opened += 1
-        return cycle_id
-
-    # -- Swing fill dispatch (sub-sprint 2.2b) --------------------------------
-
-    async def _on_swing_fill(
-        self,
-        local: Order,
-        position: Position | None,
-        fill_price: float,
-        summary: ReconcileSummary,
-    ) -> None:
-        """Route a swing fill. A single deep-ITM long (call or put) is bought
-        (BUY_TO_OPEN) → SWING_OPEN, and sold (SELL_TO_CLOSE) → IDLE, ending the
-        cycle. No short leg, no roll. Both legs are options (option_type set) →
-        priced 100× by _compute_cycle_pnl with no special handling."""
-        symbol = local.symbol
-        ot = local.order_type
-        is_option = local.option_type in (OptionType.CALL, OptionType.PUT)
-        existing_cycle = position.current_cycle_id if position else None
-
-        if ot == OrderType.BUY_TO_OPEN and is_option:
-            cycle_id = await self._open_cycle_for_swing(local, fill_price, summary)
-            await self._set_position_state(
-                position, symbol, PositionState.SWING_OPEN,
-                f"fill:{local.client_order_id}",
-                cycle_id=cycle_id or existing_cycle,
-                strategy_id=local.strategy_id,
-            )
-            if cycle_id is not None and local.id is not None:
-                await self._repos.orders.update(local.id, cycle_id=cycle_id)
-            return
-
-        if ot == OrderType.SELL_TO_CLOSE and is_option:
-            # Long closed → cycle ends → IDLE. trigger_reason (swing_stop /
-            # swing_target / swing_time_stop) is preserved on the order for P&L.
-            if existing_cycle is not None and local.id is not None and local.cycle_id is None:
-                await self._repos.orders.update(local.id, cycle_id=existing_cycle)
-            await self._set_position_state(
-                position, symbol, PositionState.IDLE,
-                f"close:{local.client_order_id}",
-                strategy_id=local.strategy_id,
-            )
-            if existing_cycle is not None:
-                await self._close_cycle(existing_cycle, CycleOutcome.SWING_CLOSED, summary)
-                if position is not None and position.id is not None:
-                    await self._repos.positions.update(position.id, current_cycle_id=None)
-            return
-
-        log_checkpoint(
-            "reconcile_swing_unhandled_fill", status="fail", symbol=symbol,
-            order_type=ot.value if hasattr(ot, "value") else str(ot),
-            option_type=str(local.option_type), client_order_id=local.client_order_id,
-        )
-        await self._flag_manual_intervention(
-            symbol, f"_on_swing_fill: unhandled fill {ot}/{local.option_type} "
-            f"({local.client_order_id})", summary,
-            strategy_id=local.strategy_id,
-        )
-
-    async def _open_cycle_for_swing(
-        self, order: Order, fill_price: float, summary: ReconcileSummary,
-    ) -> int | None:
-        """Open a swing cycle on the long-option fill. `fill_price` is the
-        per-share debit paid; defined max loss = the debit (a long option).
-        Reuses the WheelCycle fields like PMCC's long-open does."""
-        if order.order_type != OrderType.BUY_TO_OPEN:
-            return None
-        debit = abs(fill_price)
-        qty = order.quantity or 1
-        cycle = WheelCycle(
-            account_id=self._account_id,
-            symbol=order.symbol,
-            strategy_id=order.strategy_id,
-            started_at=_utcnow(),
-            initial_csp_strike=order.strike,
-            initial_csp_premium=-debit * 100 * qty,
-            initial_capital_at_risk=debit * 100 * qty,
-            n_orders=1,
-        )
-        cycle_id = await self._repos.cycles.insert(cycle)
-        summary.cycles_opened += 1
-        return cycle_id
-
-    async def _on_pmcc_short_expiration(
-        self, local: Position, summary: ReconcileSummary,
-    ) -> None:
-        """A PMCC short call expired OTM — keep the full premium, return to
-        PMCC_LONG_OPEN. The cycle CONTINUES (the long persists); we do NOT
-        close it. The short's premium is already captured by its SELL_TO_OPEN
-        fill in the cycle's order set, so no synthetic order is needed."""
-        summary.expirations_processed += 1
-        await self._set_position_state(
-            local, local.symbol, PositionState.PMCC_LONG_OPEN,
-            "pmcc_short_expired_otm",
-            strategy_id=local.strategy_id,
-        )
-
     async def _on_cancel(
         self,
         local: Order,
@@ -868,36 +596,10 @@ class Reconciler:
                 return  # state doesn't match what we'd expect for this order
             target_cycle_id = None  # no fill, no cycle opened
             reason_label = "cancel_open"
-        elif local.order_type == OrderType.BUY_TO_OPEN and position.state in (
-            PositionState.SWING_PENDING,
-            PositionState.PMCC_LONG_PENDING,
-        ):
-            # A long-option ENTRY cancelled/rejected/expired before fill must
-            # release the position back to IDLE (swing OR PMCC long), else it
-            # strands in *_PENDING and blocks every future entry on that symbol.
-            target_state = PositionState.IDLE
-            target_cycle_id = None  # no fill, no cycle opened
-            reason_label = "cancel_open"
-        elif (
-            local.order_type == OrderType.SELL_TO_CLOSE
-            and position.state == PositionState.PMCC_CLOSING
-        ):
-            # 2026-07-01 audit HIGH: a PMCC long-close that cancels/expires
-            # unfilled (e.g. a DAY order auto-cancelled at EOD) left the
-            # position in PMCC_CLOSING forever — no _on_cancel branch, in the
-            # _diff_one no-act set, and pmcc_close only walks BOTH_OPEN/
-            # LONG_OPEN, so no retry was ever proposed and the LEAP sat
-            # unmanaged. Restore PMCC_LONG_OPEN (the long is still held, cycle
-            # still open) so the close orchestrator re-proposes next tick.
-            # Swing needs no equivalent: its close keeps state SWING_OPEN.
-            target_state = PositionState.PMCC_LONG_OPEN
-            target_cycle_id = position.current_cycle_id  # cycle still open
-            reason_label = "cancel_close"
         else:
             # BUY_TO_CLOSE and other wheel order types: router doesn't move
             # position to a *_PENDING state on placement, so nothing to undo.
             return
-
         await self._set_position_state(
             position,
             symbol,
@@ -1303,23 +1005,6 @@ class Reconciler:
             return
 
         if local.state == PositionState.SPREAD_OPEN:
-            # TICKET-016: a calendar is same-strike, two expirations, NET DEBIT.
-            # It must be force-closed before the front leg expires (the 2-DTE
-            # close trigger). If we still see it SPREAD_OPEN with the front short
-            # leg GONE from the broker, the force-close didn't fire — flag it
-            # rather than mishandle the partial-expiry (back leg becomes a naked
-            # long). A healthy calendar still shows its short front leg.
-            if local.strategy_id == "calendar":
-                if not has_short_call and not has_shares:
-                    await self._flag_manual_intervention(
-                        local.symbol,
-                        f"calendar {local.symbol} still SPREAD_OPEN with front "
-                        "leg gone — 2-DTE force-close did not fire; review the "
-                        "back leg (now an uncovered long)",
-                        summary,
-                        strategy_id=local.strategy_id,
-                    )
-                return
             # Broker shows nothing for this symbol → both legs OTM at expiry,
             # full credit retained. Anything else is asymmetric (one leg ITM,
             # one OTM, or partial assignment) and needs a human eye.
@@ -1374,67 +1059,11 @@ class Reconciler:
                 )
             return
 
-        # TICKET-015 PMCC. The long LEAP is invisible at the broker on
-        # PaperBroker (only short legs are surfaced as rows; real brokers do
-        # report longs but never as CC_OPEN/SHARES_HELD). So these branches
-        # key on has_short_call / has_shares — robust whether or not the long
-        # row is present.
-        if local.state == PositionState.PMCC_LONG_OPEN:
-            # Expected shape: long alive (invisible) + no short + no shares.
-            # Shares appearing here means the long was exercised/assigned or
-            # something unexpected happened — hand to a human. A short call
-            # row appearing is the short-sale fill, which _on_fill drives.
-            if has_shares:
-                await self._flag_manual_intervention(
-                    local.symbol,
-                    f"PMCC {local.symbol} shows shares={total_shares} in "
-                    "PMCC_LONG_OPEN — long exercised/assigned? review",
-                    summary,
-                    strategy_id=local.strategy_id,
-                )
-            return
-
-        if local.state == PositionState.PMCC_BOTH_OPEN:
-            # Short assignment surfaces as stock at the broker. Rare (the short
-            # strike sits above the long's breakeven) and profitable, but the
-            # covered-exercise math is NOT auto-reconciled in v1 — flag it (D3).
-            if has_shares:
-                await self._flag_manual_intervention(
-                    local.symbol,
-                    f"PMCC {local.symbol} shows shares={total_shares} — short "
-                    "call likely assigned; exercise long to cover (manual)",
-                    summary,
-                    strategy_id=local.strategy_id,
-                )
-                return
-            if has_short_call:
-                return  # short still alive — both legs open
-            # No short, no shares → the short call expired worthless. Keep the
-            # premium, return to PMCC_LONG_OPEN; the cycle CONTINUES.
-            await self._on_pmcc_short_expiration(local, summary)
-            return
-
-        if local.state in (
-            PositionState.PMCC_LONG_PENDING,
-            PositionState.PMCC_SHORT_PENDING,
-        ):
-            # Same stranded-PENDING class as CSP/CC/SPREAD above (a cursor
-            # reset mid-rebuild drops the one-shot fill/cancel event). The
-            # broker shape flags can't drive this heal: on a shared underlying
-            # has_short_call may belong to ANOTHER strategy (CCL calendar's
-            # front short vs CCL pmcc), and long option rows carry no flag at
-            # all. The strategy's own order stream is authoritative instead.
-            if await self._has_inflight_order(local):
-                return
-            await self._selfheal_pmcc_pending(local, symbol, summary)
-            return
-
         # TICKET-014.5: explicit exhaustive guard. States that intentionally
         # imply no position-shape transition are enumerated in
         # _DIFF_ONE_NO_TRANSITION_STATES. Anything that is neither handled
         # above nor in that set is an UNCATEGORIZED state — almost certainly a
-        # new PositionState added without wiring it into reconciliation (the
-        # PMCC_* states in TICKET-015 are the next such case). Flag it loudly
+        # new PositionState added without wiring it into reconciliation. Flag it loudly
         # instead of silently skipping, so the gap surfaces as a
         # MANUAL_INTERVENTION + checkpoint rather than a position that never
         # reconciles its expirations/assignments.
@@ -1464,7 +1093,7 @@ class Reconciler:
         if local.current_cycle_id:
             await self._close_cycle(
                 local.current_cycle_id,
-                _spread_expired_outcome(local.strategy_id),
+                CycleOutcome.SPREAD_EXPIRED_PROFIT,
                 summary,
             )
         if local.id is not None:
@@ -1755,72 +1384,6 @@ class Reconciler:
         if row is None:
             return None
         return await self._repos.orders.get(row[0])
-
-    async def _selfheal_pmcc_pending(
-        self,
-        local: Position,
-        symbol: str,
-        summary: ReconcileSummary,
-    ) -> None:
-        """Heal a PMCC position stranded in *_PENDING with no working order
-        (observed live 2026-08-03: CCL stuck PMCC_SHORT_PENDING for 27 days —
-        held a global cap slot AND froze short-call income on the LEAP). The
-        latest matching call order for THIS strategy decides what happened."""
-        want = (
-            OrderType.BUY_TO_OPEN
-            if local.state == PositionState.PMCC_LONG_PENDING
-            else OrderType.SELL_TO_OPEN
-        )
-        order = await self._latest_call_order(local, want)
-        filled = order is not None and order.status == OrderStatus.FILLED
-
-        if local.state == PositionState.PMCC_LONG_PENDING:
-            if filled and order is not None:
-                # The lost fill also lost the cycle-open — recreate both.
-                cycle_id = await self._open_cycle_for_pmcc_long(
-                    order, order.fill_price or order.limit_price or 0.0, summary
-                )
-                if cycle_id is not None and order.id is not None:
-                    await self._repos.orders.update(order.id, cycle_id=cycle_id)
-                await self._set_position_state(
-                    local, symbol, PositionState.PMCC_LONG_OPEN,
-                    "selfheal:stuck_pmcc_long_pending",
-                    cycle_id=cycle_id,
-                    strategy_id=local.strategy_id,
-                )
-                to_state = PositionState.PMCC_LONG_OPEN
-            else:
-                # Order died unfilled (or never landed) → no LEAP, no cycle.
-                await self._set_position_state(
-                    local, symbol, PositionState.IDLE,
-                    "selfheal:pmcc_long_pending_unfilled",
-                    strategy_id=local.strategy_id,
-                )
-                to_state = PositionState.IDLE
-            log_checkpoint(
-                "reconcile_selfheal_pending", status="ok", symbol=symbol,
-                from_state="PMCC_LONG_PENDING", to_state=to_state.value,
-            )
-            return
-
-        # PMCC_SHORT_PENDING — the LEAP is held and its cycle is open; only
-        # the short call's fate is unknown. (No broker-shape guard here: long
-        # option rows are invisible on PaperBroker and flag-less on Alpaca, so
-        # order truth is the only reliable signal. A genuinely-missing LEAP
-        # surfaces via the PMCC_LONG_OPEN diff branch on later ticks.)
-        target = (
-            PositionState.PMCC_BOTH_OPEN if filled else PositionState.PMCC_LONG_OPEN
-        )
-        await self._set_position_state(
-            local, symbol, target,
-            "selfheal:stuck_pmcc_short_pending",
-            cycle_id=local.current_cycle_id,
-            strategy_id=local.strategy_id,
-        )
-        log_checkpoint(
-            "reconcile_selfheal_pending", status="ok", symbol=symbol,
-            from_state="PMCC_SHORT_PENDING", to_state=target.value,
-        )
 
     async def _set_position_state(
         self,

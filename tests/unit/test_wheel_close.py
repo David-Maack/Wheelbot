@@ -758,3 +758,101 @@ async def test_delta_unavailable_counter_escalates_at_threshold(db_repos, monkey
     assert stuck_events[0]["symbol"] == "F"
     assert stuck_events[0]["strategy"] == "monthly_wheel"
     assert stuck_events[0]["position_id"] == position.id
+
+
+# -- earnings close trigger (2026-10-27, replaces earnings_recheck flagging) --
+
+
+def _earnings_on(day: date | None):
+    from data.earnings import EarningsLookup
+
+    return lambda symbol: EarningsLookup(symbol=symbol, next_date=day, source="test")
+
+
+@pytest.mark.asyncio
+async def test_csp_closes_when_earnings_moves_inside_the_hold(db_repos):
+    """Earnings now 3 days out, short expires 2025-07-06, no time-close → the
+    hold overlaps the window → close through the normal path, not a flag."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    # Mid 0.80: no profit trigger, no stop (2x = 2.00).
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+    today = date(2025, 6, 10)
+
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, today=today, strategy=_strategy(),
+        next_earnings_fn=_earnings_on(today + timedelta(days=3)),
+    )
+    assert proposal is not None
+    assert proposal.order_type == OrderType.BUY_TO_CLOSE
+    assert proposal.trigger_reason == "earnings"
+    assert "earnings 2025-06-13" in proposal.rationale
+    refreshed = await db_repos.positions.get_by_symbol("test", "F", strategy_id="monthly_wheel")
+    assert refreshed.state == PositionState.CSP_OPEN  # never flagged MANUAL_INTERVENTION
+
+
+@pytest.mark.asyncio
+async def test_csp_holds_when_earnings_is_after_the_planned_exit(db_repos):
+    """time_close_dte 21 → planned exit 2025-06-15; earnings 2025-06-30 is
+    outside [exit] + window → no close."""
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, today=date(2025, 6, 10),
+        strategy=_strategy(time_close_dte=21),
+        next_earnings_fn=_earnings_on(date(2025, 6, 30)),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_no_earnings_data_never_forces_a_close(db_repos):
+    position, _ = await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, today=date(2025, 6, 10), strategy=_strategy(),
+        next_earnings_fn=_earnings_on(None),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_cc_is_exempt_from_the_earnings_trigger(db_repos):
+    """The earnings risk on a covered call sits in the shares; buying back
+    the call would not reduce it."""
+    position = await _seed_open_cc(db_repos, fill_price=0.40)
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706C00012000", bid=0.35, ask=0.37))
+    today = date(2025, 6, 10)
+    proposal = await propose_close_for_position(
+        broker, db_repos, position, today=today, strategy=_strategy(),
+        next_earnings_fn=_earnings_on(today + timedelta(days=2)),
+    )
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_propose_all_closes_uses_wheel_block_earnings_window(db_repos, monkeypatch):
+    """The window comes from the shared `wheel:` block: days_before=0 /
+    days_after=0 → an earnings date 3 days AFTER expiry is outside it."""
+    from data.earnings import EarningsLookup
+
+    await _seed_open_csp(db_repos, fill_price=1.00)
+    broker = PaperBroker()
+    broker.seed_quote(Quote(symbol="F250706P00010000", bid=0.79, ask=0.81))
+    monkeypatch.setattr(
+        "strategies.wheel_close.default_next_earnings",
+        lambda symbol, **k: EarningsLookup(symbol=symbol, next_date=date(2025, 7, 9), source="t"),
+    )
+    config = {"account": {"id": "test"},
+              "wheel": {"earnings_blackout_days_before": 0, "earnings_blackout_days_after": 0}}
+    assert await propose_all_closes(
+        broker, db_repos, config, today=date(2025, 6, 10), strategy=_strategy(),
+    ) == []
+    config["wheel"]["earnings_blackout_days_before"] = 5   # 07-04..07-09 reaches 07-06
+    out = await propose_all_closes(
+        broker, db_repos, config, today=date(2025, 6, 10), strategy=_strategy(),
+    )
+    assert [p.trigger_reason for p in out] == ["earnings"]

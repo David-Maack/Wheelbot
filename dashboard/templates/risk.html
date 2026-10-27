@@ -29,18 +29,16 @@
   <h2>Drawdown status</h2>
   {% if drawdown %}
     <table class="grid">
-      <thead><tr><th>Strategy</th><th>State</th><th>7d P&amp;L</th><th>Warning</th><th>Disable</th><th>Re-enable</th></tr></thead>
+      <thead><tr><th>Strategy</th><th>State</th><th>7d P&amp;L</th><th>Disable at</th><th>Re-enable</th></tr></thead>
       <tbody>
       {% for sid, info in drawdown.items() %}
         <tr class="row-drawdown-{{ info.state }}">
           <td><code>{{ sid }}</code></td>
           <td>
             {% if info.state == "DISABLED" %}<span class="trigger trigger-drawdown_disabled">🔴 DISABLED</span>
-            {% elif info.state == "WARNING" %}<span class="trigger trigger-drawdown_warning">🟡 WARNING (sizes ×{{ info.size_multiplier }})</span>
             {% else %}<span class="trigger trigger-drawdown_normal">🟢 NORMAL</span>{% endif %}
           </td>
           <td>{{ "%+.2f"|format(info.rolling_pnl) }}</td>
-          <td>{% if info.warning_threshold is not none %}{{ "%.2f"|format(info.warning_threshold) }}{% else %}—{% endif %}</td>
           <td>{% if info.disable_threshold is not none %}{{ "%.2f"|format(info.disable_threshold) }}{% else %}—{% endif %}</td>
           <td>{% if info.disabled_until %}{{ info.disabled_until }}{% else %}—{% endif %}</td>
         </tr>
@@ -53,82 +51,23 @@
 </section>
 
 <section class="panel">
-  <h2>Win-rate status</h2>
-  {% if win_rate %}
+  <h2>Scorecard</h2>
+  <p class="caption">Go-live bar: N &ge; {{ scorecards[0].min_trades if scorecards else 30 }} closed trades,
+    penalized $/trade &gt; 0, fill rate &ge; 70%. Retire at N &ge; 30 with $/trade &le; 0.</p>
+  {% if scorecards %}
     <table class="grid">
-      <thead><tr><th>Strategy</th><th>State</th><th>Win rate</th><th>Sample</th><th>Floor</th><th>Paused at</th><th>Eligible reenable</th></tr></thead>
+      <thead><tr><th>Strategy</th><th>Since</th><th>N</th><th>$/trade</th><th>Total</th><th>Max DD</th><th>Fill rate</th><th>Verdict</th></tr></thead>
       <tbody>
-      {% for sid, info in win_rate.items() %}
-        <tr class="row-winrate-{{ info.state }}">
-          <td><code>{{ sid }}</code></td>
-          <td>
-            {% if info.state == "LOW_WIN_RATE" %}
-              <span class="trigger trigger-winrate_paused">🔴 PAUSED</span>
-            {% else %}
-              <span class="trigger trigger-winrate_normal">🟢 NORMAL</span>
-            {% endif %}
-          </td>
-          <td>
-            {% if info.win_rate is not none %}
-              {% if info.win_rate >= 70 %}<span class="ok">{{ "%.1f"|format(info.win_rate) }}%</span>
-              {% elif info.win_rate >= 60 %}<span class="warn">{{ "%.1f"|format(info.win_rate) }}%</span>
-              {% else %}<span class="bad">{{ "%.1f"|format(info.win_rate) }}%</span>{% endif %}
-            {% else %}—{% endif %}
-          </td>
-          <td>
-            {% if info.action == "insufficient_data" %}
-              N/A ({{ info.sample_size }}/10)
-            {% else %}
-              {{ info.sample_size }}
-            {% endif %}
-          </td>
-          <td>{% if info.threshold is not none %}{{ "%.1f"|format(info.threshold) }}%{% else %}—{% endif %}</td>
-          <td>{% if info.paused_at %}{{ info.paused_at }}{% else %}—{% endif %}</td>
-          <td>
-            {% if info.eligible_in_days is not none %}
-              {% if info.eligible_in_days == 0 %}eligible now{% else %}in {{ info.eligible_in_days }}d{% endif %}
-            {% else %}—{% endif %}
-          </td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  {% else %}
-    <p class="empty">No strategies loaded.</p>
-  {% endif %}
-</section>
-
-<section class="panel">
-  <h2>Expectancy status {% if not expectancy_enabled %}<small>(observe-only — floor not armed)</small>{% endif %}</h2>
-  {% if expectancy %}
-    <table class="grid">
-      <thead><tr><th>Strategy</th><th>State</th><th>Expectancy ($/cycle)</th><th>Sample</th><th>Floor</th><th>Paused at</th></tr></thead>
-      <tbody>
-      {% for sid, info in expectancy.items() %}
-        <tr class="row-expectancy-{{ info.state }}">
-          <td><code>{{ sid }}</code></td>
-          <td>
-            {% if info.state == "NEGATIVE_EXPECTANCY" %}
-              <span class="trigger trigger-winrate_paused">🔴 PAUSED</span>
-            {% else %}
-              <span class="trigger trigger-winrate_normal">🟢 NORMAL</span>
-            {% endif %}
-          </td>
-          <td>
-            {% if info.expectancy is not none %}
-              {% if info.expectancy > 0 %}<span class="ok">${{ "%.2f"|format(info.expectancy) }}</span>
-              {% else %}<span class="bad">${{ "%.2f"|format(info.expectancy) }}</span>{% endif %}
-            {% else %}—{% endif %}
-          </td>
-          <td>
-            {% if info.action == "insufficient_data" %}
-              N/A ({{ info.sample_size }}/10)
-            {% else %}
-              {{ info.sample_size }}
-            {% endif %}
-          </td>
-          <td>{% if info.threshold is not none %}${{ "%.2f"|format(info.threshold) }}{% else %}—{% endif %}</td>
-          <td>{% if info.paused_at %}{{ info.paused_at }}{% else %}—{% endif %}</td>
+      {% for c in scorecards %}
+        <tr>
+          <td><code>{{ c.strategy_id }}</code>{% if c.penalized %} <span class="caption">penalized</span>{% endif %}</td>
+          <td>{{ c.since or "—" }}</td>
+          <td>{{ c.n }}</td>
+          <td>{% if c.per_trade is not none %}<span class="{{ 'ok' if c.per_trade > 0 else 'bad' }}">${{ "%.2f"|format(c.per_trade) }}</span>{% else %}—{% endif %}</td>
+          <td>${{ "%.0f"|format(c.total) }}</td>
+          <td>${{ "%.0f"|format(c.max_drawdown) }}</td>
+          <td>{% if c.fill_rate is not none %}{{ "%.0f"|format(c.fill_rate * 100) }}% ({{ c.opens_filled }}/{{ c.opens_placed }}){% else %}—{% endif %}</td>
+          <td><code>{{ c.verdict }}</code></td>
         </tr>
       {% endfor %}
       </tbody>

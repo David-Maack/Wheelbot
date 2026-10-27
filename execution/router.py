@@ -18,8 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -33,9 +32,7 @@ from strategies.spreads import MultiLegProposal
 from strategies.wheel import Proposal
 
 
-# TICKET-015: BUY_TO_OPEN joins the open set — PMCC's long-LEAP entry is the
-# first routed BUY_TO_OPEN (synthetic stock legs are inserted, never routed).
-# This makes PMCC long opens respect the entry-window cutoff like any entry.
+# Entry order types — gated by the entry-window cutoff and swept when stale.
 _OPEN_ORDER_TYPES = (
     OrderType.SELL_TO_OPEN,
     OrderType.BUY_TO_OPEN,
@@ -67,25 +64,16 @@ class RouterConfig:
     # close. Opens placed near/after close can't fill or be managed. Closes
     # and rolls are exempt.
     entry_cutoff_minutes_before_close: int = 15
-    # news_check enforcement. When True (advisory mode, used during paper
-    # testing), a "caution" verdict is logged but the order proceeds at FULL
-    # size; only an explicit "block" cancels. When False (full enforcement),
-    # "caution" halves the size (and a 1-lot caution becomes a block). The
-    # underlying news_check still runs + records either way.
-    news_check_advisory: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class RouteResult:
     proposal: Proposal | MultiLegProposal
-    placed: Order | None  # None when dry-run, risk-failed, or news-blocked
+    placed: Order | None  # None when dry-run, risk-failed or skipped
     risk_failed: bool = False
     risk_failure_rule: str | None = None
     risk_failure_detail: str | None = None
     dry_run: bool = False
-    news_decision: str | None = None  # "proceed" | "caution" | "block" | None
-    news_rationale: str | None = None
-    quantity_adjusted: int | None = None  # final qty if news_check forced a halve
     skipped_duplicate_pending: bool = False  # active PENDING order, too young to replace
     skipped_outside_entry_window: bool = False  # open attempted too close to / after close
 
@@ -101,8 +89,8 @@ def _option_limit_price(
 
     `cross` decides aggressiveness — a MID limit on a directional BUY rests
     between bid/ask and never fills, so we cross the spread to actually trade:
-      - "ask": buy at the offer  (BUY_TO_OPEN — PMCC long, swing entry).
-      - "bid": sell at the bid   (SELL_TO_CLOSE — swing/PMCC exits must fill).
+      - "ask": buy at the offer  (any BUY — e.g. a defensive buyback).
+      - "bid": sell at the bid   (SELL_TO_CLOSE exits must fill).
       - None : mid                (default; patient premium SELL_TO_OPEN).
     The 5% liquidity gate caps how far this cross can be (≤5% of mid), so paying
     up is a small, bounded concession in exchange for a reliable fill.
@@ -162,7 +150,6 @@ def _client_order_id(proposal: Proposal, today: date | None = None) -> str:
 
 def _router_config(config: dict[str, Any]) -> RouterConfig:
     section = config.get("execution", {}) or {}
-    intel = config.get("intelligence", {}) or {}
     return RouterConfig(
         dry_run=bool(section.get("dry_run", False)),
         retry_max_attempts=int(section.get("retry_max_attempts", 5)),
@@ -174,36 +161,10 @@ def _router_config(config: dict[str, Any]) -> RouterConfig:
         entry_cutoff_minutes_before_close=int(
             section.get("entry_cutoff_minutes_before_close", 15)
         ),
-        news_check_advisory=bool(intel.get("news_check_advisory", False)),
     )
 
 
-def _pending_state_for(
-    order_type: OrderType,
-    contract_is_put: bool,
-    strategy_id: str | None = None,
-    *,
-    is_swing: bool = False,
-) -> PositionState:
-    # Sub-sprint 2.2b: directional swing — a single deep-ITM long. BUY_TO_OPEN →
-    # SWING_PENDING (reconciler upgrades to SWING_OPEN on the fill). SELL_TO_CLOSE
-    # holds SWING_OPEN until the reconciler observes the close fill → IDLE.
-    if is_swing:
-        if order_type == OrderType.BUY_TO_OPEN:
-            return PositionState.SWING_PENDING
-        return PositionState.SWING_OPEN
-    # TICKET-015: PMCC has its own pending states. long=BUY_TO_OPEN call,
-    # short=SELL_TO_OPEN call, long-close=SELL_TO_CLOSE call (transient
-    # CLOSING), short-close=BUY_TO_CLOSE (no state change; reconciler drives
-    # PMCC_BOTH_OPEN → PMCC_LONG_OPEN on the observed fill).
-    if strategy_id == "pmcc":
-        if order_type == OrderType.BUY_TO_OPEN:
-            return PositionState.PMCC_LONG_PENDING
-        if order_type == OrderType.SELL_TO_OPEN:
-            return PositionState.PMCC_SHORT_PENDING
-        if order_type == OrderType.SELL_TO_CLOSE:
-            return PositionState.PMCC_CLOSING
-        return PositionState.PMCC_BOTH_OPEN  # BUY_TO_CLOSE short — held until fill
+def _pending_state_for(order_type: OrderType, contract_is_put: bool) -> PositionState:
     # SELL_TO_OPEN of a put → CSP_PENDING; of a call → CC_PENDING.
     # BUY_TO_CLOSE returns the position to its prior state on fill, so we don't
     # change state here for closes; we keep it CSP_OPEN/CC_OPEN until reconciler
@@ -222,8 +183,6 @@ class OrderRouter:
         repos: Repos,
         config: dict[str, Any],
         universe: dict[str, Any],
-        *,
-        news_checker: Any = None,
     ) -> None:
         self._broker = broker
         self._repos = repos
@@ -231,14 +190,6 @@ class OrderRouter:
         self._universe = universe
         self._cfg = _router_config(config)
         self._gate = RiskGate(broker, repos, config, universe)
-        # Sub-sprint 2.2b: ids of strategies whose type is "swing" — these route
-        # to the SWING_* pending states (single deep-ITM long lifecycle).
-        from core.strategies import load_strategies
-        self._swing_ids = {s.id for s in load_strategies(config) if s.type == "swing"}
-        # News checker is an awaitable that takes (symbol) and returns a
-        # NewsCheckResult-shaped object with .decision / .rationale. Optional —
-        # tests pass a stub or None to disable.
-        self._news_checker = news_checker
 
     async def _replace_stale_pending(
         self, client_id: str, proposal_label: str
@@ -429,87 +380,6 @@ class OrderRouter:
                 risk_failure_detail=exc.detail,
             )
 
-        # News check (spec §9.2: "Before placing any new CSP" — puts only).
-        # CCs are about closing existing exposure on already-held shares; a
-        # news catalyst is a different decision class. Closes/rolls also skip.
-        news_decision: str | None = None
-        news_rationale: str | None = None
-        effective_qty = proposal.quantity
-        from core.models import OptionType
-
-        # Wheel CSP path is byte-identical (SELL_TO_OPEN + PUT, no profile).
-        # TICKET-015 adds a disjoint branch: a single-leg OPEN that carries a
-        # news_check_profile (PMCC long BUY_TO_OPEN) fires news_check with that
-        # profile. The two conditions can never both be true — a wheel CSP is
-        # SELL_TO_OPEN+PUT with profile=None; a PMCC long is BUY_TO_OPEN+CALL
-        # with profile set.
-        _profile = getattr(proposal, "news_check_profile", None)
-        _is_wheel_csp = (
-            proposal.order_type == OrderType.SELL_TO_OPEN
-            and proposal.contract.option_type == OptionType.PUT
-        )
-        _is_profiled_open = (
-            _profile is not None and proposal.order_type in _OPEN_ORDER_TYPES
-        )
-        if self._news_checker is not None and (_is_wheel_csp or _is_profiled_open):
-            if _is_wheel_csp:
-                check = await self._news_checker(proposal.symbol)
-            else:
-                check = await self._news_checker(proposal.symbol, _profile)
-            news_decision = getattr(check, "decision", None)
-            news_rationale = getattr(check, "rationale", None)
-            log_checkpoint(
-                "router_news_check",
-                status="ok",
-                symbol=proposal.symbol,
-                decision=news_decision,
-            )
-            if news_decision == "block":
-                return RouteResult(
-                    proposal=proposal,
-                    placed=None,
-                    news_decision="block",
-                    news_rationale=news_rationale,
-                )
-            if news_decision == "caution" and self._cfg.news_check_advisory:
-                # Advisory mode (paper testing): record the caution but proceed
-                # at full size. Only a hard "block" stops the order.
-                log_checkpoint(
-                    "router_news_caution_advisory",
-                    status="ok",
-                    symbol=proposal.symbol,
-                    note="advisory mode — proceeding at full size",
-                    rationale=news_rationale,
-                )
-            elif news_decision == "caution":
-                halved = effective_qty // 2
-                if halved == 0:
-                    # Spec-stretch: caution + qty=1 → block (halving a single
-                    # contract isn't possible).
-                    log_checkpoint(
-                        "router_news_caution_block",
-                        status="ok",
-                        symbol=proposal.symbol,
-                        original_qty=effective_qty,
-                    )
-                    return RouteResult(
-                        proposal=proposal,
-                        placed=None,
-                        news_decision="caution",
-                        news_rationale=(news_rationale or "")
-                        + " | qty=1 cannot be halved — treated as block",
-                    )
-                effective_qty = halved
-                # Preserve EVERY other field (strategy_id especially — rebuilding
-                # the Proposal by hand previously dropped it, silently re-tagging
-                # a halved weekly_wheel CSP as the default monthly_wheel and
-                # corrupting its idempotency key + position lookup).
-                proposal = replace(
-                    proposal,
-                    quantity=halved,
-                    rationale=proposal.rationale + " (size halved by news_check)",
-                )
-
         if self._cfg.dry_run:
             log_checkpoint(
                 "router_dry_run",
@@ -518,14 +388,7 @@ class OrderRouter:
                 occ=proposal.contract.occ_symbol,
                 qty=proposal.quantity,
             )
-            return RouteResult(
-                proposal=proposal,
-                placed=None,
-                dry_run=True,
-                news_decision=news_decision,
-                news_rationale=news_rationale,
-                quantity_adjusted=effective_qty if news_decision == "caution" else None,
-            )
+            return RouteResult(proposal=proposal, placed=None, dry_run=True)
 
         # Pre-submission: handle a stale PENDING order with the same
         # deterministic client_order_id (Sprint 14 — Option B). Either skip
@@ -539,39 +402,17 @@ class OrderRouter:
                 proposal=proposal,
                 placed=None,
                 skipped_duplicate_pending=True,
-                news_decision=news_decision,
-                news_rationale=news_rationale,
             )
         effective_client_id = replacement_id if action == "replace" else base_client_id
 
         order = self._build_order(proposal, today=today, client_order_id=effective_client_id)
         placed = await self._submit_with_retry(order, sleep=sleep)
 
-        # Preserve the proposal's entry context through the broker round-trip.
-        # Brokers REPLACE raw_request with their own request dump on the returned
-        # order (alpaca_broker.place_order model_copy; paper_broker likewise),
-        # which destroyed the swing exit anchors {stop_px, target_px, ...} before
-        # they ever reached the DB — leaving swing positions with NO working
-        # stop/target/time exit. Merge the proposal's context back on top,
-        # keeping the broker dump's other keys (mirrors the multi-leg
-        # width_dollars re-stamp above).
-        prop_ctx = getattr(proposal, "raw_request", None)
-        if prop_ctx:
-            merged = dict(placed.raw_request or {})
-            merged.update(prop_ctx)
-            placed = placed.model_copy(update={"raw_request": merged})
-
         # DB writes. Order first; position state second.
         await self._persist_order(placed)
         await self._upsert_position_pending(proposal, placed)
 
-        return RouteResult(
-            proposal=proposal,
-            placed=placed,
-            news_decision=news_decision,
-            news_rationale=news_rationale,
-            quantity_adjusted=effective_qty if news_decision == "caution" else None,
-        )
+        return RouteResult(proposal=proposal, placed=placed)
 
     async def place_multi_leg(
         self,
@@ -583,12 +424,6 @@ class OrderRouter:
         """Place a defined-risk multi-leg package atomically.
 
         Differences vs `place(Proposal)`:
-          - News check is OPT-IN per strategy via `proposal.news_check_profile`.
-            When None (default for put_spread/bear_call_spread — preserves
-            existing behavior), the gate is skipped. When set (iron_condor uses
-            `neutral_range`), news_check fires with that profile's prompt and
-            applies the standard block/caution handling. PMCC long-call opens
-            and calendar opens will follow the same pattern.
           - Limit price is the proposal's net credit, snapped to a $0.01 tick.
           - Position state goes to SPREAD_PENDING; reconciler upgrades to
             SPREAD_OPEN on observed fill.
@@ -626,80 +461,6 @@ class OrderRouter:
                 risk_failure_rule=exc.rule,
                 risk_failure_detail=exc.detail,
             )
-
-        # TICKET-014: per-strategy news_check on MULTI_LEG_OPEN. Opt-in via
-        # proposal.news_check_profile. Mirrors the single-leg path's
-        # block/caution/advisory handling. Caution + qty=1 → skip (can't half
-        # a structured package). Closes (MULTI_LEG_CLOSE) bypass.
-        news_decision: str | None = None
-        news_rationale: str | None = None
-        if (
-            self._news_checker is not None
-            and proposal.order_type == OrderType.MULTI_LEG_OPEN
-            and proposal.news_check_profile is not None
-        ):
-            check = await self._news_checker(
-                proposal.symbol, proposal.news_check_profile,
-            )
-            news_decision = getattr(check, "decision", None)
-            news_rationale = getattr(check, "rationale", None)
-            log_checkpoint(
-                "router_news_check",
-                status="ok",
-                symbol=proposal.symbol,
-                strategy=proposal.strategy_id,
-                profile=proposal.news_check_profile,
-                decision=news_decision,
-            )
-            if news_decision == "block":
-                log_checkpoint(
-                    "router_news_block",
-                    status="skip",
-                    symbol=proposal.symbol,
-                    strategy=proposal.strategy_id,
-                    rationale=news_rationale,
-                )
-                return RouteResult(
-                    proposal=proposal,
-                    placed=None,
-                    news_decision="block",
-                    news_rationale=news_rationale,
-                )
-            if news_decision == "caution" and self._cfg.news_check_advisory:
-                log_checkpoint(
-                    "router_news_caution_advisory",
-                    status="ok",
-                    symbol=proposal.symbol,
-                    strategy=proposal.strategy_id,
-                    note="advisory mode — proceeding at full size",
-                    rationale=news_rationale,
-                )
-            elif news_decision == "caution":
-                halved = proposal.quantity // 2
-                if halved == 0:
-                    # qty=1 caution → skip. Halving a structured package
-                    # below 1 contract isn't meaningful; the conservative
-                    # call is to not enter.
-                    log_checkpoint(
-                        "router_news_caution_block",
-                        status="skip",
-                        symbol=proposal.symbol,
-                        strategy=proposal.strategy_id,
-                        original_qty=proposal.quantity,
-                        note="qty=1 cannot be halved — treated as block",
-                    )
-                    return RouteResult(
-                        proposal=proposal,
-                        placed=None,
-                        news_decision="caution",
-                        news_rationale=(news_rationale or "")
-                        + " | qty=1 cannot be halved — treated as block",
-                    )
-                proposal = replace(
-                    proposal,
-                    quantity=halved,
-                    rationale=proposal.rationale + " (size halved by news_check)",
-                )
 
         if self._cfg.dry_run:
             log_checkpoint(
@@ -799,12 +560,7 @@ class OrderRouter:
         # so it never needed the PENDING hop.
         if proposal.order_type == OrderType.MULTI_LEG_OPEN:
             await self._upsert_position_spread_pending(proposal, placed)
-        return RouteResult(
-            proposal=proposal,
-            placed=placed,
-            news_decision=news_decision,
-            news_rationale=news_rationale,
-        )
+        return RouteResult(proposal=proposal, placed=placed)
 
     # -- Internals ------------------------------------------------------------
 
@@ -844,8 +600,6 @@ class OrderRouter:
             # into orders.trigger_reason so the dashboard + post-hoc analysis
             # can read it without parsing the rationale string.
             trigger_reason=proposal.trigger_reason,
-            # Sub-sprint 2.2b: optional entry context (swing exit anchors).
-            raw_request=getattr(proposal, "raw_request", None),
         )
 
     async def _submit_with_retry(
@@ -902,37 +656,11 @@ class OrderRouter:
 
         account_id = self._config.get("account", {}).get("id", "primary")
         contract_is_put = proposal.contract.option_type == OptionType.PUT
-        new_state = _pending_state_for(
-            proposal.order_type, contract_is_put, proposal.strategy_id,
-            is_swing=proposal.strategy_id in self._swing_ids,
-        )
+        new_state = _pending_state_for(proposal.order_type, contract_is_put)
         existing = await self._repos.positions.get_by_symbol(
             account_id, proposal.symbol, strategy_id=proposal.strategy_id
         )
         now = _utcnow()
-        # TICKET-015: PMCC short-close (BUY_TO_CLOSE) leaves state unchanged —
-        # the reconciler drives PMCC_BOTH_OPEN → PMCC_LONG_OPEN on the fill.
-        if proposal.strategy_id == "pmcc" and proposal.order_type == OrderType.BUY_TO_CLOSE:
-            return
-        if proposal.strategy_id == "pmcc":
-            if existing is None:
-                await self._repos.positions.insert(
-                    Position(
-                        account_id=account_id,
-                        symbol=proposal.symbol,
-                        strategy_id=proposal.strategy_id,
-                        state=new_state,
-                        shares=0,
-                        state_changed_at=now,
-                        state_change_reason=f"router_pending:{placed.client_order_id}",
-                    )
-                )
-            elif existing.id is not None:
-                await self._repos.positions.update_state(
-                    existing.id, new_state,
-                    f"router_pending:{placed.client_order_id}", when=now,
-                )
-            return
         if existing is None:
             await self._repos.positions.insert(
                 Position(

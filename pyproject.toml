@@ -31,9 +31,6 @@ dashboard = [
     "python-multipart>=0.0.12",
     "mistune>=3.0",
 ]
-intelligence = [
-    "anthropic>=0.40",
-]
 data = [
     "yfinance>=0.2",
     "numpy>=1.26",
@@ -58,12 +55,10 @@ packages = [
     "data",
     "strategies",
     "execution",
-    "intelligence",
     "risk",
     "dashboard",
     "db",
     "mcp_server",
-    "backtest",
 ]
 
 [tool.pytest.ini_options]

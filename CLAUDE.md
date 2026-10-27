@@ -6,12 +6,11 @@ it short and stable; longer-lived design docs live in `docs/`.
 ## Repo layout (top level)
 
 - `scripts/run_bot.py`     — the long-running trading loop (Docker entrypoint)
-- `scripts/run_*.py`       — cron entrypoints (screener, regime, daily summary)
+- `scripts/run_*.py`       — cron entrypoints (regime, daily summary, macro calendar)
 - `core/`                  — broker abstraction, config, notifier, models
-- `strategies/`            — wheel + spreads orchestrators and selectors
-- `risk/`                  — risk gate, regime classifier, auto-disable
+- `strategies/`            — monthly wheel + zero_dte (the two strategies since 2026-10-27)
+- `risk/`                  — risk gate, regime classifier, drawdown breaker, scorecard
 - `execution/`             — router and reconciler (single source of truth)
-- `intelligence/`          — Anthropic client, screener, news_check, budget
 - `data/`                  — chain, IVR, earnings, yfinance helpers
 - `platforms/`             — Alpaca, Tastytrade, PaperBroker adapters
 - `dashboard/`             — FastAPI + Jinja UI
@@ -89,40 +88,36 @@ cron entries in LXC-local MDT (e.g. the daily macro-calendar refresh at
   for explicit ack before commit/push.
 - **`docs/HOW_IT_WORKS.md` is the living overview** (rendered at
   `/how-it-works` on the dashboard). Any commit that changes trading behavior
-  — a strategy, a gate, an exit rule, an AI touchpoint, a cron — must update
+  — a strategy, a gate, an exit rule, a cron — must update
   it in the same commit (same convention as the go-live runbook).
 - Every new module that mutates state writes a `core.checkpoint.log_checkpoint(...)`.
-- All Anthropic calls go through `intelligence.anthropic_client.AnthropicClient`.
 - All DB migrations go in `db/migrations/NNNN_description.sql`.
 - New config knobs default to **off** or **conservative**.
 - Tests live in `tests/unit/test_<module>.py`.
 
 ## Live state knobs that matter
 
-- `intelligence.news_check_advisory`: `true` (paper testing — caution
-  proceeds at full size; only `block` cancels). Flip to `false` before live.
-- `intelligence.llm_screener_enabled`: `true`. Opus runs daily via cron.
-- `intelligence.llm_roll_advisor_enabled`: `false`. Re-enable after 3+ months
-  of paper data.
+- Two strategies since the 2026-10-27 cleanup: `monthly_wheel` and `zero_dte`.
+  The AI layer, the other eight strategies, the win-rate / expectancy floors,
+  the drawdown WARNING tier and the consecutive-losses pause were removed (git
+  history has them). Each strategy is judged by `risk/scorecard.py` (go-live
+  bar: 30 trades, $/trade > 0, fill rate >= 70%).
+- `disabled_strategies` in the LXC's `config.local.yaml` decides what opens;
+  zero_dte stays listed there until GO_LIVE_RUNBOOK Stage 1.
 - `account.max_concurrent_total`: `6` during testing (2026-07-01: virtual book
   re-based to $12k assumed live funding; worst-case simultaneous ~= $10.9k).
   Drop to 4 for the quarter-size live ramp, back to 6 at full funding.
-- `universe_refresh.enabled`: `true` (armed 2026-07-02). Weekly two-tier
-  watchlist refresh (quant pre-filter + Opus rank) — proposes per-strategy
-  add/keep/drop diffs; apply via the MCP `approve_watchlist` tool.
-  `auto_apply: false` keeps spec §6's human-review gate; flip only after
-  several trusted cycles. Needs the cron installed on the LXC host:
-  `0 7 * * 6 docker exec wheelbot python -m scripts.run_universe_refresh`
-  (LXC-local MDT). Watchlist membership only changes what strategies LOOK AT —
-  all risk gates still apply at trade time; auto-added symbols enter at tier 2.
+- `config/macro_calendar.yaml` is the only macro-event source (official
+  FOMC/CPI/NFP dates through 2027-12). Extend it before `/macro` shows
+  "running out".
 
 ## Live-deployment authority
 
 `docs/GO_LIVE_RUNBOOK.md` is the authoritative sequence for taking WheelBot
 live; any change to `account.broker`, position caps (`max_concurrent_total`,
 per-strategy `max_position_pct_of_account`), or risk thresholds
-(`daily_loss_kill_switch_pct`, `consecutive_losses_pause`,
-`auto_disable_drawdown_usd`, `drawdown_warning_usd`) that affects
+(`daily_loss_kill_switch_pct`, `auto_disable_drawdown_usd`,
+`risk.scorecard`) that affects
 live-trading readiness must update the runbook in the same commit. The
 runbook is rendered at `/runbook` on the dashboard; the markdown file in
 `docs/` is the source of truth.

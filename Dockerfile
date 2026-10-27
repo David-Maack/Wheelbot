@@ -16,9 +16,7 @@ COPY core/ ./core/
 COPY platforms/ ./platforms/
 COPY data/ ./data/
 COPY strategies/ ./strategies/
-COPY backtest/ ./backtest/
 COPY execution/ ./execution/
-COPY intelligence/ ./intelligence/
 COPY risk/ ./risk/
 COPY dashboard/ ./dashboard/
 COPY db/ ./db/
@@ -31,7 +29,7 @@ COPY config/ ./config/
 COPY docs/ ./docs/
 
 RUN pip install --upgrade pip \
- && pip install -e ".[broker,dashboard,intelligence,data,mcp]"
+ && pip install -e ".[broker,dashboard,data,mcp]"
 
 RUN useradd --create-home --uid 1000 wheelbot \
  && mkdir -p /mnt/wheelbot-storage \
