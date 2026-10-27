@@ -94,7 +94,7 @@ Every proposed entry passes, in order:
    per-position capital caps; IVR floor/ceiling; earnings blackout (no opens
    within 7 days of earnings, nor any whose planned hold — expiry minus the
    strategy's time-close — reaches 5 days before earnings); macro blackout (no opens within
-   2 days of FOMC/CPI/NFP; a strategy may override the event list
+   2 days of FOMC/CPI/NFP, from the hand-kept official calendar; a strategy may override the event list
    (`macro_event_types`) or narrow it to the event day itself
    (`macro_same_day_only` — zero_dte does)); **tier-2 screen** — tier-2 symbols need TODAY's
    LLM screener score ≥ 50.
@@ -153,7 +153,7 @@ The host crontab on CT 105 is authoritative — `crontab -l` to verify.
 
 - **Screener** — weekday pre-market (Opus ranking → `candidates` table)
 - **Regime classifier + LLM veto** — daily (SPY vs 200-SMA, VIX → regime flags)
-- **Macro calendar refresh** — daily 06:00 (Finnhub, falls back to the YAML)
+- **Macro calendar refresh** — daily 06:00. Loads `config/macro_calendar.yaml` (official FOMC/CPI/NFP dates; the only source since Finnhub's economic calendar started returning 403) and replaces every future row with it. When any event type has nothing within 60 days the gate keeps blocking on what it has and Discord gets a daily "extend the YAML" alert. Before 2026-10-27 the staleness check looked at refresh time, so the calendar ran out on 09-16 without anyone noticing.
 - **Daily summary** — weekday evenings → Discord
 - **Universe refresh** — Saturday 07:00 → proposal → Discord + MCP approval
 - **DB backup / history ingest** — per crontab

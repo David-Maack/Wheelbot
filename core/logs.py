@@ -51,6 +51,18 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, separators=(",", ":"))
 
 
+#: Third-party loggers that log every request URL at INFO. httpx prints the
+#: full query string, and Finnhub's API key travels as `?token=` — so INFO
+#: wrote the key into every log line (2026-10-27 audit). WARNING keeps their
+#: errors and drops the per-request chatter.
+QUIET_LOGGERS = ("httpx", "httpcore")
+
+
+def quiet_noisy_loggers() -> None:
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 _STDLIB_RECORD_FIELDS = {
     "args", "asctime", "created", "exc_info", "exc_text", "filename",
     "funcName", "levelname", "levelno", "lineno", "message", "module",
@@ -95,3 +107,4 @@ def setup_logging(config: dict[str, Any]) -> None:
         root.addHandler(file_handler)
 
     root.setLevel(level)
+    quiet_noisy_loggers()
